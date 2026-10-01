@@ -193,10 +193,13 @@ pub struct Gate<'a> {
     pub bucket: &'a str,
 }
 
-/// Returned by [`Gate::caps`]; records the account caps when committed.
+/// Returned by [`Gate::caps`]; records the account caps when committed. Owns
+/// its keys so it can move into the task that creates the account: a client
+/// that hangs up must not stop an account that gets created from being counted.
 #[must_use = "commit() once the account exists, or the caps never count it"]
-pub struct Permit<'a> {
-    gate: &'a Gate<'a>,
+pub struct Permit {
+    ns: String,
+    bucket: String,
     no_js: bool,
 }
 
@@ -257,7 +260,7 @@ impl<'a> Gate<'a> {
 
     /// The site-wide attempt cap and the account caps. Call after the caller's
     /// own validation, so junk refused there does not spend the global cap.
-    pub fn caps(&'a self, no_js: bool) -> Result<Permit<'a>, Deny> {
+    pub fn caps(&self, no_js: bool) -> Result<Permit, Deny> {
         let (ns, b, l) = (self.ns, self.bucket, self.limits);
         if !self.limiter.check(&format!("{ns}:try:global"), HOUR, l.max_attempts_per_hour) {
             return Err(deny("global_cap", "Too many attempts right now. Try again in an hour."));
@@ -268,17 +271,16 @@ impl<'a> Gate<'a> {
         if !self.limiter.peek(&format!("{ns}:ok:global"), HOUR, l.max_accounts_per_hour) {
             return Err(deny("global_cap", "Too many new accounts right now. Try again in an hour."));
         }
-        Ok(Permit { gate: self, no_js })
+        Ok(Permit { ns: ns.to_string(), bucket: b.to_string(), no_js })
     }
 }
 
-impl Permit<'_> {
-    pub fn commit(self) {
-        let g = self.gate;
-        g.limiter.record(&format!("{}:ok:{}", g.ns, g.bucket), DAY);
-        g.limiter.record(&format!("{}:ok:global", g.ns), HOUR);
+impl Permit {
+    pub fn commit(self, limiter: &crate::limit::RateLimiter) {
+        limiter.record(&format!("{}:ok:{}", self.ns, self.bucket), DAY);
+        limiter.record(&format!("{}:ok:global", self.ns), HOUR);
         if self.no_js {
-            g.limiter.record(&format!("{}:nojs:{}", g.ns, g.bucket), DAY);
+            limiter.record(&format!("{}:nojs:{}", self.ns, self.bucket), DAY);
         }
     }
 }
@@ -367,7 +369,7 @@ mod tests {
         let p = Proof { altcha: &pay, ts: &ts, ..Proof::default() };
         let no_js = g.precheck(p, true).unwrap();
         assert!(!no_js);
-        g.caps(no_js).unwrap().commit();
+        g.caps(no_js).unwrap().commit(&l);
         assert_eq!(g.precheck(p, true).unwrap_err().outcome, "bad_pow", "a solution is single-use");
     }
 
@@ -395,7 +397,7 @@ mod tests {
         assert!(g.precheck(p, true).unwrap());
         let _abandoned = g.caps(true).unwrap();
         assert!(g.precheck(p, true).unwrap(), "an uncommitted attempt spent nothing");
-        g.caps(true).unwrap().commit();
+        g.caps(true).unwrap().commit(&l);
         assert_eq!(g.precheck(p, true).unwrap_err().outcome, "rate_limited", "no-JS slot now spent");
         assert_eq!(g.caps(false).err().unwrap().outcome, "rate_limited", "per-address account cap reached");
     }
