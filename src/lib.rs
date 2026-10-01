@@ -12,6 +12,8 @@ pub mod limit;
 pub mod migrate;
 pub mod pow;
 pub mod qr;
+pub mod recovery;
+pub mod totp;
 pub mod util;
 
 pub use ip::IpMode;
