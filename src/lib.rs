@@ -8,6 +8,8 @@
 
 pub mod ip;
 pub mod limit;
+#[cfg(feature = "mysql")]
+pub mod migrate;
 pub mod pow;
 pub mod qr;
 pub mod util;

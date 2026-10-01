@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS acct_roles (
+  id BINARY(16) NOT NULL,
+  name VARCHAR(32) NOT NULL,
+  description VARCHAR(255) NOT NULL DEFAULT '',
+  badge VARCHAR(32) NULL,
+  builtin TINYINT NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
