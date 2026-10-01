@@ -6,7 +6,9 @@
 //! layer; `axum` the web handlers and templates; `oauth` and `email` the outbound
 //! integrations. See `docs/embedding.md`.
 
+pub mod challenge;
 pub mod ip;
+pub mod keys;
 pub mod limit;
 #[cfg(feature = "mysql")]
 pub mod migrate;
@@ -16,6 +18,7 @@ pub mod recovery;
 pub mod scope;
 pub mod totp;
 pub mod util;
+pub mod verify;
 
 pub use ip::IpMode;
 pub use limit::RateLimiter;
