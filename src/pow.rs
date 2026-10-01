@@ -118,6 +118,171 @@ pub fn stamp_age(key: &[u8], raw: &str) -> Option<u64> {
     now_secs().checked_sub(secs)
 }
 
+// ------------------------------------------------------------- sign-up gate
+
+/// The anti-abuse chain every sign-up form shares (Matrix registration, site
+/// accounts, the "choose a username" step after a social login).
+///
+/// Two halves, because the caller validates its own fields in between and the
+/// order matters: cheap junk is refused by [`Gate::precheck`] before it can
+/// spend the site-wide attempt cap that [`Gate::caps`] charges. Account counts
+/// are only peeked there; [`Permit::commit`] records them once the account
+/// really exists, so a mistyped password never costs someone their sign-up.
+///
+/// Callers must hold one async lock from `precheck` to `commit`, or parallel
+/// posts all pass the same peek before any of them counts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Limits {
+    pub max_attempts_per_ip_hour: usize,
+    pub max_attempts_per_hour: usize,
+    pub max_accounts_per_hour: usize,
+    /// Accounts per address (IPv6: per /64) per day.
+    pub max_accounts_per_ip_day: usize,
+    pub min_form_seconds: u64,
+    pub pow_maxnumber: u32,
+    pub pow_ttl_minutes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_attempts_per_ip_hour: 10,
+            max_attempts_per_hour: 60,
+            max_accounts_per_hour: 10,
+            max_accounts_per_ip_day: 2,
+            min_form_seconds: 3,
+            pow_maxnumber: 60_000,
+            pow_ttl_minutes: 60,
+        }
+    }
+}
+
+/// Why a sign-up was turned away: a stable label for the log (fail2ban, metrics)
+/// and the sentence shown to the visitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deny {
+    pub outcome: &'static str,
+    pub message: &'static str,
+}
+
+const fn deny(outcome: &'static str, message: &'static str) -> Deny {
+    Deny { outcome, message }
+}
+
+/// What the visitor sent besides their own fields.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Proof<'a> {
+    /// The ALTCHA payload. Empty means the browser ran no JavaScript.
+    pub altcha: &'a str,
+    /// The signed render time from [`stamp`].
+    pub ts: &'a str,
+    /// The honeypot field. Anything in it is a bot.
+    pub honeypot: &'a str,
+    /// The request's `Sec-Fetch-Site`, or "".
+    pub sec_fetch_site: &'a str,
+}
+
+pub struct Gate<'a> {
+    pub limiter: &'a crate::limit::RateLimiter,
+    pub key: &'a [u8],
+    pub limits: &'a Limits,
+    /// Limiter key prefix, e.g. `mx` or `acct-reg`. Never contains `:`.
+    pub ns: &'a str,
+    /// `util::ip_key` of the client.
+    pub bucket: &'a str,
+}
+
+/// Returned by [`Gate::caps`]; records the account caps when committed.
+#[must_use = "commit() once the account exists, or the caps never count it"]
+pub struct Permit<'a> {
+    gate: &'a Gate<'a>,
+    no_js: bool,
+}
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+const DAY: std::time::Duration = std::time::Duration::from_secs(86400);
+
+impl<'a> Gate<'a> {
+    /// Origin, per-address attempt cap, honeypot, form age, then the proof of
+    /// work (burned, so one solution is one sign-up) or, without JavaScript, a
+    /// much stricter one-per-day cap that is only peeked here.
+    ///
+    /// `with_pow` false skips the PoW and the no-JS cap entirely: for a form that
+    /// only exists after a provider already vouched for a human (social sign-up).
+    pub fn precheck(&self, p: Proof<'_>, with_pow: bool) -> Result<bool, Deny> {
+        let (ns, b, l) = (self.ns, self.bucket, self.limits);
+        // Another site submitting the form through a visitor's browser would get
+        // the account created and charged to that visitor. A sibling subdomain
+        // counts as another site. Scripts send no Sec-Fetch-Site at all.
+        if matches!(p.sec_fetch_site, "cross-site" | "same-site") {
+            return Err(deny("cross_site", "Something went wrong. Please try again."));
+        }
+        if !self.limiter.check(&format!("{ns}:try:{b}"), HOUR, l.max_attempts_per_ip_hour) {
+            return Err(deny("rate_limited", "Too many attempts from your connection. Try again later."));
+        }
+        if !p.honeypot.is_empty() {
+            return Err(deny("honeypot", "Something went wrong. Please try again."));
+        }
+        // Not single-use, so it does not stop a replay within the hour; the caps do.
+        match stamp_age(self.key, p.ts) {
+            None => return Err(deny("too_fast", "The form expired. Please try again.")),
+            Some(age) if age < l.min_form_seconds => {
+                return Err(deny("too_fast", "That was quick. Give it a couple of seconds and try again."));
+            }
+            Some(age) if age > 3600 => return Err(deny("too_fast", "The form expired. Please try again.")),
+            Some(_) => {}
+        }
+        if !with_pow {
+            return Ok(false);
+        }
+        let no_js = p.altcha.is_empty();
+        if no_js {
+            // Peeked, not spent: a mistyped password must not cost someone their
+            // one no-JS sign-up for the day.
+            if !self.limiter.peek(&format!("{ns}:nojs:{b}"), DAY, 1) {
+                return Err(deny("rate_limited", "Too many attempts from your connection. Try again tomorrow."));
+            }
+        } else {
+            let challenge = verify(self.key, p.altcha)
+                .map_err(|_| deny("bad_pow", "The anti-spam check failed. Please try again."))?;
+            // The signature proves the challenge is ours, not that it is unused.
+            let ttl = std::time::Duration::from_secs(l.pow_ttl_minutes * 60);
+            if !self.limiter.check(&format!("{ns}:pow:{challenge}"), ttl, 1) {
+                return Err(deny("bad_pow", "That anti-spam check was already used. Please try again."));
+            }
+        }
+        Ok(no_js)
+    }
+
+    /// The site-wide attempt cap and the account caps. Call after the caller's
+    /// own validation, so junk refused there does not spend the global cap.
+    pub fn caps(&'a self, no_js: bool) -> Result<Permit<'a>, Deny> {
+        let (ns, b, l) = (self.ns, self.bucket, self.limits);
+        if !self.limiter.check(&format!("{ns}:try:global"), HOUR, l.max_attempts_per_hour) {
+            return Err(deny("global_cap", "Too many attempts right now. Try again in an hour."));
+        }
+        if !self.limiter.peek(&format!("{ns}:ok:{b}"), DAY, l.max_accounts_per_ip_day) {
+            return Err(deny("rate_limited", "You have already created an account today."));
+        }
+        if !self.limiter.peek(&format!("{ns}:ok:global"), HOUR, l.max_accounts_per_hour) {
+            return Err(deny("global_cap", "Too many new accounts right now. Try again in an hour."));
+        }
+        Ok(Permit { gate: self, no_js })
+    }
+}
+
+impl Permit<'_> {
+    pub fn commit(self) {
+        let g = self.gate;
+        g.limiter.record(&format!("{}:ok:{}", g.ns, g.bucket), DAY);
+        g.limiter.record(&format!("{}:ok:global", g.ns), HOUR);
+        if self.no_js {
+            g.limiter.record(&format!("{}:nojs:{}", g.ns, g.bucket), DAY);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +351,62 @@ mod tests {
         let s = stamp(k, now_secs() - 10);
         assert!(stamp_age(k, &s).unwrap() >= 10);
         assert_eq!(stamp_age(k, "9999.deadbeef"), None, "unsigned stamp must be refused");
+    }
+
+    fn gate<'a>(l: &'a crate::limit::RateLimiter, lim: &'a Limits) -> Gate<'a> {
+        Gate { limiter: l, key: b"powkey", limits: lim, ns: "t", bucket: "203.0.113.9" }
+    }
+
+    #[test]
+    fn gate_accepts_a_solved_form_once() {
+        let l = crate::limit::RateLimiter::default();
+        let lim = Limits { min_form_seconds: 0, ..Limits::default() };
+        let g = gate(&l, &lim);
+        let ts = stamp(b"powkey", now_secs() - 5);
+        let pay = solve(&issue(b"powkey", 500, 600));
+        let p = Proof { altcha: &pay, ts: &ts, ..Proof::default() };
+        let no_js = g.precheck(p, true).unwrap();
+        assert!(!no_js);
+        g.caps(no_js).unwrap().commit();
+        assert_eq!(g.precheck(p, true).unwrap_err().outcome, "bad_pow", "a solution is single-use");
+    }
+
+    #[test]
+    fn gate_refuses_cross_site_honeypot_and_fresh_forms() {
+        let l = crate::limit::RateLimiter::default();
+        let lim = Limits::default();
+        let g = gate(&l, &lim);
+        let ts = stamp(b"powkey", now_secs());
+        let base = Proof { ts: &ts, ..Proof::default() };
+        assert_eq!(g.precheck(Proof { sec_fetch_site: "same-site", ..base }, true).unwrap_err().outcome, "cross_site");
+        assert_eq!(g.precheck(Proof { honeypot: "x", ..base }, true).unwrap_err().outcome, "honeypot");
+        assert_eq!(g.precheck(base, true).unwrap_err().outcome, "too_fast", "rendered 0s ago");
+        assert_eq!(g.precheck(Proof { ts: "1.bad", ..base }, true).unwrap_err().outcome, "too_fast");
+    }
+
+    #[test]
+    fn account_caps_count_only_committed_accounts() {
+        let l = crate::limit::RateLimiter::default();
+        let lim = Limits { min_form_seconds: 0, max_accounts_per_ip_day: 1, ..Limits::default() };
+        let g = gate(&l, &lim);
+        let ts = stamp(b"powkey", now_secs() - 5);
+        let p = Proof { ts: &ts, ..Proof::default() };
+        // No JS: the per-day no-JS slot is peeked, not spent, until commit.
+        assert!(g.precheck(p, true).unwrap());
+        let _abandoned = g.caps(true).unwrap();
+        assert!(g.precheck(p, true).unwrap(), "an uncommitted attempt spent nothing");
+        g.caps(true).unwrap().commit();
+        assert_eq!(g.precheck(p, true).unwrap_err().outcome, "rate_limited", "no-JS slot now spent");
+        assert_eq!(g.caps(false).err().unwrap().outcome, "rate_limited", "per-address account cap reached");
+    }
+
+    #[test]
+    fn social_signup_skips_only_the_pow() {
+        let l = crate::limit::RateLimiter::default();
+        let lim = Limits { min_form_seconds: 0, ..Limits::default() };
+        let g = gate(&l, &lim);
+        let ts = stamp(b"powkey", now_secs() - 5);
+        assert!(!g.precheck(Proof { ts: &ts, ..Proof::default() }, false).unwrap());
+        assert_eq!(g.precheck(Proof { ts: &ts, honeypot: "x", ..Proof::default() }, false).unwrap_err().outcome, "honeypot");
     }
 }
