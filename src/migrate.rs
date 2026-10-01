@@ -25,6 +25,7 @@ pub const ACCOUNTS: &[&str] = &[
     include_str!("../migrations/mysql/0008_blobs.sql"),
     include_str!("../migrations/mysql/0009_profiles.sql"),
     include_str!("../migrations/mysql/0010_audit.sql"),
+    include_str!("../migrations/mysql/0011_role_scopes_scope_key.sql"),
 ];
 
 #[derive(Debug)]
