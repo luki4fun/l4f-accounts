@@ -11,6 +11,8 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use ring::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey};
 use sha2::{Digest, Sha256, Sha512};
 
+use crate::scope::invisible;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshKey {
     pub algo: String,
@@ -89,16 +91,6 @@ fn clean_comment(raw: &str) -> String {
     }
     let joined = words.join(" ");
     joined.chars().take(MAX_COMMENT).collect::<String>().trim_end().to_string()
-}
-
-/// Bidi controls reorder the label and whatever the page prints after it; the
-/// zero-width space, word joiner and BOM only make lookalike labels differ. ZWJ
-/// and ZWNJ are not here: emoji and Persian or Indic spelling need them.
-fn invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
-    )
 }
 
 /// The `SHA256:...` form `ssh-keygen -l` prints.

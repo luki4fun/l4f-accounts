@@ -92,8 +92,8 @@ pub const RESERVED: &[&str] = &[
 /// is the app's own list (its route words), compared case-insensitively.
 ///
 /// ASCII only, so no two names look alike through Unicode homoglyphs (Cyrillic
-/// `а` for `a`) or Unicode case folding. ASCII look-alikes are not caught:
-/// `1uki` and `adrnin` pass although they read as `luki` and `admin`. Never all
+/// `а` for `a`) or Unicode case folding; ASCII look-alikes of a reserved name
+/// (`1uki`, `adrnin`, `luki_`) are refused through `skeleton`. Never all
 /// digits, so a name cannot pass for a numeric id; never a leading `_` or `-`,
 /// which read as markers and flags.
 pub fn normalize_username(raw: &str, extra_reserved: &[&str]) -> Result<String, &'static str> {
@@ -111,10 +111,65 @@ pub fn normalize_username(raw: &str, extra_reserved: &[&str]) -> Result<String, 
     if name.bytes().all(|b| b.is_ascii_digit()) {
         return Err("A username cannot be only digits.");
     }
-    if RESERVED.contains(&name.as_str()) || extra_reserved.iter().any(|r| r.eq_ignore_ascii_case(&name)) {
+    let sk = skeleton(&name);
+    if RESERVED.iter().chain(extra_reserved).any(|r| skeleton(r) == sk) {
         return Err("That username is reserved. Pick another one.");
     }
     Ok(name)
+}
+
+/// Folds ASCII look-alikes so a name that reads as a reserved one counts as it:
+/// `1` and `i` as `l`, `0` as `o`, `rn` as `m`, `vv` as `w`, `cl` as `d`
+/// (confusables.txt, plus i/l, which many fonts barely tell apart), and `-`/`_`
+/// dropped. Only ever compared, never stored.
+fn skeleton(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_'))
+        .map(|c| match c.to_ascii_lowercase() {
+            '1' | 'i' => 'l',
+            '0' => 'o',
+            c => c,
+        })
+        .collect();
+    s.replace("rn", "m").replace("vv", "w").replace("cl", "d")
+}
+
+/// Bidi controls and marks reorder the text and whatever the page prints after
+/// it; the zero-width space, word joiner and BOM only make look-alikes differ.
+/// ZWJ and ZWNJ are not here: emoji and Persian or Indic spelling need them.
+pub(crate) fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+    )
+}
+
+/// Renders as nothing on its own: whitespace, the `invisible` set, joiners,
+/// fillers, variation selectors, tag characters and the blank Braille cell.
+fn blank(c: char) -> bool {
+    c.is_whitespace()
+        || invisible(c)
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200c}'
+                | '\u{200d}'
+                | '\u{2061}'..='\u{2064}'
+                | '\u{206a}'..='\u{206f}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{ffa0}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'
+        )
 }
 
 /// A display name is free text shown next to other people's content, so it must
@@ -122,7 +177,9 @@ pub fn normalize_username(raw: &str, extra_reserved: &[&str]) -> Result<String, 
 /// paragraph separators U+2028/U+2029, which are not `Cc` but still force a line
 /// break and could fake a second line under the name) or reorder the text
 /// around it (bidi overrides and isolates, the "Trojan Source" trick that can make
-/// a name render as someone else's or flip an adjacent file name).
+/// a name render as someone else's or flip an adjacent file name). Zero-width
+/// characters are refused too, and a name must show at least one visible
+/// character, so nobody appears as a blank.
 pub fn clean_display_name(raw: &str) -> Result<String, &'static str> {
     let name = raw.trim();
     if name.is_empty() {
@@ -135,8 +192,11 @@ pub fn clean_display_name(raw: &str) -> Result<String, &'static str> {
     if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
         return Err("The display name cannot contain control characters or line breaks.");
     }
-    if name.chars().any(|c| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')) {
-        return Err("The display name cannot contain text-direction override characters.");
+    if name.chars().any(invisible) {
+        return Err("The display name cannot contain invisible or text-direction characters.");
+    }
+    if name.chars().all(blank) {
+        return Err("The display name needs at least one visible character.");
     }
     Ok(name.to_string())
 }
@@ -473,6 +533,17 @@ mod tests {
     }
 
     #[test]
+    fn lookalikes_of_reserved_names_are_refused() {
+        for bad in ["1uki", "luk1", "lukl", "adrnin", "adm1n", "admln", "r00t", "luki_", "l-u-k-i", "vvebmaster", "he1p", "nu11", "AdRnIn"] {
+            assert_err(normalize_username(bad, &[]), "reserved", bad);
+        }
+        assert_err(normalize_username("1inks", &["links"]), "reserved", "app words are folded too");
+        for ok in ["lucky", "luka", "admins", "rootkit", "helper", "linkz"] {
+            assert!(normalize_username(ok, &["links"]).is_ok(), "{ok} only resembles a reserved name");
+        }
+    }
+
+    #[test]
     fn display_names_are_trimmed_free_text() {
         assert_eq!(clean_display_name("  Luki  "), Ok("Luki".into()));
         assert_eq!(clean_display_name("\tLuki\n"), Ok("Luki".into()), "edge whitespace is trimmed, not refused");
@@ -517,5 +588,21 @@ mod tests {
             assert_err(clean_display_name(&name), "text-direction", &label);
             assert_err(clean_display_name(&format!("{c}x")), "text-direction", &format!("{label} at the start"));
         }
+    }
+
+    #[test]
+    fn display_name_refuses_bidi_marks_and_zero_width_characters() {
+        for c in ['\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{2060}', '\u{FEFF}'] {
+            assert_err(clean_display_name(&format!("ad{c}min")), "invisible", &format!("U+{:04X}", c as u32));
+        }
+    }
+
+    #[test]
+    fn display_name_needs_a_visible_character() {
+        for bad in ["\u{3164}", "\u{200D}", "\u{200C}\u{200D}", "\u{2800}", "\u{00AD}", "\u{FE0F}", "\u{E0041}", "\u{3164} \u{3164}"] {
+            assert_err(clean_display_name(bad), "visible", &format!("{bad:?}"));
+        }
+        assert!(clean_display_name("👨\u{200D}👩\u{200D}👧").is_ok(), "ZWJ inside an emoji sequence stays allowed");
+        assert!(clean_display_name("\u{3164}x").is_ok(), "one visible character is enough");
     }
 }
