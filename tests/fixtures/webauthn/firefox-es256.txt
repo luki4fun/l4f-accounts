@@ -1,0 +1,23 @@
+firefox-es256-create.json / firefox-es256-get.json: real Firefox 156.0.1 (Linux) WebAuthn output,
+recorded over Marionette by a throwaway node script (firefox --headless --marionette --no-remote,
+fresh profile with security.webauth.webauthn_enable_softtoken=true and
+security.webauth.webauthn_enable_usbtoken=false) with a fresh virtual authenticator:
+  WebAuthn:AddVirtualAuthenticator {protocol: ctap2, transport: internal, hasResidentKey: true,
+    hasUserVerification: true, isUserConsenting: true, isUserVerified: true}
+Firefox's virtual authenticator refuses RS256 (NotAllowedError), so the RS256 fixture is Chrome's only.
+
+rp id:            localhost
+origin:           http://localhost:8099
+create challenge: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+get challenge:    202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+user.id:          6c34662d666978747572652d75736572 ("l4f-fixture-user")
+
+create(): PublicKeyCredential.parseCreationOptionsFromJSON({rp.id "localhost", user.id above,
+  pubKeyCredParams [-7, -257], residentKey required, userVerification preferred,
+  attestation none}), then JSON.stringify(credential.toJSON(), null, 2).
+get(): PublicKeyCredential.parseRequestOptionsFromJSON({get challenge, rpId "localhost",
+  userVerification preferred, no allowCredentials (discoverable)}), then the same.
+Flags: create UP|UV|AT, get UP|UV. signCount is 0 in both: this authenticator keeps no counter,
+like a synced passkey. Members are in lexicographic order because toJSON() returns WebIDL dictionaries.
+
+Public data only: the private key never left the virtual authenticator.

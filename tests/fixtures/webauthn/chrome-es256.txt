@@ -1,0 +1,19 @@
+chrome-es256-create.json / chrome-es256-get.json: real Chrome/153.0.8010.52 WebAuthn output,
+recorded over CDP by a throwaway node 22 script (chromium --headless=new) with a fresh virtual authenticator:
+  WebAuthn.addVirtualAuthenticator {protocol: ctap2, transport: internal,
+    hasResidentKey: true, hasUserVerification: true, isUserVerified: true}
+The page is plain HTTP on localhost, which browsers treat as a secure context.
+
+rp id:            localhost
+origin:           http://localhost:8099
+create challenge: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+get challenge:    202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+user.id:          6c34662d666978747572652d75736572 ("l4f-fixture-user")
+
+create(): PublicKeyCredential.parseCreationOptionsFromJSON({rp.id "localhost", user.id above,
+  pubKeyCredParams [-7, -257], residentKey required, userVerification preferred,
+  attestation none}), then credential.toJSON().
+get(): PublicKeyCredential.parseRequestOptionsFromJSON({get challenge, rpId "localhost",
+  userVerification preferred, no allowCredentials (discoverable)}), then credential.toJSON().
+
+Public data only: the private key never left the virtual authenticator.
