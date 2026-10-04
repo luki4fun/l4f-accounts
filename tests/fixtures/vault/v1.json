@@ -1,0 +1,42 @@
+{
+ "account": "000102030405060708090a0b0c0d0e0f",
+ "pass": "correct horse battery staple",
+ "recovery_key": "MBQW EY3E MVTG O2DJ NJVW Y3LO N5YH C4TT OR2X M53Y PF5H W7D5 PZ7Q",
+ "pass_slot": {
+  "v": 1,
+  "id": "AAAAAAAAAAAAAAAAAAAAAA",
+  "kind": "pass",
+  "kdf": {
+   "alg": "PBKDF2-SHA256",
+   "iter": 600000,
+   "salt": "QEFCQ0RFRkdISUpLTE1OTw"
+  },
+  "dek_id": "icdGBFLt3_E",
+  "iv": "UFFSU1RVVldYWVpb",
+  "ct": "zqHfpqRCKDKbMCI7qd4fCobx2rmRc9se7Al2Y8sROrF2BtiBo-ImWVLdP6VMuY2l"
+ },
+ "recovery_slot": {
+  "v": 1,
+  "id": "AQEBAQEBAQEBAQEBAQEBAQ",
+  "kind": "recovery",
+  "kdf": {
+   "alg": "HKDF-SHA256",
+   "salt": "cHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo8",
+   "info": "l4f-vault-kek/v1"
+  },
+  "dek_id": "icdGBFLt3_E",
+  "iv": "gIGCg4SFhoeIiYqL",
+  "ct": "DXsaMuvfFvPHd9dA7tuSSTJ0P7PvjcoFkOoPUx3lHTWoqfY27d64nr8ZNzalQ0vo"
+ },
+ "item_id": "totp.AgICAgICAgICAgICAgICAg",
+ "item": "AYnHRgRS7d_xkJGSk5SVlpeYmZqbaQ3pQqqDzltewxLqNpbXfjau_J1y5Y4fCr94J1XiHss_ZyCIXyBuRIDnUR3rufct_TQyKquaBZYnq3Tig1K-_xK0SYtoj-QZmLtPi9XKe1BERZTDmvyuXVkmkdM8pNixoxRvtJUq8Bn9NRirDOVI_qXNBG3jl9i5M9w",
+ "value": {
+  "v": 1,
+  "name": "GitHub",
+  "secret": "JBSWY3DPEHPK3PXP",
+  "issuer": "GitHub",
+  "digits": 6,
+  "period": 30,
+  "algo": "SHA1"
+ }
+}

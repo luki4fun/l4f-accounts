@@ -12,7 +12,7 @@ use serde::Deserialize;
 use super::flash::{self, Flash};
 use super::{
     Authed, BASE, St, Viewer, WebHost, clear_session, csrf_for_cookie, known_device, page, refused, see_other,
-    session_token, set_device, set_session, status_of,
+    session_token, set_session, status_of,
 };
 use crate::password::MAX_LEN;
 use crate::service::{Accounts, Ctx, Error, LoginStep};
@@ -102,7 +102,7 @@ pub(super) async fn login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, F
     let known = known_device(&a, &cfg, &h);
     match a.login_password(&ctx, &f.username, &f.password, known).await {
         Ok(LoginStep::Done(s)) => {
-            let cookies = [set_session(&cfg, &s.token), set_device(&a, &cfg, s.info.user_id)];
+            let cookies = super::signed_in(&a, &s).await;
             see_other(util::safe_next(&f.next, BASE), &cookies)
         }
         Ok(LoginStep::NeedMfa(s)) => {
@@ -126,7 +126,7 @@ pub(super) async fn logout<H: WebHost>(State(a): St<H>, h: HeaderMap) -> Respons
     {
         tracing::warn!(target: "accounts", error = %e, "session row not removed at sign-out");
     }
-    flash::to(&a.keys, &format!("{BASE}/login"), true, "Signed out.", &[clear_session(&cfg)])
+    flash::to(&a.keys, &format!("{BASE}/login"), true, "Signed out.", &[clear_session(&cfg), super::sync_hint(&cfg, false)])
 }
 
 pub(super) async fn logout_all<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap) -> Response {
@@ -216,8 +216,7 @@ pub(super) async fn register<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap
     };
     match a.register(&ctx, form).await {
         Ok(s) => {
-            let cfg = a.host.config();
-            let cookies = [set_session(&cfg, &s.token), set_device(&a, &cfg, s.info.user_id)];
+            let cookies = super::signed_in(&a, &s).await;
             flash::to(&a.keys, BASE, true, "Welcome! Your account is ready.", &cookies)
         }
         Err(e) => {

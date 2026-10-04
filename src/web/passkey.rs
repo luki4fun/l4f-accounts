@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::flash;
 use super::{
-    Authed, BASE, PendingMfa, St, WebHost, json_ok, json_refused, new_nonce, nonce_of, set_device, set_session,
+    Authed, BASE, PendingMfa, St, WebHost, json_ok, json_refused, new_nonce, nonce_of, set_session,
 };
 use crate::service::{Ctx, Error, PasskeyFor};
 use crate::util;
@@ -77,7 +77,7 @@ pub(super) async fn login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, J
     let nonce = nonce_of(&cfg, &h);
     match a.passkey_login(&ctx, &f.token, &nonce, &f.credential.to_string()).await {
         Ok(s) => {
-            let cookies = [set_session(&cfg, &s.token), set_device(&a, &cfg, s.info.user_id)];
+            let cookies = super::signed_in(&a, &s).await;
             json_ok(json!({ "next": util::safe_next(&f.next, BASE) }), &cookies)
         }
         Err(e) => json_refused(&e),
@@ -89,7 +89,7 @@ pub(super) async fn mfa<H: WebHost>(State(a): St<H>, p: PendingMfa, ctx: Ctx, h:
     let nonce = nonce_of(&cfg, &h);
     match a.passkey_mfa(&ctx, &p.user, &p.session, &f.token, &nonce, &f.credential.to_string()).await {
         Ok(s) => {
-            let cookies = [set_session(&cfg, &s.token), set_device(&a, &cfg, p.user.id)];
+            let cookies = super::signed_in(&a, &s).await;
             json_ok(json!({ "next": util::safe_next(&f.next, BASE) }), &cookies)
         }
         Err(e) => json_refused(&e),

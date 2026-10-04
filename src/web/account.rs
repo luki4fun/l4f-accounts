@@ -42,6 +42,8 @@ struct DashboardTpl<'a> {
     can_roles: bool,
     waiting_for_2fa: bool,
     mail: bool,
+    can_sync: bool,
+    can_vault: bool,
     flash: Option<Flash>,
 }
 
@@ -76,6 +78,8 @@ pub(super) async fn dashboard<H: WebHost>(State(a): St<H>, me: Authed, h: Header
         // Held but not granted: the 2FA rule is holding them back.
         waiting_for_2fa: held.len() > me.scopes.len(),
         mail: cfg!(feature = "email"),
+        can_sync: me.can("storage:sync"),
+        can_vault: me.can("vault:use"),
         flash: flash::read(&a.keys, &fq),
     };
     page(&a, &h, "Your account", StatusCode::OK, &t)

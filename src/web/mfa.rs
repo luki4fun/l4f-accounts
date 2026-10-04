@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use super::auth::{NextQuery, need_fresh};
 use super::flash::{self, Flash};
-use super::{Authed, BASE, PendingMfa, St, WebHost, error_page, page, refused, see_other, set_device, set_session, status_of, when};
+use super::{Authed, BASE, PendingMfa, St, WebHost, error_page, page, refused, see_other, status_of, when};
 use crate::qr::qr_svg;
 use crate::service::{Accounts, Ctx, Error, TotpSetup};
 use crate::util;
@@ -49,7 +49,6 @@ pub(super) struct MfaForm {
 }
 
 pub(super) async fn mfa<H: WebHost>(State(a): St<H>, p: PendingMfa, ctx: Ctx, h: HeaderMap, Form(f): Form<MfaForm>) -> Response {
-    let cfg = a.host.config();
     let done = match f.action.as_str() {
         "totp" => a.mfa_totp(&ctx, &p.user, &p.session, &f.code).await.map(|s| (s, None)),
         "recovery" => a.mfa_recovery(&ctx, &p.user, &p.session, &f.code).await.map(|(s, left)| (s, Some(left))),
@@ -57,7 +56,7 @@ pub(super) async fn mfa<H: WebHost>(State(a): St<H>, p: PendingMfa, ctx: Ctx, h:
     };
     match done {
         Ok((s, recovery_left)) => {
-            let cookies = [set_session(&cfg, &s.token), set_device(&a, &cfg, p.user.id)];
+            let cookies = super::signed_in(&a, &s).await;
             match recovery_left {
                 // Straight to where a new set is made, saying how many are left.
                 Some(left) => {

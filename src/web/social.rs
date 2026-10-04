@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use super::auth::need_fresh;
 use super::flash;
-use super::{BASE, St, Viewer, WebHost, error_page, page, refused, see_other, set_device, set_session, status_of};
+use super::{BASE, St, Viewer, WebHost, error_page, page, refused, see_other, set_session, status_of};
 use crate::oauth::Kind;
 use crate::service::{Accounts, Ctx, Error, Intent, LoginStep, SocialOutcome};
 use crate::{pow, util};
@@ -93,7 +93,8 @@ pub(super) async fn callback<H: WebHost>(
     let r = a.oauth_finish(&ctx, kind, flow, &q.state, &q.code, me.as_ref().map(|m| (&m.user, &m.session))).await;
     match r {
         Ok((SocialOutcome::Signed(LoginStep::Done(s)), next)) => {
-            let cookies = [clear, set_session(&cfg, &s.token), set_device(&a, &cfg, s.info.user_id)];
+            let mut cookies = super::signed_in(&a, &s).await;
+            cookies.push(clear);
             see_other(util::safe_next(&next, BASE), &cookies)
         }
         Ok((SocialOutcome::Signed(LoginStep::NeedMfa(s)), next)) => {
@@ -167,8 +168,8 @@ pub(super) async fn signup<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, 
     let proof = pow::Proof { altcha: &f.altcha, ts: &f.ts, honeypot: &f.website, sec_fetch_site: "" };
     match a.oauth_signup(&ctx, cookie_get(&a, &h, SIGNUP_COOKIE), &f.username, proof).await {
         Ok(s) => {
-            let cfg = a.host.config();
-            let cookies = [cookie_set(&a, SIGNUP_COOKIE, "", 0), set_session(&cfg, &s.token), set_device(&a, &cfg, s.info.user_id)];
+            let mut cookies = super::signed_in(&a, &s).await;
+            cookies.push(cookie_set(&a, SIGNUP_COOKIE, "", 0));
             flash::to(&a.keys, BASE, true, "Welcome! Your account is ready.", &cookies)
         }
         Err(e @ Error::Db(_)) => refused(&a, &h, &e),

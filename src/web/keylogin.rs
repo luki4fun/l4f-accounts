@@ -13,7 +13,7 @@ use serde_json::json;
 use super::auth::{NextQuery, need_fresh};
 use super::flash;
 use super::{
-    Authed, BASE, St, WebHost, error_page, json_ok, json_refused, new_nonce, nonce_of, page, refused, see_other, set_device, set_session,
+    Authed, BASE, St, WebHost, error_page, json_ok, json_refused, new_nonce, nonce_of, page, refused, see_other, set_session,
     status_of,
 };
 use crate::service::{Accounts, Ctx, Error, LoginStep, NewDeviceKey};
@@ -67,7 +67,7 @@ pub(super) async fn ssh_login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMa
     let cfg = a.host.config();
     match a.ssh_login(&ctx, &f.token, &nonce_of(&cfg, &h), &f.signature).await {
         Ok(LoginStep::Done(s)) => {
-            let cookies = [set_session(&cfg, &s.token), set_device(&a, &cfg, s.info.user_id)];
+            let cookies = super::signed_in(&a, &s).await;
             see_other(util::safe_next(&f.next, BASE), &cookies)
         }
         Ok(LoginStep::NeedMfa(s)) => {
@@ -180,7 +180,7 @@ pub(super) async fn devkey_login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: Heade
     let cfg = a.host.config();
     match a.devkey_login(&ctx, &f.token, &nonce_of(&cfg, &h), &b64(&f.device_id), &b64(&f.signature)).await {
         Ok(s) => {
-            let cookies = [set_session(&cfg, &s.token), set_device(&a, &cfg, s.info.user_id)];
+            let cookies = super::signed_in(&a, &s).await;
             json_ok(json!({ "next": util::safe_next(&f.next, BASE) }), &cookies)
         }
         Err(e) => json_refused(&e),

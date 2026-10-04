@@ -19,6 +19,7 @@ mod mfa;
 mod passkey;
 #[cfg(feature = "oauth")]
 mod social;
+mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -96,6 +97,20 @@ pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>)
         .route("/oauth/{p}/cb", get(social::callback::<H>))
         .route("/oauth/{p}/unlink", post(social::unlink::<H>));
     r.route("/password", get(mail::password_form::<H>).post(mail::password::<H>))
+        .route("/api/kv", get(storage::kv_list::<H>))
+        .route("/api/kv/{k}", axum::routing::put(storage::kv_put::<H>).delete(storage::kv_delete::<H>))
+        .route("/sync", post(storage::sync::<H>))
+        .route("/api/vault", get(storage::vault_list::<H>))
+        .route(
+            "/api/vault/items/{k}",
+            // An item is up to 72 KiB of ciphertext, past the router's 64 KiB.
+            axum::routing::put(storage::vault_put_item::<H>).delete(storage::vault_delete_item::<H>).layer(DefaultBodyLimit::max(80 * 1024)),
+        )
+        .route("/api/vault/slots/{k}", axum::routing::put(storage::vault_put_slot::<H>).delete(storage::vault_delete_slot::<H>))
+        .route("/vault", get(storage::vault_page::<H>))
+        .route("/vault/wipe", post(storage::vault_wipe::<H>))
+        .route("/assets/sync.js", get(storage::sync_script))
+        .route("/assets/vault.js", get(storage::vault_script))
         .route("/", get(account::dashboard::<H>))
         .route("/sessions/{id}/revoke", post(account::revoke::<H>))
         .route("/display-name", post(account::display_name::<H>))
@@ -170,6 +185,21 @@ fn session_token<'a>(cfg: &Config, h: &'a HeaderMap) -> Option<&'a str> {
 fn set_session(cfg: &Config, token: &str) -> String {
     let age = u64::try_from(cfg.session_max_days).unwrap_or(0) * DAY;
     util::set_cookie(&session_name(cfg), token, age, cfg.cookie_secure, true)
+}
+
+/// The hint `lib.js` reads to load the sync script. Not HttpOnly on purpose:
+/// it only says that sync is on, and a script has to see it.
+fn sync_hint(cfg: &Config, on: bool) -> String {
+    let age = if on { u64::try_from(cfg.session_max_days).unwrap_or(0) * DAY } else { 0 };
+    util::set_cookie(&util::cookie_name("acct-sync", cfg.cookie_secure), if on { "1" } else { "" }, age, cfg.cookie_secure, false)
+}
+
+/// The cookies of a completed sign-in: the session, the known device, and the
+/// sync hint as the account has it.
+async fn signed_in<H: Host>(a: &Accounts<H>, s: &crate::service::NewSession) -> Vec<String> {
+    let cfg = a.host.config();
+    let sync = a.store.user_by_id(s.info.user_id).await.ok().flatten().is_some_and(|u| u.sync_enabled);
+    vec![set_session(&cfg, &s.token), set_device(a, &cfg, s.info.user_id), sync_hint(&cfg, sync)]
 }
 
 fn clear_session(cfg: &Config) -> String {

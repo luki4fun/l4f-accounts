@@ -917,3 +917,74 @@ async fn social_sign_in_runs_through_start_and_callback() {
     assert!(page.contains("/account/oauth/discord?intent=reauth") && !page.contains(r#"name="password""#));
     drop_user(&a, u.id).await;
 }
+
+// ---- storage
+
+fn put_raw(uri: &str, body: Vec<u8>, ctype: &str, cookie: &str, csrf: Option<&str>, version: i64) -> Request<Body> {
+    let mut b = Request::put(uri)
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::COOKIE, cookie)
+        .header(header::IF_MATCH, version.to_string())
+        .header("sec-fetch-site", "same-origin");
+    if let Some(t) = csrf {
+        b = b.header("x-csrf", t);
+    }
+    b.body(Body::from(body)).unwrap()
+}
+
+#[tokio::test]
+async fn sync_api_is_compare_and_set_behind_the_switch() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let u = make_user(&a).await;
+    let role = role_with(&a, &["storage:sync", "vault:use"]).await;
+    give(&a, u.id, &role).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    assert_eq!(send(&app, get("/account/api/kv", None)).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&app, get("/account/api/kv", Some(&c))).await.status(), StatusCode::BAD_REQUEST, "sync is off");
+    let r = send(&app, post("/account/sync", &format!("csrf={t}&_action=on"), Some(&c))).await;
+    let hint = r.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap().to_string()).find(|c| c.starts_with("__Host-acct-sync=1")).unwrap();
+    assert!(!hint.contains("HttpOnly"), "the script reads it");
+    let j = json_of(send(&app, get("/account/api/kv", Some(&c))).await).await;
+    assert_eq!((j["csrf"].as_str(), j["items"].as_array().map(Vec::len)), (Some(t.as_str()), Some(0)));
+    let body = br#"[{"short":"https://l4f.cc/abc"}]"#.to_vec();
+    assert_eq!(send(&app, put_raw("/account/api/kv/links:v1", body.clone(), "application/json", &c, None, 0)).await.status(), StatusCode::FORBIDDEN, "X-CSRF");
+    let r = send(&app, put_raw("/account/api/kv/links:v1", body.clone(), "application/json", &c, Some(&t), 0)).await;
+    assert_eq!((r.status(), json_of(r).await["version"].as_i64()), (StatusCode::OK, Some(1)));
+    let r = send(&app, put_raw("/account/api/kv/links:v1", b"[]".to_vec(), "application/json", &c, Some(&t), 0)).await;
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let j = json_of(r).await;
+    assert_eq!((j["version"].as_i64(), j["v"][0]["short"].as_str()), (Some(1), Some("https://l4f.cc/abc")), "what is there now");
+    let mut del = Request::delete("/account/api/kv/links:v1").header(header::COOKIE, &c).header("x-csrf", &t).header(header::IF_MATCH, "1");
+    del = del.header("sec-fetch-site", "same-origin");
+    assert_eq!(send(&app, del.body(Body::empty()).unwrap()).await.status(), StatusCode::NO_CONTENT);
+    let r = send(&app, post("/account/sync", &format!("csrf={t}&_action=off"), Some(&c))).await;
+    assert!(r.headers().get_all(header::SET_COOKIE).iter().any(|v| v.to_str().unwrap().starts_with("__Host-acct-sync=;")));
+    drop_user(&a, u.id).await;
+    drop_role(&a, &role).await;
+}
+
+#[tokio::test]
+async fn the_vault_api_takes_up_to_72_kib_of_ciphertext_per_item() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let u = make_user(&a).await;
+    let role = role_with(&a, &["vault:use"]).await;
+    give(&a, u.id, &role).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let j = json_of(send(&app, get("/account/api/vault", Some(&c))).await).await;
+    assert_eq!(j["account"].as_str(), Some(u.id.hex().as_str()), "the AAD needs it");
+    let k = format!("note.{}", util::b64u(&util::random::<16>()));
+    let mut item = vec![1u8];
+    item.extend(vec![7u8; 70 * 1024]);
+    let r = send(&app, put_raw(&format!("/account/api/vault/items/{k}"), item, "application/octet-stream", &c, Some(&t), 0)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = send(&app, put_raw(&format!("/account/api/vault/items/{k}"), vec![1u8; 100 * 1024], "application/octet-stream", &c, Some(&t), 1)).await;
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let page = text(send(&app, get("/account/vault", Some(&c))).await).await;
+    assert!(page.contains(r#"id="vault""#) && page.contains(r#"type="module" src="/account/assets/vault.js""#));
+    assert!(text(send(&app, get("/account/assets/vault.js", None)).await).await.contains("l4f-vault-item/v1"));
+    assert!(text(send(&app, get("/account/assets/sync.js", None)).await).await.contains("export function attach"));
+    let r = send(&app, post("/account/vault/wipe", &format!("csrf={t}"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account?ok=The+vault+is+empty."));
+    drop_user(&a, u.id).await;
+    drop_role(&a, &role).await;
+}

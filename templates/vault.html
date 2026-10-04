@@ -1,0 +1,24 @@
+<div class="wrap page">
+<div class="panel read">
+  <p class="crumb"><a href="{{ base }}">Your account</a></p>
+  <h1>Vault</h1>
+  <p class="hint">Secrets kept end-to-end encrypted: locked and unlocked in this browser, stored here only as ciphertext. That protects them from a leaked database or backup, not from a compromised server, which could serve a changed script.</p>
+  {% if allowed %}
+  <div id="vault" data-base="{{ base }}" data-csrf="{{ csrf }}">
+    <div class="notice mt-2" id="vault-msg" role="status" hidden></div>
+    <div id="vault-body"><noscript><div class="callout mt-2"><p>The vault needs JavaScript: the encryption runs in your browser.</p></div></noscript></div>
+  </div>
+  <details class="opt mt-3">
+    <summary>Forgot the passphrase and lost the recovery key?</summary>
+    <p class="hint mt-2">Then nobody can read what is in the vault, this site included. You can empty it and start again.</p>
+    <form method="post" action="{{ base }}/vault/wipe" data-confirm="Delete everything in the vault for good?">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-sm btn-danger" type="submit">Empty the vault</button>
+    </form>
+  </details>
+  {% else %}
+  <div class="notice mt-2" role="status">Your account cannot keep a vault.</div>
+  {% endif %}
+</div>
+</div>
+{% if allowed %}<script type="module" src="{{ base }}/assets/vault.js"></script>{% endif %}
