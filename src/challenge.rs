@@ -60,6 +60,12 @@ pub const MAX_USER: usize = 16;
 /// The browser cookie must be at least this random; a shorter one cannot bind.
 pub const MIN_BROWSER_NONCE: usize = 16;
 
+/// Longest ttl `issue` grants. Every burn lasts this long plus [`SKEW`], so a
+/// burn always outlives its token whatever ttl the caller picked.
+pub const MAX_TTL: i64 = 600;
+/// Slack for the wall clock stepping back while a burn is live.
+const SKEW: i64 = 60;
+
 const MAC_PURPOSE: &str = "challenge";
 const FIXED: usize = 16 + 8 + 1 + 1 + 16;
 /// Length of the longest real token (unpadded payload, dot, 43-char tag);
@@ -79,6 +85,8 @@ fn browser_hash(browser_nonce: &[u8]) -> [u8; 16] {
 /// caller also sets in an HttpOnly cookie, so a challenge minted for one browser
 /// cannot be completed in another. An empty `user` is the same as none.
 ///
+/// `ttl_secs` is clamped to `1..=MAX_TTL`.
+///
 /// # Panics
 /// If `user` is longer than [`MAX_USER`]: callers pass an account id, never input.
 pub fn issue(keys: &Keys, purpose: Purpose, user: Option<&[u8]>, browser_nonce: &[u8], ttl_secs: i64) -> String {
@@ -86,7 +94,7 @@ pub fn issue(keys: &Keys, purpose: Purpose, user: Option<&[u8]>, browser_nonce: 
     assert!(user.len() <= MAX_USER, "challenge user must be an account id (at most {MAX_USER} bytes)");
     let mut p = Vec::with_capacity(FIXED + user.len());
     p.extend_from_slice(&random::<16>());
-    p.extend_from_slice(&now().saturating_add(ttl_secs).to_be_bytes());
+    p.extend_from_slice(&(now() + ttl_secs.clamp(1, MAX_TTL)).to_be_bytes());
     p.push(purpose.byte());
     p.push(user.len() as u8);
     p.extend_from_slice(user);
@@ -125,7 +133,8 @@ pub fn check(
     let exp = i64::from_be_bytes(p[16..24].try_into().expect("length checked"));
     let user_len = p[25] as usize;
     let (token_user, bh) = p[26..].split_at(user_len);
-    if now >= exp {
+    // A token from further ahead than `issue` ever mints would outlive its burn.
+    if now >= exp || exp - now > MAX_TTL + SKEW {
         return Err(Expired);
     }
     if p[24] != purpose.byte() {
@@ -140,12 +149,13 @@ pub fn check(
     Ok(nonce)
 }
 
-/// Spend a checked nonce. `false` means it was already used (or the limiter is
-/// full and refuses single-use keys, which fails closed). `ttl_secs` must be at
-/// least the challenge's own ttl, or the burn could lapse before the token does.
-pub fn burn(limiter: &RateLimiter, nonce: &[u8; 16], ttl_secs: i64) -> bool {
-    let window = std::time::Duration::from_secs(u64::try_from(ttl_secs).unwrap_or(0).max(1));
-    limiter.check(&format!("acct-ch:{}", hex::encode(nonce)), window, 1)
+/// Spend a checked nonce. `false` means it was already used (or a million
+/// burns are live, which fails closed). Call it only once the signature or
+/// assertion over [`challenge_bytes`] verified: a burn before that lets anyone
+/// who can fetch a token fill the set.
+pub fn burn(limiter: &RateLimiter, nonce: &[u8; 16]) -> bool {
+    let ttl = std::time::Duration::from_secs((MAX_TTL + SKEW) as u64);
+    limiter.spend(&format!("acct-ch:{}", hex::encode(nonce)), ttl)
 }
 
 /// SHA-256 of the token text: the WebAuthn `challenge`, the SSH signed message
@@ -208,9 +218,22 @@ mod tests {
         assert!(check(&k, &t, Purpose::Login, None, BROWSER, now() + 30).is_ok());
         assert_eq!(check(&k, &t, Purpose::Login, None, BROWSER, now() + 61), Err(ChallengeError::Expired));
         let dead = issue(&k, Purpose::Login, None, BROWSER, -1);
-        assert_eq!(check(&k, &dead, Purpose::Login, None, BROWSER, now()), Err(ChallengeError::Expired));
+        assert_eq!(check(&k, &dead, Purpose::Login, None, BROWSER, now() + 1), Err(ChallengeError::Expired), "clamped to 1s");
         let huge = issue(&k, Purpose::Login, None, BROWSER, i64::MAX);
-        assert!(check(&k, &huge, Purpose::Login, None, BROWSER, now()).is_ok(), "expiry saturates instead of wrapping");
+        assert!(check(&k, &huge, Purpose::Login, None, BROWSER, now()).is_ok());
+        assert_eq!(check(&k, &huge, Purpose::Login, None, BROWSER, now() + MAX_TTL), Err(ChallengeError::Expired), "clamped to MAX_TTL");
+    }
+
+    /// A token valid longer than its burn could be replayed once the burn lapsed.
+    #[test]
+    fn a_token_that_outlives_its_burn_is_refused() {
+        let k = k();
+        let mut p = vec![0u8; 16];
+        p.extend_from_slice(&(now() + MAX_TTL + SKEW + 10).to_be_bytes());
+        p.extend_from_slice(&[Purpose::Login.byte(), 0]);
+        p.extend_from_slice(&browser_hash(BROWSER));
+        let t = format!("{}.{}", b64u(&p), k.sign(MAC_PURPOSE, &p));
+        assert_eq!(check(&k, &t, Purpose::Login, None, BROWSER, now()), Err(ChallengeError::Expired));
     }
 
     #[test]
@@ -348,12 +371,10 @@ mod tests {
         let k = k();
         let t = issue(&k, Purpose::Login, None, BROWSER, 120);
         let n = check(&k, &t, Purpose::Login, None, BROWSER, now()).unwrap();
-        assert!(burn(&l, &n, 120));
-        assert!(!burn(&l, &n, 120), "a burned nonce must not be accepted twice");
+        assert!(burn(&l, &n));
+        assert!(!burn(&l, &n), "a burned nonce must not be accepted twice");
         assert!(check(&k, &t, Purpose::Login, None, BROWSER, now()).is_ok(), "check alone is stateless; burn is what spends it");
-        assert!(burn(&l, &[9u8; 16], 120), "other nonces are unaffected");
-        assert!(burn(&l, &[8u8; 16], -5), "a nonsense ttl still burns");
-        assert!(!burn(&l, &[8u8; 16], -5));
+        assert!(burn(&l, &[9u8; 16]), "other nonces are unaffected");
     }
 
     #[test]

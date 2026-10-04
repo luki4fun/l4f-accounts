@@ -53,7 +53,7 @@ pub fn issue(key: &[u8], maxnumber: u32, ttl_secs: u64) -> Challenge {
     // The trailing `&` ends the number. Without it, digits can move from the
     // solution into the salt with the hashed string unchanged, and the expiry
     // grows at will (ALTCHA's CVE-2025-68113).
-    let salt = format!("{}?expires={}&", hex::encode(raw), now_secs() + ttl_secs);
+    let salt = format!("{}?expires={}&", hex::encode(raw), now_secs().saturating_add(ttl_secs));
     let number = rand::rng().random_range(0..maxnumber.max(1)) as u64;
     let challenge = hex::encode(Sha256::digest(format!("{salt}{number}").as_bytes()));
     let mut m = <H>::new_from_slice(key).expect("hmac accepts any key length");
@@ -71,9 +71,14 @@ pub fn issue(key: &[u8], maxnumber: u32, ttl_secs: u64) -> Challenge {
 /// Returns the challenge hex on success.
 ///
 /// The signature makes a challenge unforgeable but **not single-use** - the
-/// caller must burn the returned value through the rate limiter, or one solved
-/// challenge registers unlimited accounts.
+/// caller must burn the returned value (`RateLimiter::spend`), or one solved
+/// challenge registers unlimited accounts. [`Gate`] does.
 pub fn verify(key: &[u8], payload_json: &str) -> Result<String, PowErr> {
+    verify_until(key, payload_json).map(|(challenge, _)| challenge)
+}
+
+/// `verify`, plus the signed expiry (unix seconds) the burn must outlive.
+fn verify_until(key: &[u8], payload_json: &str) -> Result<(String, u64), PowErr> {
     let p: Payload = serde_json::from_str(payload_json).map_err(|_| PowErr::Malformed)?;
     if p.algorithm != "SHA-256" {
         return Err(PowErr::Malformed);
@@ -96,7 +101,7 @@ pub fn verify(key: &[u8], payload_json: &str) -> Result<String, PowErr> {
     m.update(p.challenge.as_bytes());
     m.verify_slice(&hex::decode(&p.signature).map_err(|_| PowErr::Malformed)?)
         .map_err(|_| PowErr::Forged)?; // constant-time, free with hmac
-    Ok(p.challenge)
+    Ok((p.challenge, exp))
 }
 
 /// A hidden, signed render timestamp. Catches instantly-submitted and stale
@@ -247,11 +252,13 @@ impl<'a> Gate<'a> {
                 return Err(deny("rate_limited", "Too many attempts from your connection. Try again tomorrow."));
             }
         } else {
-            let challenge = verify(self.key, p.altcha)
+            let (challenge, exp) = verify_until(self.key, p.altcha)
                 .map_err(|_| deny("bad_pow", "The anti-spam check failed. Please try again."))?;
             // The signature proves the challenge is ours, not that it is unused.
-            let ttl = std::time::Duration::from_secs(l.pow_ttl_minutes * 60);
-            if !self.limiter.check(&format!("{ns}:pow:{challenge}"), ttl, 1) {
+            // Burned until its own signed expiry, not the configured ttl, which
+            // a reload may have shortened since it was issued.
+            let ttl = std::time::Duration::from_secs(exp.saturating_sub(now_secs()) + 60);
+            if !self.limiter.spend(&format!("{ns}:pow:{challenge}"), ttl) {
                 return Err(deny("bad_pow", "That anti-spam check was already used. Please try again."));
             }
         }
@@ -259,14 +266,22 @@ impl<'a> Gate<'a> {
     }
 
     /// The site-wide attempt cap and the account caps. Call after the caller's
-    /// own validation, so junk refused there does not spend the global cap.
+    /// own validation, including a lookup that the username is free, so junk
+    /// and taken names refused there do not spend the global cap.
+    ///
+    /// The global caps fail closed: about `max_attempts_per_hour /
+    /// max_attempts_per_ip_hour` sources can shut sign-up for everyone for an
+    /// hour, again and again. The host needs a switch to close sign-up or move
+    /// it behind invites while that happens.
     pub fn caps(&self, no_js: bool) -> Result<Permit, Deny> {
         let (ns, b, l) = (self.ns, self.bucket, self.limits);
-        if !self.limiter.check(&format!("{ns}:try:global"), HOUR, l.max_attempts_per_hour) {
-            return Err(deny("global_cap", "Too many attempts right now. Try again in an hour."));
-        }
+        // Per source first: a source that already has its accounts must not
+        // spend the site-wide budget.
         if !self.limiter.peek(&format!("{ns}:ok:{b}"), DAY, l.max_accounts_per_ip_day) {
             return Err(deny("rate_limited", "You have already created an account today."));
+        }
+        if !self.limiter.check(&format!("{ns}:try:global"), HOUR, l.max_attempts_per_hour) {
+            return Err(deny("global_cap", "Too many attempts right now. Try again in an hour."));
         }
         if !self.limiter.peek(&format!("{ns}:ok:global"), HOUR, l.max_accounts_per_hour) {
             return Err(deny("global_cap", "Too many new accounts right now. Try again in an hour."));
