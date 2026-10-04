@@ -1,5 +1,6 @@
 //! In-memory fixed-window rate limiter, shared by everything that counts
-//! attempts: logins, sign-ups, link creation, single-use challenge burns.
+//! attempts (logins, sign-ups, link creation), plus a separate set of
+//! single-use keys (burned challenges, spent proofs-of-work).
 
 use std::{
     collections::HashMap,
@@ -23,31 +24,49 @@ pub struct RateLimiter {
 struct Inner {
     pruned: Instant,
     hits: HashMap<String, (Duration, Vec<Instant>)>,
+    /// Live keys per kind, for the per-kind quota. Rebuilt on every prune.
+    kinds: HashMap<String, usize>,
+    /// Single-use keys and when each may be forgotten.
+    spent: HashMap<String, Instant>,
 }
 
 impl Default for Inner {
     fn default() -> Self {
-        Self { pruned: Instant::now(), hits: HashMap::new() }
+        Self { pruned: Instant::now(), hits: HashMap::new(), kinds: HashMap::new(), spent: HashMap::new() }
     }
 }
 
 const PRUNE_EVERY: Duration = Duration::from_secs(10);
 
-/// ponytail: hard ceiling on distinct keys, about 10 MB when full. Past it, a new
-/// source shares one spill bucket per kind (`login:*`, `create:*`), so a flood of
-/// one kind is limited wholesale without refusing everyone at every other door.
-/// Site-wide `…:global` keys and `record`s are admitted as they are, which is
-/// why the admin's known devices sign in through `login-dev:global`: a full map
-/// can never fold them into the spill bucket strangers are filling. Single-use
-/// keys (`max` 1: a burned challenge, a no-JS slot) are refused instead: shared,
-/// they would forget what was spent.
-/// Keys are `kind:source`, and sources never contain `:` (see `util::ip_key`).
-const MAX_KEYS: usize = 100_000;
-/// Room above the ceiling for spill and global keys. Past this, refuse outright.
+/// Keys are `kind:source`; the kind is everything before the last `:`, so a
+/// source never contains one (see `util::ip_key`). Past `PER_KIND` live keys of
+/// one kind, a new source of that kind shares one spill bucket (`login:*`): a
+/// flood of one kind is limited wholesale, and every other kind keeps its
+/// per-source buckets. Past `MAX_KEYS` in all, every kind spills. Site-wide
+/// `…:global` keys and `record`s are admitted as they are, up to
+/// `MAX_KEYS + SPILL_ROOM`. Counters with `max` 1 are refused rather than
+/// shared: a shared one would forget what was spent. Single-use keys belong in
+/// `spend`, which no counter flood can crowd out.
+/// ponytail: about 250 B a key, so 50 MB when full.
+const PER_KIND: usize = 25_000;
+const MAX_KEYS: usize = 200_000;
+/// Room above the ceiling for spill, global and recorded keys. Past this, refuse.
 const SPILL_ROOM: usize = 1_000;
+/// Ceiling on live single-use keys, about 100 MB when full. Never evicted
+/// early: forgetting one would let it be replayed, so a full set refuses.
+const SPEND_MAX: usize = 1_000_000;
+
+fn kind_of(key: &str) -> &str {
+    key.rsplit_once(':').map_or("", |(kind, _)| kind)
+}
 
 fn prune(inner: &mut Inner, now: Instant) {
     inner.hits.retain(|_, (window, v)| v.iter().any(|t| now.duration_since(*t) < *window));
+    inner.kinds.clear();
+    for k in inner.hits.keys() {
+        *inner.kinds.entry(kind_of(k).to_string()).or_default() += 1;
+    }
+    inner.spent.retain(|_, until| *until > now);
     inner.pruned = now;
 }
 
@@ -71,17 +90,47 @@ impl RateLimiter {
         self.inner(key, window, None, true);
     }
 
-    fn inner(&self, key: &str, window: Duration, max: Option<usize>, count: bool) -> bool {
+    /// `true` the first time `key` is spent within `ttl`, `false` after. An
+    /// earlier spend keeps its own deadline; a later call never shortens it.
+    /// For single-use tokens: a burned challenge, a solved proof-of-work.
+    pub fn spend(&self, key: &str, ttl: Duration) -> bool {
         let now = Instant::now();
+        let mut g = self.lock(now);
+        match g.spent.get(key) {
+            Some(until) if *until > now => false,
+            Some(_) => {
+                g.spent.insert(key.to_string(), now + ttl);
+                true
+            }
+            None if g.spent.len() >= SPEND_MAX => false,
+            None => {
+                g.spent.insert(key.to_string(), now + ttl);
+                true
+            }
+        }
+    }
+
+    fn lock(&self, now: Instant) -> std::sync::MutexGuard<'_, Inner> {
         let mut g = self.inner.lock().unwrap();
         if now.duration_since(g.pruned) >= PRUNE_EVERY {
             prune(&mut g, now);
         }
+        g
+    }
+
+    fn inner(&self, key: &str, window: Duration, max: Option<usize>, count: bool) -> bool {
+        let now = Instant::now();
+        let mut g = self.lock(now);
         let spill: String;
         let mut key = key;
-        if g.hits.len() >= MAX_KEYS && !g.hits.contains_key(key) {
-            let (kind, src) = key.rsplit_once(':').unwrap_or(("", key));
-            if src != "global" {
+        if !g.hits.contains_key(key) {
+            // A key nobody spent: a peek says yes and leaves no entry behind.
+            if !count {
+                return max != Some(0);
+            }
+            let kind = kind_of(key);
+            let full = g.hits.len() >= MAX_KEYS || g.kinds.get(kind).is_some_and(|n| *n >= PER_KIND);
+            if full && !key.ends_with(":global") {
                 match max {
                     Some(1) => return false,
                     Some(_) => {
@@ -91,11 +140,15 @@ impl RateLimiter {
                     None => {}
                 }
             }
-            if g.hits.len() >= MAX_KEYS + SPILL_ROOM && !g.hits.contains_key(key) {
-                return false;
+            if !g.hits.contains_key(key) {
+                if g.hits.len() >= MAX_KEYS + SPILL_ROOM {
+                    return false;
+                }
+                *g.kinds.entry(kind.to_string()).or_default() += 1;
+                g.hits.insert(key.to_string(), (window, Vec::new()));
             }
         }
-        let (w, e) = g.hits.entry(key.to_string()).or_insert_with(|| (window, Vec::new()));
+        let (w, e) = g.hits.get_mut(key).unwrap();
         *w = window; // the configured window may have changed since the key was first seen
         e.retain(|t| now.duration_since(*t) < window);
         if max.is_some_and(|m| e.len() >= m) {
@@ -150,24 +203,51 @@ mod tests {
         assert!(!l.peek("long", day, 1), "and it is still spent");
     }
 
-    /// The bug this guards against: a flood of one kind filled the map and then
-    /// every new source was refused everywhere, the admin login included.
+    /// The bug this guards against: a flood of one kind filled the shared map,
+    /// and then every challenge burn was refused (no passkey, SSH or device-key
+    /// login for anyone) and every other kind's new sources shared one bucket.
     #[test]
-    fn key_ceiling_spills_new_sources_per_kind() {
+    fn a_flood_of_one_kind_spills_only_that_kind() {
         let l = RateLimiter::default();
         let w = Duration::from_secs(60);
-        for i in 0..MAX_KEYS {
+        for i in 0..PER_KIND {
             assert!(l.check(&format!("create:{i}"), w, 5));
         }
         assert!(l.check("create:0", w, 5), "an existing key keeps working");
-        assert!(l.check("login:1.2.3.4", w, 2), "a new source of another kind still gets in");
-        assert!(l.check("login:5.6.7.8", w, 2));
-        assert!(!l.check("login:9.9.9.9", w, 2), "new sources of that kind share one bucket");
-        assert!(l.check("login:global", w, 1), "a site-wide key keeps its own bucket");
-        assert!(!l.check("mx:pow:abc", w, 1), "a single-use key is refused, not shared");
-        l.record("mx:ok:1.2.3.4", w);
-        assert!(!l.peek("mx:ok:1.2.3.4", w, 1), "a record keeps its own key");
+        assert!(l.check("create:new1", w, 2), "new sources of the flooded kind share one bucket");
+        assert!(l.check("create:new2", w, 2));
+        assert!(!l.check("create:new3", w, 2));
+        assert!(!l.check("create:one", w, 1), "a max-1 counter is refused, not shared");
+        assert!(l.check("login:1.2.3.4", w, 1), "another kind keeps per-source buckets");
+        assert!(l.check("login:5.6.7.8", w, 1));
+        assert!(l.check("create:global", w, 1), "a site-wide key keeps its own bucket");
+        assert!(l.spend("acct-ch:abc", w), "single use still works");
+        assert!(!l.spend("acct-ch:abc", w), "exactly once");
+        l.record("create:rec", w);
+        assert!(!l.peek("create:rec", w, 1), "a record keeps its own key");
         let g = l.inner.lock().unwrap();
-        assert!(g.hits.contains_key("login:*") && !g.hits.contains_key("login:1.2.3.4"));
+        assert!(g.hits.contains_key("create:*") && !g.hits.contains_key("create:new1"));
+    }
+
+    #[test]
+    fn peek_leaves_no_key_behind() {
+        let l = RateLimiter::default();
+        let w = Duration::from_secs(60);
+        assert!(l.peek("nojs:1.2.3.4", w, 1));
+        assert!(l.inner.lock().unwrap().hits.is_empty());
+    }
+
+    #[test]
+    fn spend_is_single_use_until_its_deadline() {
+        let l = RateLimiter::default();
+        assert!(l.spend("k", Duration::from_secs(60)));
+        assert!(!l.spend("k", Duration::from_millis(1)), "a later call does not shorten the deadline");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!l.spend("k", Duration::from_secs(60)), "still spent");
+        assert!(l.spend("short", Duration::from_millis(1)));
+        std::thread::sleep(Duration::from_millis(5));
+        let mut g = l.inner.lock().unwrap();
+        prune(&mut g, Instant::now());
+        assert!(g.spent.contains_key("k") && !g.spent.contains_key("short"), "prune drops only expired spends");
     }
 }
