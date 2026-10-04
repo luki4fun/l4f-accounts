@@ -3,6 +3,20 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.3.0 (2026-10-04)
+
+Signing in with a key. No new migrations.
+
+- SSH keys: added with a signature over an enrol challenge, sign-in via
+  `ssh-keygen -Y sign -n <ssh_namespace>` (default `login@<host>`); a first
+  factor like the password. `sshsig::signer`.
+- Remembered browsers (device keys): WebCrypto Ed25519 in IndexedDB,
+  `/account/assets/devkey.js`; a full session but never a recent sign-in;
+  revoked by sign-out everywhere and every second-factor change, and after
+  90 days unused (`Swept::devkeys`).
+- `remove_credential` for every kind; `/account/credentials/{kind}/{id}/delete`
+  replaces `/account/passkey/{id}/delete` (**BREAKING** for scripts posting there).
+
 ## v0.2.0 (2026-10-04)
 
 Two-factor sign-in. No new migrations.
