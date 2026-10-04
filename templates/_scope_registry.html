@@ -1,0 +1,7 @@
+<details class="opt mt-3">
+  <summary>Scopes this site knows</summary>
+  <dl class="kv mt-2">
+    {% for d in registry %}<dt class="mono">{{ d.name }}</dt><dd>{{ d.description }}</dd>{% endfor %}
+  </dl>
+  <p class="hint">A role may also carry <code>*</code> (everything) or <code>prefix:*</code> (every scope starting with <code>prefix:</code>).</p>
+</details>

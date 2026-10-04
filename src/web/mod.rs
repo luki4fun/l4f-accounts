@@ -8,6 +8,7 @@
 //! - serve `/static/js/pow.js` (the ALTCHA solver the sign-up form loads).
 
 mod account;
+mod admin;
 mod auth;
 mod csrf;
 mod extract;
@@ -81,6 +82,10 @@ pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>)
         .route("/display-name", post(account::display_name::<H>))
         .route("/data", get(account::export::<H>))
         .route("/delete", get(account::delete_form::<H>).post(account::delete::<H>))
+        .route("/admin/users", get(admin::users::<H>))
+        .route("/admin/users/{id}", get(admin::user::<H>).post(admin::user_action::<H>))
+        .route("/admin/roles", get(admin::roles::<H>).post(admin::role_create::<H>))
+        .route("/admin/roles/{name}", get(admin::role::<H>).post(admin::role_action::<H>))
         .route("/login", get(auth::login_form::<H>).post(auth::login::<H>))
         .route("/logout", post(auth::logout::<H>))
         .route("/logout-all", post(auth::logout_all::<H>))

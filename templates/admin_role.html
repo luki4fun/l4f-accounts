@@ -1,0 +1,31 @@
+<div class="wrap page">
+<div class="panel">
+  {% include "_admin_nav.html" %}
+  <h1>{{ role.name }}{% if role.builtin %} <span class="tag">built-in</span>{% endif %}</h1>
+  {% include "_flash.html" %}
+  {% if can_admin %}
+  <form class="narrow mt-2" method="post" action="{{ base }}/admin/roles/{{ role.name }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="_action" value="save">
+    <div class="field"><label for="description">Description</label><input type="text" id="description" name="description" value="{{ role.description }}" maxlength="255"></div>
+    <div class="field"><label for="badge">Badge <span class="muted">(optional)</span></label><input type="text" id="badge" name="badge" value="{% if let Some(b) = role.badge %}{{ b }}{% endif %}" maxlength="32"></div>
+    <div class="field"><label for="scopes">Scopes, one per line</label><textarea id="scopes" name="scopes" rows="6" class="mono" spellcheck="false">{{ scopes_text }}</textarea></div>
+    <button class="btn btn-sm" type="submit">Save</button>
+  </form>
+  {% if !role.builtin %}
+  <form class="mt-2" method="post" action="{{ base }}/admin/roles/{{ role.name }}" data-confirm="Delete the role {{ role.name }}? Everyone holding it loses it.">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="_action" value="delete">
+    <button class="btn btn-sm btn-danger" type="submit">Delete role</button>
+  </form>
+  {% endif %}
+  {% else %}
+  <dl class="kv mt-2">
+    <dt>Description</dt><dd>{{ role.description }}</dd>
+    <dt>Badge</dt><dd>{% if let Some(b) = role.badge %}{{ b }}{% else %}&ndash;{% endif %}</dd>
+    <dt>Scopes</dt><dd class="mono small">{{ role.scopes.join(" ") }}</dd>
+  </dl>
+  {% endif %}
+  {% include "_scope_registry.html" %}
+</div>
+</div>

@@ -1,0 +1,32 @@
+<div class="wrap page">
+<div class="panel">
+  {% include "_admin_nav.html" %}
+  <h1>Users</h1>
+  <form class="mt-2" method="get" action="{{ base }}/admin/users">
+    <div class="pill narrow mt-0">
+      <input type="search" name="q" value="{{ q }}" placeholder="Search username or display name" aria-label="Search users">
+      <button type="submit">Search</button>
+    </div>
+  </form>
+  <div class="table-wrap mt-3">
+    <table>
+      <thead><tr><th>Username</th><th>Display name</th><th>Created</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for r in rows %}
+      <tr>
+        <td><a href="{{ base }}/admin/users/{{ r.id }}">{{ r.username }}</a></td>
+        <td>{{ r.display_name }}</td>
+        <td class="nowrap">{{ r.created }}</td>
+        <td>{% if r.disabled %}<span class="tag warn">suspended</span>{% else %}active{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="btn-row">
+    {% if let Some(p) = prev %}<a class="btn btn-sm btn-quiet" href="{{ base }}/admin/users?q={{ q_enc }}&amp;offset={{ p }}">Previous</a>{% endif %}
+    <span class="muted small">{% if total > 0 %}{{ offset + 1 }}&ndash;{{ shown_to }} of {{ total }}{% else %}None found{% endif %}</span>
+    {% if let Some(n) = next %}<a class="btn btn-sm btn-quiet" href="{{ base }}/admin/users?q={{ q_enc }}&amp;offset={{ n }}">Next</a>{% endif %}
+  </div>
+</div>
+</div>

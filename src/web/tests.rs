@@ -461,3 +461,108 @@ async fn export_is_a_json_attachment_without_secrets() {
     assert!(!body.contains("$argon2") && !body.contains(&hex::encode(h)), "no hash, no session id");
     drop_user(&a, u.id).await;
 }
+
+async fn role_with(a: &Accounts<T>, scopes: &[&str]) -> String {
+    let name = unique("r");
+    let id = a.store.create_role(&name, "", None).await.unwrap().unwrap();
+    a.store.set_role_scopes(id, &scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>()).await.unwrap();
+    name
+}
+
+async fn give(a: &Accounts<T>, user: AccountId, role: &str) {
+    let r = a.store.role_by_name(role).await.unwrap().unwrap();
+    a.store.grant_role(user, r.id, None).await.unwrap();
+}
+
+async fn drop_role(a: &Accounts<T>, name: &str) {
+    if let Some(r) = a.store.role_by_name(name).await.unwrap() {
+        a.store.delete_role(r.id).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn admin_pages_need_their_scope_and_changes_need_step_up() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let nobody = make_user(&a).await;
+    let (c0, _, _) = browser(&a, nobody.id, util::now()).await;
+    assert_eq!(send(&app, get("/account/admin/users", Some(&c0))).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(send(&app, get("/account/admin/roles", Some(&c0))).await.status(), StatusCode::FORBIDDEN);
+
+    let reader = role_with(&a, &["users:read"]).await;
+    let viewer = make_user(&a).await;
+    give(&a, viewer.id, &reader).await;
+    let (c1, t1, _) = browser(&a, viewer.id, util::now()).await;
+    let r = send(&app, get(&format!("/account/admin/users?q={}", nobody.username), Some(&c1))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(text(r).await.contains(&nobody.username));
+    let page = text(send(&app, get("/account", Some(&c1))).await).await;
+    assert!(page.contains("/account/admin/users") && !page.contains("/account/admin/roles\""), "only what it may open");
+    let target = format!("/account/admin/users/{}", nobody.id.hex());
+    assert_eq!(send(&app, get(&target, Some(&c1))).await.status(), StatusCode::OK);
+    let r = send(&app, post(&target, &format!("csrf={t1}&_action=grant&role={reader}"), Some(&c1))).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "reading is not granting");
+
+    let admin_role = role_with(&a, &["users:admin", "users:read", "roles:admin"]).await;
+    let admin = make_user(&a).await;
+    give(&a, admin.id, &admin_role).await;
+    let (stale, st, _) = browser(&a, admin.id, util::now() - 3600).await;
+    let r = send(&app, post(&target, &format!("csrf={st}&_action=grant&role={reader}"), Some(&stale))).await;
+    assert_eq!(location(&r), format!("/account/reauth?next={}", util::urlencode(&target)), "a change needs a recent sign-in");
+
+    let (c2, t2, _) = browser(&a, admin.id, util::now()).await;
+    let (victim, _, _) = browser(&a, nobody.id, util::now()).await;
+    let r = send(&app, post(&target, &format!("csrf={t2}&_action=grant&role={reader}"), Some(&c2))).await;
+    assert!(location(&r).starts_with(&format!("{target}?ok=Role+granted.")), "{}", location(&r));
+    let r = send(&app, post(&target, &format!("csrf={t2}&_action=revoke&role={reader}"), Some(&c2))).await;
+    assert!(location(&r).contains("ok=Role+taken+away"));
+    assert_eq!(send(&app, get("/account", Some(&victim))).await.status(), StatusCode::SEE_OTHER, "signed out by the revoke");
+    let r = send(&app, post(&target, &format!("csrf={t2}&_action=disable"), Some(&c2))).await;
+    assert!(location(&r).contains("ok=Account+suspended"));
+    let r = send(&app, post(&target, &format!("csrf={t2}&_action=nonsense"), Some(&c2))).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let r = send(&app, post(&target, &format!("csrf={t2}&_action=delete"), Some(&c2))).await;
+    assert!(location(&r).starts_with("/account/admin/users?ok=Account+deleted."));
+    assert!(a.store.user_by_id(nobody.id).await.unwrap().is_none());
+
+    drop_user(&a, viewer.id).await;
+    drop_user(&a, admin.id).await;
+    drop_role(&a, &reader).await;
+    drop_role(&a, &admin_role).await;
+}
+
+#[tokio::test]
+async fn roles_are_created_edited_and_deleted() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let admin_role = role_with(&a, &["roles:admin", "users:read"]).await;
+    let admin = make_user(&a).await;
+    give(&a, admin.id, &admin_role).await;
+    let (c, t, _) = browser(&a, admin.id, util::now()).await;
+    let name = unique("r");
+    let r = send(&app, post("/account/admin/roles", &format!("csrf={t}&name={name}&description=Test&badge=&scopes=users%3Aread"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/admin/roles?ok=Role+created."), "{}", location(&r));
+    let second = unique("r");
+    let r = send(&app, post("/account/admin/roles", &format!("csrf={t}&name={}&scopes=users%3Aread", second.to_uppercase()), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/admin/roles?ok="), "names are lowercased");
+    assert!(a.store.role_by_name(&second).await.unwrap().is_some());
+    let r = send(&app, post("/account/admin/roles", &format!("csrf={t}&name={}&scopes=users%3Areed", unique("r")), Some(&c))).await;
+    assert!(location(&r).contains("err=That+is+not+a+scope"), "a typo is refused");
+    let r = send(&app, post("/account/admin/roles", &format!("csrf={t}&name={}&scopes=users%3Aadmin", unique("r")), Some(&c))).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "no handing out what you do not hold");
+
+    let page_url = format!("/account/admin/roles/{name}");
+    let page = text(send(&app, get(&page_url, Some(&c))).await).await;
+    assert!(page.contains(">users:read</textarea>"));
+    let r = send(&app, post(&page_url, &format!("csrf={t}&_action=save&description=New&badge=Mod&scopes=users%3Aread%0Aroles%3Aadmin"), Some(&c))).await;
+    assert!(location(&r).starts_with(&format!("{page_url}?ok=Role+saved.")));
+    let role = a.store.role_by_name(&name).await.unwrap().unwrap();
+    assert_eq!((role.description.as_str(), role.badge.as_deref(), role.scopes.len()), ("New", Some("Mod"), 2));
+    let r = send(&app, post(&page_url, &format!("csrf={t}&_action=delete"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/admin/roles?ok=Role+deleted."));
+    let r = send(&app, post("/account/admin/roles/user", &format!("csrf={t}&_action=delete"), Some(&c))).await;
+    assert!(location(&r).contains("err=Built-in"), "{}", location(&r));
+    assert_eq!(send(&app, get("/account/admin/roles/nope-nope", Some(&c))).await.status(), StatusCode::NOT_FOUND);
+
+    drop_user(&a, admin.id).await;
+    drop_role(&a, &admin_role).await;
+    drop_role(&a, &second).await;
+}
