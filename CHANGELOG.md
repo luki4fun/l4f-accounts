@@ -3,6 +3,18 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.4.0 (2026-10-04)
+
+Mail. No new migrations.
+
+- Feature `email` (now implies `mysql`): `email::Mailer` (SMTP, implicit TLS,
+  optionally through an SNI egress forwarder), `Accounts::with_mailer`.
+- Address confirmation by link, forgotten password reset by link (bound to
+  the current hash: works once), password change with a recent sign-in.
+- Config `smtp_host`, `smtp_port`, `smtp_user`, `smtp_from`, `egress`.
+- Password policy messages are sentences (**BREAKING** for hosts matching
+  the old strings).
+
 ## v0.3.0 (2026-10-04)
 
 Signing in with a key. No new migrations.
