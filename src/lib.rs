@@ -19,6 +19,8 @@ pub mod qr;
 pub mod recovery;
 pub mod scope;
 #[cfg(feature = "mysql")]
+pub mod service;
+#[cfg(feature = "mysql")]
 pub mod store;
 pub mod totp;
 pub mod util;
