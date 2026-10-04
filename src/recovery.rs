@@ -13,7 +13,7 @@
 //! once an old master is dropped, its codes stop working and the user makes a
 //! new set.
 
-use rand::Rng;
+use rand::{Rng, TryRngCore};
 
 use crate::util::mac_raw;
 
@@ -28,7 +28,8 @@ const GROUP_LEN: usize = 4;
 
 /// Codes look like "abcd-efgh-jkmn": 12 symbols grouped by 4.
 pub fn generate() -> Vec<String> {
-    let mut rng = rand::rng();
+    // The OS RNG, like every other secret here (see `util::random`).
+    let mut rng = rand::rngs::OsRng.unwrap_err();
     let mut codes: Vec<String> = Vec::with_capacity(COUNT);
     while codes.len() < COUNT {
         let mut c = String::with_capacity(GROUPS * (GROUP_LEN + 1));

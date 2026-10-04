@@ -20,6 +20,7 @@ pub enum IpMode {
 }
 
 pub fn shape_ip(ip: IpAddr, mode: IpMode, salt: &[u8]) -> String {
+    let ip = ip.to_canonical(); // ::ffff:a.b.c.d is an IPv4 client
     match mode {
         IpMode::None => String::new(),
         // The mode can be hot-reloaded while the salt is only checked at boot.
@@ -63,6 +64,9 @@ mod tests {
         assert_eq!(shape_ip(v4, IpMode::Hash, b"short"), "", "a short salt stores nothing");
         let v6: IpAddr = "2001:db8:abcd:1234::1".parse().unwrap();
         assert_eq!(shape_ip(v6, IpMode::Truncate, b""), "2001:db8:abcd::");
+        let mapped: IpAddr = "::ffff:203.0.113.42".parse().unwrap();
+        assert_eq!(shape_ip(mapped, IpMode::Truncate, b""), "203.0.113.0");
+        assert_eq!(shape_ip(mapped, IpMode::Hash, &[7; 32]), shape_ip(v4, IpMode::Hash, &[7; 32]));
     }
 
     #[test]

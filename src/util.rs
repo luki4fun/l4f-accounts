@@ -50,7 +50,9 @@ pub fn cookie_name(base: &str, secure: bool) -> String {
 pub fn cookie<'a>(header: Option<&'a str>, name: &str) -> Option<&'a str> {
     header?.split(';').find_map(|p| {
         let (k, v) = p.split_once('=')?;
-        (k.trim() == name).then_some(v.trim())
+        // ASCII trim only: Unicode-aware trim would let "\u{85}__Host-x" pass as
+        // the `__Host-` cookie, which a sibling subdomain can set.
+        (k.trim_ascii() == name).then_some(v.trim_ascii())
     })
 }
 
@@ -71,8 +73,10 @@ pub fn set_cookie(name: &str, value: &str, max_age: u64, secure: bool, http_only
 ///
 /// Never contains `:`: the limiter finds a key's kind by its last colon.
 pub fn ip_key(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(_) => ip.to_string(),
+    // A dual-stack socket reports IPv4 clients as ::ffff:a.b.c.d, which would
+    // put every one of them in the same /64.
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => {
             let s = v6.segments();
             format!("{:x}-{:x}-{:x}-{:x}/64", s[0], s[1], s[2], s[3])
@@ -120,11 +124,15 @@ pub fn b64u_dec(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).ok()
 }
 
-/// `n` bytes from the thread CSPRNG.
+/// `n` bytes from the OS CSPRNG. Not `rand`'s thread RNG: that one is a
+/// userspace generator a fork would duplicate.
+///
+/// # Panics
+/// If the OS RNG fails.
 pub fn random<const N: usize>() -> [u8; N] {
-    use rand::RngCore;
+    use ring::rand::SecureRandom;
     let mut b = [0u8; N];
-    rand::rng().fill_bytes(&mut b);
+    ring::rand::SystemRandom::new().fill(&mut b).expect("OS RNG failed");
     b
 }
 
@@ -138,6 +146,7 @@ mod tests {
         assert_eq!(cookie(h, "__Host-sid"), Some("abc.1.def"));
         assert_eq!(cookie(h, "missing"), None);
         assert_eq!(cookie(None, "x"), None);
+        assert_eq!(cookie(Some("\u{85}__Host-sid=evil"), "__Host-sid"), None, "only ASCII space is trimmed");
     }
 
     #[test]
@@ -149,6 +158,7 @@ mod tests {
         assert_ne!(ip_key(a), ip_key(c));
         assert_eq!(ip_key(a), "2001-db8-abcd-1234/64");
         assert_eq!(ip_key("203.0.113.42".parse().unwrap()), "203.0.113.42");
+        assert_eq!(ip_key("::ffff:203.0.113.42".parse().unwrap()), "203.0.113.42", "a mapped IPv4 client is itself");
     }
 
     #[test]
