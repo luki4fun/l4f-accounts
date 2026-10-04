@@ -44,9 +44,10 @@ pub trait Host: Send + Sync + 'static {
     ) -> impl Future<Output = sqlx::Result<()>> + Send;
 }
 
-/// No `Debug`: it carries the IP salt.
-#[derive(Clone, Deserialize)]
-#[serde(default)]
+/// The host's `[accounts]` section. Unknown keys are refused, so a typo in a
+/// limit fails the config load instead of silently keeping the default.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Off refuses every sign-in and sign-up; sessions already issued keep working.
     pub enabled: bool,
@@ -75,8 +76,6 @@ pub struct Config {
     pub cookie_secure: bool,
     #[serde(skip)]
     pub ip_mode: IpMode,
-    #[serde(skip)]
-    pub ip_salt: Vec<u8>,
 }
 
 impl Default for Config {
@@ -102,7 +101,6 @@ impl Default for Config {
             base_url: String::new(),
             cookie_secure: true,
             ip_mode: IpMode::default(),
-            ip_salt: Vec::new(),
         }
     }
 }
@@ -262,6 +260,8 @@ pub struct Accounts<H: Host> {
     pub scopes: Vec<ScopeDef>,
     /// ALTCHA key; sign-up stays closed without one.
     pub pow_key: Option<Vec<u8>>,
+    /// For `IpMode::Hash`. A secret, so never part of `Config`.
+    ip_salt: Vec<u8>,
     /// Held from the sign-up gate's peek to its commit.
     reg_lock: Mutex<()>,
     /// Argon2 runs at most two at once; owned permits move into the blocking
@@ -290,6 +290,23 @@ impl<H: Host> Accounts<H> {
         host: H,
         app_scopes: &[ScopeDef],
         pow_key: Option<Vec<u8>>,
+        ip_salt: Vec<u8>,
+    ) -> sqlx::Result<Self> {
+        let a = Self::new(store, keys, limiter, host, app_scopes, pow_key, ip_salt)?;
+        a.store.ensure_builtin_roles(&a.host.config().default_user_scopes).await?;
+        Ok(a)
+    }
+
+    /// `build` without touching the database: the same checks, no role seeding.
+    /// For tests that never reach the store.
+    pub fn new(
+        store: Store,
+        keys: Keys,
+        limiter: Arc<RateLimiter>,
+        host: H,
+        app_scopes: &[ScopeDef],
+        pow_key: Option<Vec<u8>>,
+        ip_salt: Vec<u8>,
     ) -> sqlx::Result<Self> {
         if let Some(bad) = app_scopes.iter().find(|d| !scope::valid_scope(d.name)) {
             return Err(sqlx::Error::InvalidArgument(format!("not a valid scope name: {:?}", bad.name)));
@@ -302,14 +319,13 @@ impl<H: Host> Accounts<H> {
             host,
             scopes,
             pow_key,
+            ip_salt,
             reg_lock: Mutex::new(()),
             hash_permits: Arc::new(Semaphore::new(2)),
         };
-        let cfg = a.host.config();
-        if let Some(bad) = cfg.default_user_scopes.iter().find(|s| !a.known_grant(s)) {
+        if let Some(bad) = a.host.config().default_user_scopes.iter().find(|s| !a.known_grant(s)) {
             return Err(sqlx::Error::InvalidArgument(format!("default_user_scopes: unknown scope {bad:?}")));
         }
-        a.store.ensure_builtin_roles(&cfg.default_user_scopes).await?;
         Ok(a)
     }
 
@@ -338,8 +354,7 @@ impl<H: Host> Accounts<H> {
 
     /// The address as config allows it to be stored or logged.
     fn shaped_ip(&self, ip: IpAddr) -> String {
-        let cfg = self.host.config();
-        ip::shape_ip(ip, cfg.ip_mode, &cfg.ip_salt)
+        ip::shape_ip(ip, self.host.config().ip_mode, &self.ip_salt)
     }
 
     async fn audit(&self, ctx: &Ctx, user: Option<AccountId>, actor: Option<AccountId>, event: &str, detail: &str) -> sqlx::Result<()> {

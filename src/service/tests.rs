@@ -64,7 +64,7 @@ fn cfg() -> Config {
 async fn on(store: Store, cfg: Config) -> Accounts<Stub> {
     let host = Stub { cfg: Arc::new(cfg), deleted: StdMutex::default() };
     let keys = Keys::new(&[7; 32], None).unwrap();
-    Accounts::build(store, keys, Arc::default(), host, APP, Some(POW_KEY.to_vec())).await.unwrap()
+    Accounts::build(store, keys, Arc::default(), host, APP, Some(POW_KEY.to_vec()), Vec::new()).await.unwrap()
 }
 
 async fn shared(cfg: Config) -> Option<Accounts<Stub>> {
@@ -214,8 +214,9 @@ fn defaults_keep_signup_closed_and_the_2fa_rule_off_until_phase_2() {
     assert_eq!(parsed.signup.max_accounts_per_ip_day, 1);
     assert_eq!(parsed.signup.max_attempts_per_hour, 60, "unset limits keep their defaults");
     assert_eq!(parsed.min_password_len, 10);
-    let salted: Config = serde_json::from_str(r#"{"ip_salt": [1, 2]}"#).unwrap();
-    assert!(salted.ip_salt.is_empty(), "secrets never come from config");
+    for bad in [r#"{"ip_salt": [1, 2]}"#, r#"{"registraton_open": true}"#, r#"{"signup": {"max_acounts_per_hour": 1}}"#] {
+        assert!(serde_json::from_str::<Config>(bad).is_err(), "{bad}: unknown keys, secrets included, are refused");
+    }
 }
 
 #[test]

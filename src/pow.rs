@@ -137,7 +137,7 @@ pub fn stamp_age(key: &[u8], raw: &str) -> Option<u64> {
 /// Callers must hold one async lock from `precheck` to `commit`, or parallel
 /// posts all pass the same peek before any of them counts.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_attempts_per_ip_hour: usize,
     pub max_attempts_per_hour: usize,
