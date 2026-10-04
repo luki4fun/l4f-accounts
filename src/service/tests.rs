@@ -200,6 +200,16 @@ fn service_futures_are_send(a: &Accounts<Stub>, c: &Ctx, actor: Actor<'_>) {
     send(a.set_user_status(c, actor, actor.user.id, UserStatus::Disabled));
     send(a.bootstrap_admin("", ""));
     send(a.sweep(0));
+    send(a.confirm_password(c, actor.user, ""));
+    send(a.set_display_name(c, actor.user.id, ""));
+    send(a.sessions(actor.user.id, 0));
+    send(a.revoke_session(c, actor.user.id, &[0; 32]));
+}
+
+#[allow(dead_code)]
+fn step_up_is_send(a: &Accounts<Stub>, c: &Ctx, u: &User, s: &SessionInfo) {
+    fn send<T: Send>(_: T) {}
+    send(a.step_up(c, u, s, ""));
 }
 
 #[test]
@@ -735,4 +745,92 @@ async fn sweep_removes_dead_sessions_and_old_audit_rows() {
     assert_eq!(keep_all.sweep(now).await.unwrap().audit, 0, "retention 0 keeps the log");
     drop((a, keep_all));
     f.done().await;
+}
+
+#[tokio::test]
+async fn confirm_password_shares_the_account_bucket() {
+    let Some(a) = shared(Config { login_per_user_15min: 3, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.60");
+    let u = make_user(&a, &[]).await;
+    a.confirm_password(&c, &u, PW).await.unwrap();
+    assert!(matches!(a.confirm_password(&c, &u, "wrong password").await, Err(Error::Invalid("Wrong password."))));
+    let cross = Ctx { sec_fetch_site: "same-site".into(), ..ctx("203.0.113.60") };
+    assert!(matches!(a.confirm_password(&cross, &u, PW).await, Err(Error::CrossSite)));
+    a.confirm_password(&c, &u, PW).await.unwrap();
+    assert!(matches!(a.confirm_password(&c, &u, PW).await, Err(Error::RateLimited)), "3 per account, right or wrong");
+    assert!(
+        matches!(a.login_password(&ctx("203.0.113.61"), &u.username, PW, None).await, Err(Error::RateLimited)),
+        "the login form spends the same bucket"
+    );
+    let mut logged = false;
+    for _ in 0..50 {
+        if audit_events(&a, u.id).await.contains(&"reauth_fail".to_string()) {
+            logged = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(logged, "a wrong password is audited");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+#[tokio::test]
+async fn step_up_refreshes_auth_at_and_rotates_the_token() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.62");
+    let u = make_user(&a, &[]).await;
+    let now = util::now();
+    // A login long ago: the session is live but not fresh.
+    let old = a.create_session(u.id, "password", true, now - 3600, &c).await.unwrap();
+    let (_, info, _) = a.session_from_token(&old.token, now).await.unwrap().unwrap();
+    assert!(!a.fresh(&info, now), "an hour-old sign-in is stale");
+    assert!(matches!(a.step_up(&c, &u, &info, "wrong password").await, Err(Error::Invalid(_))));
+    let new = a.step_up(&c, &u, &info, PW).await.unwrap();
+    assert!(a.session_from_token(&old.token, now).await.unwrap().is_none(), "the old token is dead");
+    let (_, fresh, _) = a.session_from_token(&new.token, now).await.unwrap().unwrap();
+    assert!(a.fresh(&fresh, util::now()));
+    assert!(!a.fresh(&fresh, fresh.auth_at + 15 * 60), "15 minutes by default");
+    assert_eq!(fresh.created_at, info.created_at, "same session");
+    assert!(audit_events(&a, u.id).await.contains(&"step_up".to_string()));
+
+    // Someone else's session, a pending one, and a 2FA account are refused.
+    let other = make_user(&a, &[]).await;
+    assert!(matches!(a.step_up(&c, &other, &fresh, PW).await, Err(Error::Forbidden)));
+    let pending = a.create_session(u.id, "password", false, 0, &c).await.unwrap();
+    assert!(matches!(a.step_up(&c, &u, &pending.info, PW).await, Err(Error::Forbidden)));
+    assert!(!a.fresh(&pending.info, now));
+    sqlx::query("UPDATE acct_users SET totp_enc = x'00' WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    let u2 = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(matches!(a.step_up(&c, &u2, &fresh, PW).await, Err(Error::Invalid(_))), "a password alone is not enough with 2FA");
+    cleanup(&a, &[u.id, other.id], &[]).await;
+}
+
+#[tokio::test]
+async fn display_name_sessions_and_revoke() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.63");
+    let u = make_user(&a, &[]).await;
+    let other = make_user(&a, &[]).await;
+    assert_eq!(a.set_display_name(&c, u.id, "  Dee  ").await.unwrap(), "Dee");
+    assert!(matches!(a.set_display_name(&c, u.id, "a\u{202e}b").await, Err(Error::Invalid(_))));
+    assert_eq!(a.store.user_by_id(u.id).await.unwrap().unwrap().display_name, "Dee", "a refused name changes nothing");
+
+    let now = util::now();
+    let live = sess(u.id, now - 10, now + DAY);
+    let expired = sess(u.id, now - 10, now - 1);
+    let idle = sess(u.id, now - 8 * DAY, now + DAY);
+    for s in [&live, &expired, &idle] {
+        a.store.insert_session(s).await.unwrap();
+    }
+    let listed: Vec<_> = a.sessions(u.id, now).await.unwrap().into_iter().map(|s| s.token_hash).collect();
+    assert_eq!(listed, [live.token_hash], "expired and idle rows are left out");
+
+    assert!(!a.revoke_session(&c, other.id, &live.token_hash).await.unwrap(), "someone else's hash deletes nothing");
+    assert_eq!(a.sessions(u.id, now).await.unwrap().len(), 1);
+    assert!(a.revoke_session(&c, u.id, &live.token_hash).await.unwrap());
+    assert!(a.sessions(u.id, now).await.unwrap().is_empty());
+    assert!(!a.revoke_session(&c, u.id, &live.token_hash).await.unwrap());
+    let ev = audit_events(&a, u.id).await;
+    assert!(ev.contains(&"session_revoke".to_string()) && ev.contains(&"display_name".to_string()));
+    cleanup(&a, &[u.id, other.id], &[]).await;
 }

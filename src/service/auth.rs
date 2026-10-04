@@ -9,7 +9,7 @@ use crate::model::{AccountId, NewUser, SessionInfo, User, UserStatus};
 use crate::store::{CreateUserError, TOUCH_SECS};
 use crate::{password, pow, scope, util};
 
-const WINDOW: Duration = Duration::from_secs(900);
+pub(super) const WINDOW: Duration = Duration::from_secs(900);
 /// How long a session waits for its second factor.
 const PENDING_MFA_SECS: i64 = 600;
 
@@ -36,7 +36,7 @@ pub enum LoginStep {
 }
 
 /// SHA-256 of the token's 32 bytes, or `None` for anything never issued.
-pub(super) fn token_hash(token: &str) -> Option<[u8; 32]> {
+pub(crate) fn token_hash(token: &str) -> Option<[u8; 32]> {
     // 32 bytes are exactly 43 characters; also refuses a padded second spelling.
     if token.len() != 43 {
         return None;

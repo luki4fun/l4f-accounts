@@ -6,6 +6,7 @@
 //! domain value or an `Error`, which knows its sentence for the user and its
 //! label for the log.
 
+mod account;
 mod admin;
 mod auth;
 #[cfg(test)]
