@@ -78,12 +78,24 @@ pub(super) async fn mfa<H: WebHost>(State(a): St<H>, p: PendingMfa, ctx: Ctx, h:
 
 // ---- the security page
 
-struct PasskeyRow {
+struct KeyRow {
     /// base64url of the credential id: names it in its delete URL.
     id: String,
     name: String,
     created: String,
     used: String,
+}
+
+fn rows(creds: Vec<crate::model::Credential>) -> Vec<KeyRow> {
+    creds
+        .into_iter()
+        .map(|c| KeyRow {
+            id: util::b64u(&c.ext_id),
+            created: when(c.created_at),
+            used: c.last_used_at.map(when).unwrap_or_else(|| "never".into()),
+            name: c.name,
+        })
+        .collect()
 }
 
 #[derive(Template)]
@@ -94,12 +106,16 @@ struct SecurityTpl<'a> {
     fresh: bool,
     totp: bool,
     recovery_left: i64,
-    passkeys: Vec<PasskeyRow>,
+    passkeys: Vec<KeyRow>,
+    ssh: Vec<KeyRow>,
+    devkeys: Vec<KeyRow>,
+    username: &'a str,
     flash: Option<Flash>,
 }
 
 pub(super) async fn security<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderMap, Query(fq): Query<flash::Query>) -> Response {
-    let (left, keys) = match tokio::try_join!(a.recovery_left(me.user.id), a.passkeys(me.user.id)) {
+    let id = me.user.id;
+    let (left, passkeys, ssh, devkeys) = match tokio::try_join!(a.recovery_left(id), a.passkeys(id), a.ssh_keys(id), a.devkeys(id)) {
         Ok(v) => v,
         Err(e) => return refused(&a, &h, &Error::Db(e)),
     };
@@ -109,15 +125,10 @@ pub(super) async fn security<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderM
         fresh: a.fresh(&me.session, util::now()),
         totp: me.user.totp_enabled,
         recovery_left: left,
-        passkeys: keys
-            .into_iter()
-            .map(|c| PasskeyRow {
-                id: util::b64u(&c.ext_id),
-                created: when(c.created_at),
-                used: c.last_used_at.map(when).unwrap_or_else(|| "never".into()),
-                name: c.name,
-            })
-            .collect(),
+        passkeys: rows(passkeys),
+        ssh: rows(ssh),
+        devkeys: rows(devkeys),
+        username: &me.user.username,
         flash: flash::read(&a.keys, &fq),
     };
     page(&a, &h, "Security", StatusCode::OK, &t)

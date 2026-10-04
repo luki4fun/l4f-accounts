@@ -13,6 +13,7 @@ mod auth;
 mod csrf;
 mod extract;
 mod flash;
+mod keylogin;
 mod mfa;
 mod passkey;
 #[cfg(test)]
@@ -100,8 +101,15 @@ pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>)
         .route("/passkey/add", post(passkey::add::<H>))
         .route("/passkey/mfa", post(passkey::mfa::<H>))
         .route("/passkey/step-up", post(passkey::step_up::<H>))
-        .route("/passkey/{id}/delete", post(passkey::remove::<H>))
         .route("/assets/passkey.js", get(passkey::script))
+        .route("/login/ssh", get(keylogin::ssh_login_form::<H>).post(keylogin::ssh_login::<H>))
+        .route("/ssh", get(keylogin::ssh_add_form::<H>).post(keylogin::ssh_add::<H>))
+        .route("/devkey/options/add", post(keylogin::devkey_options_add::<H>))
+        .route("/devkey/options/login", post(keylogin::devkey_options_login::<H>))
+        .route("/devkey/add", post(keylogin::devkey_add::<H>))
+        .route("/devkey/login", post(keylogin::devkey_login::<H>))
+        .route("/assets/devkey.js", get(keylogin::devkey_script))
+        .route("/credentials/{kind}/{id}/delete", post(keylogin::remove::<H>))
         .route("/login", get(auth::login_form::<H>).post(auth::login::<H>))
         .route("/logout", post(auth::logout::<H>))
         .route("/logout-all", post(auth::logout_all::<H>))

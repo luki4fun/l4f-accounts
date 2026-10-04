@@ -19,9 +19,12 @@
         <button class="btn" type="submit">Sign in</button>
       </form>
       <button class="btn btn-quiet mt-2" type="button" hidden data-passkey="login" data-base="{{ base }}" data-next="{{ next }}" data-status="pk-status"{% if let Some(t) = csrf %} data-csrf="{{ t }}"{% endif %}>Sign in with a passkey</button>
+      <button class="btn btn-quiet mt-2" type="button" hidden data-devkey="login" data-base="{{ base }}" data-next="{{ next }}" data-status="pk-status"{% if let Some(t) = csrf %} data-csrf="{{ t }}"{% endif %}>Sign in on this browser</button>
       <p class="hint" id="pk-status" role="status" aria-live="polite"></p>
+      <p class="hint mt-2"><a href="{{ base }}/login/ssh{% if !next.is_empty() %}?next={{ next|urlencode }}{% endif %}">Sign in with an SSH key</a></p>
       {% if signup_open %}<p class="hint mt-2">No account yet? <a href="{{ base }}/register">Create one</a>.</p>{% endif %}
     </div>
   </div>
 </section>
 <script src="{{ base }}/assets/passkey.js" defer></script>
+<script src="{{ base }}/assets/devkey.js" defer></script>

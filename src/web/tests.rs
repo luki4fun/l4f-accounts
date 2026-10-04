@@ -686,7 +686,7 @@ async fn passkeys_are_added_and_used_through_the_json_endpoints() {
 
     // Removing it, with a recent sign-in, from the security page's form.
     let id = util::b64u(&auth.id);
-    let r = send(&app, post(&format!("/account/passkey/{id}/delete"), &format!("csrf={t}"), Some(&c))).await;
+    let r = send(&app, post(&format!("/account/credentials/passkey/{id}/delete"), &format!("csrf={t}"), Some(&c))).await;
     assert!(location(&r).starts_with("/account/security?ok=Passkey+removed."));
     assert!(!a.store.user_by_id(u.id).await.unwrap().unwrap().has_passkey);
     drop_user(&a, u.id).await;
@@ -710,4 +710,83 @@ async fn the_passkey_script_is_served_and_privileged_accounts_are_told_about_2fa
     assert_eq!(send(&app, get("/account/admin/users", Some(&c))).await.status(), StatusCode::FORBIDDEN, "held, not granted");
     drop_user(&a, u.id).await;
     drop_role(&a, &admin_role).await;
+}
+
+// ---- key sign-in
+
+fn token_on(page: &str) -> String {
+    field(page, "token")
+}
+
+#[tokio::test]
+async fn ssh_keys_are_added_and_sign_in_through_the_pages() {
+    let Some((app, a)) = shared(pk_cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let key = crate::testkit::EdKey::new();
+    let r = send(&app, get("/account/ssh", Some(&c))).await;
+    let nonce = set_cookie(&r, "__Host-acct-ch").unwrap();
+    let page = text(r).await;
+    assert!(page.contains("ssh-keygen -Y sign -n login@l4f.cc"));
+    let token = token_on(&page);
+    let sig = key.ssh_sign("login@l4f.cc", token.as_bytes());
+    let body = format!(
+        "csrf={t}&token={token}&key={}&signature={}",
+        util::urlencode(&key.ssh_public("me@box")),
+        util::urlencode(&sig)
+    );
+    let r = send(&app, post("/account/ssh", &body, Some(&format!("{c}; {nonce}")))).await;
+    assert!(location(&r).starts_with("/account/security?ok=SSH+key+added."), "{}", location(&r));
+    assert!(text(send(&app, get("/account/security", Some(&c))).await).await.contains("<td>me@box</td>"));
+
+    let r = send(&app, get("/account/login/ssh?next=%2Faccount%2Fsecurity", None)).await;
+    let nonce = set_cookie(&r, "__Host-acct-ch").unwrap();
+    let page = text(r).await;
+    let token = token_on(&page);
+    let sig = key.ssh_sign("login@l4f.cc", token.as_bytes());
+    let body = format!("token={token}&next=%2Faccount%2Fsecurity&signature={}", util::urlencode(&sig));
+    let r = send(&app, post("/account/login/ssh", &body, Some(&nonce))).await;
+    assert_eq!((r.status(), location(&r)), (StatusCode::SEE_OTHER, "/account/security"));
+    assert!(set_cookie(&r, "__Host-acct").is_some());
+    let r = send(&app, post("/account/login/ssh", &body, Some(&nonce))).await;
+    assert!(text(r).await.contains("That took too long"), "a replay gets a fresh page and an error");
+
+    let id = util::b64u(&a.ssh_keys(u.id).await.unwrap()[0].ext_id);
+    let r = send(&app, post(&format!("/account/credentials/ssh/{id}/delete"), &format!("csrf={t}"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/security?ok=SSH+key+removed."));
+    let r = send(&app, post(&format!("/account/credentials/nonsense/{id}/delete"), &format!("csrf={t}"), Some(&c))).await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    drop_user(&a, u.id).await;
+}
+
+#[tokio::test]
+async fn a_remembered_browser_signs_in_through_the_json_endpoints() {
+    let Some((app, a)) = shared(pk_cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let key = crate::testkit::EdKey::new();
+    let device = util::random::<16>();
+    let r = send(&app, post_json("/account/devkey/options/add", &serde_json::json!({}), Some(&c), Some(&t))).await;
+    let nonce = set_cookie(&r, "__Host-acct-ch").unwrap();
+    let token = json_of(r).await["token"].as_str().unwrap().to_string();
+    let sig = key.devkey_sign("https://l4f.cc", &device, &crate::challenge::challenge_bytes(&token));
+    let body = serde_json::json!({ "token": token, "device_id": util::b64u(&device), "public_key": util::b64u(&key.raw_public()), "signature": util::b64u(&sig) });
+    let r = send(&app, post_json("/account/devkey/add", &body, Some(&format!("{c}; {nonce}")), Some(&t))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+
+    let r = send(&app, post_json("/account/devkey/options/login", &serde_json::json!({}), None, None)).await;
+    let nonce = set_cookie(&r, "__Host-acct-ch").unwrap();
+    let token = json_of(r).await["token"].as_str().unwrap().to_string();
+    let sig = key.devkey_sign("https://l4f.cc", &device, &crate::challenge::challenge_bytes(&token));
+    let body = serde_json::json!({ "token": token, "device_id": util::b64u(&device), "signature": util::b64u(&sig), "next": "/account" });
+    let r = send(&app, post_json("/account/devkey/login", &body, Some(&nonce), None)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let full = set_cookie(&r, "__Host-acct").unwrap();
+    let page = text(send(&app, get("/account/security", Some(&full))).await).await;
+    assert!(page.contains("Confirm it's you"), "a remembered browser is never a recent sign-in");
+
+    let r = send(&app, get("/account/assets/devkey.js", None)).await;
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache");
+    assert!(text(r).await.contains("l4f-devkey-v1"));
+    drop_user(&a, u.id).await;
 }

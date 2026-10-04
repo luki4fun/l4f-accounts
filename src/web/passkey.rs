@@ -3,9 +3,9 @@
 //! reads it back. With a session cookie the CSRF layer wants `X-CSRF`.
 
 use axum::{
-    Form, Json,
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    Json,
+    extract::State,
+    http::{HeaderMap, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use serde_json::json;
 
 use super::flash;
 use super::{
-    Authed, BASE, PendingMfa, St, WebHost, error_page, json_ok, json_refused, new_nonce, nonce_of, refused, set_device, set_session,
+    Authed, BASE, PendingMfa, St, WebHost, json_ok, json_refused, new_nonce, nonce_of, set_device, set_session,
 };
 use crate::service::{Ctx, Error, PasskeyFor};
 use crate::util;
@@ -102,23 +102,6 @@ pub(super) async fn step_up<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h
     match a.passkey_step_up(&ctx, &me.user, &me.session, &f.token, &nonce, &f.credential.to_string()).await {
         Ok(s) => json_ok(json!({ "next": util::safe_next(&f.next, BASE) }), &[set_session(&cfg, &s.token)]),
         Err(e) => json_refused(&e),
-    }
-}
-
-#[derive(Deserialize, Default)]
-pub(super) struct Empty {}
-
-/// A form post, not JSON: removing works without the script.
-pub(super) async fn remove<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Path(id): Path<String>, _f: Form<Empty>) -> Response {
-    let back = format!("{BASE}/security");
-    if let Some(r) = super::auth::need_fresh(&a, &me, &back) {
-        return r;
-    }
-    let Some(ext_id) = util::b64u_dec(&id) else { return error_page(&a, &h, StatusCode::NOT_FOUND, "Not found.") };
-    match a.passkey_remove(&ctx, &me.user, &ext_id).await {
-        Ok(()) => flash::to(&a.keys, &back, true, "Passkey removed.", &[]),
-        Err(e @ (Error::Invalid(_) | Error::NotFound)) => flash::to(&a.keys, &back, false, e.message(), &[]),
-        Err(e) => refused(&a, &h, &e),
     }
 }
 

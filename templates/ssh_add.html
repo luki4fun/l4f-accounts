@@ -1,0 +1,24 @@
+<div class="wrap page">
+<div class="panel read">
+  <p class="crumb"><a href="{{ base }}">Your account</a> / <a href="{{ base }}/security">Security</a></p>
+  <h1>Add an SSH key</h1>
+  <p>Paste the public key, sign this page's text with it, and paste the signature. The signature proves the key is yours.</p>
+  {% if let Some(e) = error %}<div class="notice mt-2" role="alert">{{ e }}</div>{% endif %}
+  <form class="mt-2" method="post" action="{{ base }}/ssh">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <div class="field">
+      <label for="key">Public key</label>
+      <textarea id="key" name="key" rows="3" class="mono" spellcheck="false" required placeholder="ssh-ed25519 AAAA... you@laptop">{{ key }}</textarea>
+      <p class="hint">The contents of <code>~/.ssh/id_ed25519.pub</code>: ssh-ed25519, ssh-rsa (2048 bits or more) or ecdsa-sha2-nistp256.</p>
+    </div>
+    <p>Then run:</p>
+    <pre class="code-out anywhere">{{ command }}</pre>
+    <div class="field">
+      <label for="signature">Signature</label>
+      <textarea id="signature" name="signature" rows="7" class="mono" spellcheck="false" required placeholder="-----BEGIN SSH SIGNATURE-----"></textarea>
+    </div>
+    <button class="btn" type="submit">Add key</button>
+  </form>
+</div>
+</div>
