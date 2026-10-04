@@ -97,6 +97,18 @@ pub const RESERVED: &[&str] = &[
 /// digits, so a name cannot pass for a numeric id; never a leading `_` or `-`,
 /// which read as markers and flags.
 pub fn normalize_username(raw: &str, extra_reserved: &[&str]) -> Result<String, &'static str> {
+    let name = username_shape(raw)?;
+    let sk = skeleton(&name);
+    if RESERVED.iter().chain(extra_reserved).any(|r| skeleton(r) == sk) {
+        return Err("That username is reserved. Pick another one.");
+    }
+    Ok(name)
+}
+
+/// Every rule but the reserved list. For names the site picks itself (the
+/// bootstrap admin, `luki4fun`, is reserved for exactly that reason) and for
+/// the login lookup, which must find such names too.
+pub(crate) fn username_shape(raw: &str) -> Result<String, &'static str> {
     let name = raw.trim().to_ascii_lowercase();
     // Charset first: after it, bytes are characters and the length check is exact.
     if !name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')) {
@@ -110,10 +122,6 @@ pub fn normalize_username(raw: &str, extra_reserved: &[&str]) -> Result<String, 
     }
     if name.bytes().all(|b| b.is_ascii_digit()) {
         return Err("A username cannot be only digits.");
-    }
-    let sk = skeleton(&name);
-    if RESERVED.iter().chain(extra_reserved).any(|r| skeleton(r) == sk) {
-        return Err("That username is reserved. Pick another one.");
     }
     Ok(name)
 }
@@ -161,12 +169,15 @@ fn blank(c: char) -> bool {
                 | '\u{180b}'..='\u{180f}'
                 | '\u{200c}'
                 | '\u{200d}'
-                | '\u{2061}'..='\u{2064}'
+                | '\u{2061}'..='\u{2065}'
                 | '\u{206a}'..='\u{206f}'
                 | '\u{2800}'
                 | '\u{3164}'
                 | '\u{fe00}'..='\u{fe0f}'
                 | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
                 | '\u{1d173}'..='\u{1d17a}'
                 | '\u{e0000}'..='\u{e0fff}'
         )
@@ -599,7 +610,7 @@ mod tests {
 
     #[test]
     fn display_name_needs_a_visible_character() {
-        for bad in ["\u{3164}", "\u{200D}", "\u{200C}\u{200D}", "\u{2800}", "\u{00AD}", "\u{FE0F}", "\u{E0041}", "\u{3164} \u{3164}"] {
+        for bad in ["\u{3164}", "\u{200D}", "\u{200C}\u{200D}", "\u{2800}", "\u{00AD}", "\u{FE0F}", "\u{E0041}", "\u{3164} \u{3164}", "\u{2065}", "\u{FFF0}", "\u{13430}", "\u{1BCA0}"] {
             assert_err(clean_display_name(bad), "visible", &format!("{bad:?}"));
         }
         assert!(clean_display_name("👨\u{200D}👩\u{200D}👧").is_ok(), "ZWJ inside an emoji sequence stays allowed");

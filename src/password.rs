@@ -59,10 +59,10 @@ pub fn check_policy(pw: &str, min_len: usize) -> Result<(), &'static str> {
 /// Only for a password that passed `check_policy`: `verify` refuses anything
 /// over MAX_LEN, so hashing a longer one would lock the account for good.
 ///
-/// Panics if the OS RNG fails, the 19 MiB allocation fails, or the password
-/// exceeds 4 GiB.
+/// Panics if the password is empty or over MAX_LEN, the OS RNG fails, or the
+/// 19 MiB allocation fails.
 pub fn hash(pw: &str) -> String {
-    debug_assert!(pw.chars().nth(MAX_LEN).is_none(), "hash() takes only passwords that passed check_policy");
+    assert!(!pw.is_empty() && pw.chars().nth(MAX_LEN).is_none(), "hash() takes only passwords that passed check_policy");
     Argon2::default()
         .hash_password(pw.as_bytes())
         .expect("argon2 with default params fails only on RNG or allocation failure")
@@ -74,8 +74,9 @@ pub fn hash(pw: &str) -> String {
 /// unparsable is a plain failure, never a panic.
 pub fn verify(pw: &str, stored: &str) -> Verified {
     // Refused before any hashing; `verify_dummy` goes through the same check,
-    // so this shortcut times the same for known and unknown users.
-    if pw.chars().nth(MAX_LEN).is_some() {
+    // so this shortcut times the same for known and unknown users. Empty never
+    // matches: `hash` refuses it, but a hand-made or imported row might not.
+    if pw.is_empty() || pw.chars().nth(MAX_LEN).is_some() {
         return FAILED;
     }
     let checked = if stored.starts_with("$argon2") {
@@ -169,6 +170,13 @@ fn verify_bcrypt(pw: &str, stored: &str) -> Option<Verified> {
 pub(crate) fn bcrypt_accepted(s: &str) -> bool {
     ["$2a$", "$2b$", "$2y$"].iter().any(|p| s.starts_with(p))
         && s.get(4..6).and_then(|c| c.parse::<u32>().ok()).is_some_and(|cost| cost <= MAX_BCRYPT_COST)
+}
+
+/// The Argon2 hashes `verify` runs the KDF on rather than refusing outright,
+/// for the bootstrap's check of L4F_ADMIN_HASH. Costs one verify.
+#[cfg(feature = "mysql")]
+pub(crate) fn argon2_accepted(s: &str) -> bool {
+    s.starts_with("$argon2") && verify_argon2("", s).is_some()
 }
 
 /// Burns the same CPU as a real verify, for unknown users and users without a
@@ -288,6 +296,12 @@ mod tests {
         let max = "x".repeat(MAX_LEN);
         let h = argon2_with(Algorithm::Argon2id, Version::V0x13, 8, 1, 1, &max);
         assert!(verify(&max, &h).ok, "exactly MAX_LEN still verifies");
+    }
+
+    #[test]
+    fn verify_never_accepts_an_empty_password() {
+        let h = argon2_with(Algorithm::Argon2id, Version::V0x13, 8, 1, 1, "");
+        assert_eq!(verify("", &h), FAILED, "even against a hash of the empty string");
     }
 
     #[test]
@@ -480,6 +494,16 @@ mod tests {
         // move, regenerate DUMMY_HASH from the password below.
         assert!(DUMMY_HASH.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{DUMMY_HASH}");
         assert_eq!(verify("l4f-accounts timing dummy", DUMMY_HASH), Verified { ok: true, needs_rehash: false });
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn argon2_accepted_is_what_verify_would_hash_against() {
+        assert!(argon2_accepted(DUMMY_HASH));
+        let costly = DUMMY_HASH.replace("m=19456", "m=999999");
+        for refused in [costly.as_str(), "", "$argon2id$garbage", "$2y$04$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234"] {
+            assert!(!argon2_accepted(refused), "{refused:?}");
+        }
     }
 
     #[test]
