@@ -3,6 +3,21 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.2.0 (2026-10-04)
+
+Two-factor sign-in. No new migrations.
+
+- **BREAKING** `require_2fa_for_privileged` defaults to true: scopes beyond
+  `default_user_scopes` count only for accounts with a second factor. The
+  bootstrap admin sets one up before admin rights work.
+- TOTP (sealed secret, one use per step, 5 tries per 15 minutes), ten keyed
+  recovery codes, passkeys (sign-in alone with user verification, second
+  factor, step-up), the second sign-in step (`PendingMfa`, `/mfa`), the
+  security page, and step-up by code or passkey.
+- Config `rp_id`, `webauthn_origins`, `totp_issuer`, defaulting to
+  `base_url`. `User::has_passkey`.
+- `/account/assets/passkey.js`.
+
 ## v0.1.0 (2026-10-04)
 
 First version a host embeds: users, sessions, roles and password sign-in.
