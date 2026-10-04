@@ -1,0 +1,1 @@
+{% if let Some(f) = flash %}{% if f.good %}<div class="notice good mt-2" role="status">{{ f.msg }}</div>{% else %}<div class="notice mt-2" role="alert">{{ f.msg }}</div>{% endif %}{% endif %}

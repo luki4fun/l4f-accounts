@@ -25,6 +25,8 @@ pub mod store;
 pub mod totp;
 pub mod util;
 pub mod verify;
+#[cfg(feature = "axum")]
+pub mod web;
 
 pub use ip::IpMode;
 pub use limit::RateLimiter;

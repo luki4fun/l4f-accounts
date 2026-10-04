@@ -1,0 +1,24 @@
+<section class="hero">
+  <div class="wrap">
+    <div class="panel narrow-s">
+      <h1>Sign in</h1>
+      {% include "_flash.html" %}
+      {% if let Some(e) = error %}<div class="notice mt-2" role="alert">{{ e }}</div>{% endif %}
+      <form class="mt-2" method="post" action="{{ base }}/login">
+        {% if let Some(t) = csrf %}<input type="hidden" name="csrf" value="{{ t }}">{% endif %}
+        <input type="hidden" name="next" value="{{ next }}">
+        <div class="field">
+          <label for="username">Username</label>
+          <input type="text" id="username" name="username" value="{{ username }}" autocomplete="username"
+                 autocapitalize="none" spellcheck="false" maxlength="64" required>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" autocomplete="current-password" maxlength="{{ max_len }}" required>
+        </div>
+        <button class="btn" type="submit">Sign in</button>
+      </form>
+      {% if signup_open %}<p class="hint mt-2">No account yet? <a href="{{ base }}/register">Create one</a>.</p>{% endif %}
+    </div>
+  </div>
+</section>

@@ -1,0 +1,23 @@
+<section class="hero">
+  <div class="wrap">
+    <div class="panel narrow-s">
+      <h1>Confirm it's you</h1>
+      {% if two_factor %}
+      <div class="notice mt-2" role="status">Your account has a second factor, which this step needs. That is not available yet.</div>
+      {% else %}
+      <p class="hint">This needs a recent sign-in. Enter your password; it counts for {{ minutes }} minutes.</p>
+      {% if let Some(e) = error %}<div class="notice mt-2" role="alert">{{ e }}</div>{% endif %}
+      <form class="mt-2" method="post" action="{{ base }}/reauth">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="next" value="{{ next }}">
+        <input type="text" name="username" value="{{ username }}" autocomplete="username" hidden>
+        <div class="field">
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" autocomplete="current-password" maxlength="{{ max_len }}" required autofocus>
+        </div>
+        <button class="btn" type="submit">Continue</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+</section>

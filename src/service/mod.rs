@@ -14,6 +14,8 @@ mod tests;
 
 pub use admin::{Actor, RoleForm, UserDetail};
 pub use auth::{LoginStep, NewSession, RegisterForm};
+#[cfg(feature = "axum")]
+pub(crate) use auth::token_hash;
 
 use std::{future::Future, net::IpAddr, sync::Arc};
 
