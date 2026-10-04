@@ -3,6 +3,15 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.7.0 (2026-10-04)
+
+Public profiles. No new migrations (acct_profiles existed since 0009).
+
+- `/account/profile`, `PUT /account/api/avatar`, `assets/avatar.js`;
+  `web::profile_router` for the host to nest (`/{id}`, `/{id}/avatar`).
+- `Host::profile_links` (default: none); `Credential::public` for linked
+  identities shown on the profile.
+
 ## v0.6.0 (2026-10-04)
 
 Storage. No new migrations (acct_blobs existed since 0008).
