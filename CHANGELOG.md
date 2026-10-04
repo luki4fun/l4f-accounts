@@ -3,6 +3,16 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.5.0 (2026-10-04)
+
+Social sign-in. No new migrations.
+
+- Feature `oauth` (now implies `mysql`): Discord, Google, Facebook with PKCE,
+  `oauth::client` limited to `EGRESS_HOSTS`, `Accounts::with_oauth`.
+- Sign-in (a first factor), sign-up for a new identity through the
+  proof-of-work gate, linking (recent sign-in), unlinking, step-up with a
+  forced provider prompt. Identities never matched by email.
+
 ## v0.4.0 (2026-10-04)
 
 Mail. No new migrations.
