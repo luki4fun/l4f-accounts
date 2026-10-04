@@ -13,7 +13,7 @@ use crate::model::{AccountId, Credential, FLAG_BACKUP_ELIGIBLE, SessionInfo, Use
 use crate::verify::webauthn::{self, ES256, RS256, Rp, WebauthnError};
 use crate::{scope, util};
 
-const KIND: &str = "passkey";
+pub(super) const KIND: &str = "passkey";
 /// What the browser gets to finish a ceremony: long enough for a security key
 /// in a drawer.
 const TTL: i64 = 300;
@@ -131,6 +131,7 @@ impl<H: Host> Accounts<H> {
         if !self.store.insert_credential(&row).await? {
             return Err(Error::Invalid("That passkey is already registered."));
         }
+        self.revoke_devkeys(ctx, user.id, "passkey_add").await?;
         self.audit(ctx, Some(user.id), Some(user.id), "passkey_add", &row.name).await?;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "passkey_add", user = %user.id.hex());
         Ok(())
@@ -251,24 +252,7 @@ impl<H: Host> Accounts<H> {
         self.store.credentials_of(user, KIND).await
     }
 
-    /// Never the last way in: an account without a password keeps one passkey.
-    /// Recovery codes go when no second factor is left.
     pub async fn passkey_remove(&self, ctx: &Ctx, user: &User, ext_id: &[u8]) -> Result<(), Error> {
-        let mine = self.store.credentials_of(user.id, KIND).await?;
-        if !mine.iter().any(|c| c.ext_id == ext_id) {
-            return Err(Error::NotFound);
-        }
-        if !user.has_password && mine.len() == 1 {
-            return Err(Error::Invalid("That is your only way to sign in. Add another passkey first."));
-        }
-        if !self.store.delete_credential(user.id, KIND, ext_id).await? {
-            return Err(Error::NotFound);
-        }
-        if mine.len() == 1 && !user.totp_enabled {
-            self.store.delete_recovery(user.id).await?;
-        }
-        self.audit(ctx, Some(user.id), Some(user.id), "passkey_remove", "").await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "passkey_remove", user = %user.id.hex());
-        Ok(())
+        self.remove_credential(ctx, user, KIND, ext_id).await
     }
 }

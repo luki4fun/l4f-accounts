@@ -734,7 +734,7 @@ async fn sweep_removes_dead_sessions_and_old_audit_rows() {
             .unwrap();
     }
     a.store.audit(Some(u.id), None, "recent", "", "").await.unwrap();
-    assert_eq!(a.sweep(now).await.unwrap(), Swept { sessions: 2, audit: 2 });
+    assert_eq!(a.sweep(now).await.unwrap(), Swept { sessions: 2, audit: 2, devkeys: 0 });
     let left: Vec<_> = a.store.sessions_of(u.id).await.unwrap().into_iter().map(|s| s.token_hash).collect();
     assert_eq!(left, [live.token_hash]);
     assert_eq!(audit_events(&a, u.id).await, ["recent"]);
@@ -1026,4 +1026,103 @@ async fn removing_passkeys_keeps_a_way_in() {
     assert!(!a.store.user_by_id(u.id).await.unwrap().unwrap().has_passkey);
     assert_eq!(a.recovery_left(u.id).await.unwrap(), 0, "recovery codes went with the last second factor");
     cleanup(&a, &[u.id], &[]).await;
+}
+
+// ---- key sign-in
+
+#[tokio::test]
+async fn an_ssh_key_signs_in_once_it_signed_its_own_enrolment() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.80");
+    let u = make_user(&a, &[]).await;
+    let key = crate::testkit::EdKey::new();
+    let ns = a.host.config().ssh_namespace();
+    assert_eq!(ns, "login@l4f.cc");
+    let token = a.ssh_challenge(Some(&u), NONCE);
+    let line = key.ssh_public("dee@laptop");
+    let other = crate::testkit::EdKey::new();
+    assert!(matches!(a.ssh_add(&c, &u, &token, NONCE, &line, &other.ssh_sign(&ns, token.as_bytes())).await, Err(Error::Invalid(_))), "signed by another key");
+    assert!(matches!(a.ssh_add(&c, &u, &token, NONCE, &line, &key.ssh_sign("git", token.as_bytes())).await, Err(Error::Invalid(_))), "another namespace");
+    a.ssh_add(&c, &u, &token, NONCE, &line, &key.ssh_sign(&ns, token.as_bytes())).await.unwrap();
+    assert_eq!(a.ssh_keys(u.id).await.unwrap()[0].name, "dee@laptop");
+    let v = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let t2 = a.ssh_challenge(Some(&v), NONCE);
+    assert!(matches!(a.ssh_add(&c, &v, &t2, NONCE, &line, &key.ssh_sign(&ns, t2.as_bytes())).await, Err(Error::Invalid(_))), "registered once");
+
+    let login = a.ssh_challenge(None, NONCE);
+    let sig = key.ssh_sign(&ns, login.as_bytes());
+    assert!(matches!(a.ssh_login(&c, &login, b"some-other-browser!", &sig).await, Err(Error::Invalid(_))));
+    let s = signed_in(a.ssh_login(&c, &login, NONCE, &sig).await);
+    assert!(s.info.mfa_ok && s.info.method == "ssh" && !a.fresh(&s.info, util::now()), "never a recent sign-in");
+    assert!(a.ssh_login(&c, &login, NONCE, &sig).await.is_err(), "a replay is refused");
+    let stranger = a.ssh_challenge(None, NONCE);
+    assert!(a.ssh_login(&c, &stranger, NONCE, &other.ssh_sign(&ns, stranger.as_bytes())).await.is_err(), "an unknown key");
+
+    // With a second factor, an SSH key is only the first one.
+    sqlx::query("UPDATE acct_users SET totp_enc = x'00' WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    let login = a.ssh_challenge(None, NONCE);
+    let pending = pending_of(a.ssh_login(&c, &login, NONCE, &key.ssh_sign(&ns, login.as_bytes())).await);
+    assert!(!pending.info.mfa_ok);
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+#[tokio::test]
+async fn a_device_key_signs_in_this_browser_until_it_is_revoked() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.81");
+    let u = make_user(&a, &[]).await;
+    let key = crate::testkit::EdKey::new();
+    let device = util::random::<16>();
+    let token = a.devkey_challenge(Some(&u), NONCE);
+    let ch = crate::challenge::challenge_bytes(&token);
+    let bad = key.devkey_sign("https://evil.example", &device, &ch);
+    assert!(a.devkey_add(&c, &u, &token, NONCE, NewDeviceKey { device_id: &device, public_key: &key.raw_public(), signature: &bad }).await.is_err(), "signed for another origin");
+    a.devkey_add(&c, &u, &token, NONCE, NewDeviceKey { device_id: &device, public_key: &key.raw_public(), signature: &key.devkey_sign(ORIGIN, &device, &ch) }).await.unwrap();
+
+    let sign_in = |t: &str| key.devkey_sign(ORIGIN, &device, &crate::challenge::challenge_bytes(t));
+    let t = a.devkey_challenge(None, NONCE);
+    let s = a.devkey_login(&c, &t, NONCE, &device, &sign_in(&t)).await.unwrap();
+    assert!(s.info.mfa_ok && s.info.method == "devkey" && !a.fresh(&s.info, util::now()));
+    assert!(a.devkey_login(&c, &t, NONCE, &device, &sign_in(&t)).await.is_err(), "a replay is refused");
+    let t = a.devkey_challenge(None, NONCE);
+    assert!(a.devkey_login(&c, &t, NONCE, &util::random::<16>(), &sign_in(&t)).await.is_err(), "another device id");
+
+    // Unused for 90 days: gone.
+    sqlx::query("UPDATE acct_credentials SET last_used_at = 1 WHERE kind = 'devkey' AND ext_id = ?").bind(&device[..]).execute(&a.store.0).await.unwrap();
+    let t = a.devkey_challenge(None, NONCE);
+    assert!(a.devkey_login(&c, &t, NONCE, &device, &sign_in(&t)).await.is_err());
+    assert!(a.devkeys(u.id).await.unwrap().is_empty(), "and deleted");
+
+    // Sign-out everywhere and any second-factor change revoke them.
+    let token = a.devkey_challenge(Some(&u), NONCE);
+    let ch = crate::challenge::challenge_bytes(&token);
+    a.devkey_add(&c, &u, &token, NONCE, NewDeviceKey { device_id: &device, public_key: &key.raw_public(), signature: &key.devkey_sign(ORIGIN, &device, &ch) }).await.unwrap();
+    a.logout_all(&c, u.id, None).await.unwrap();
+    assert!(a.devkeys(u.id).await.unwrap().is_empty(), "sign-out everywhere");
+    let token = a.devkey_challenge(Some(&u), NONCE);
+    let ch = crate::challenge::challenge_bytes(&token);
+    a.devkey_add(&c, &u, &token, NONCE, NewDeviceKey { device_id: &device, public_key: &key.raw_public(), signature: &key.devkey_sign(ORIGIN, &device, &ch) }).await.unwrap();
+    add_passkey(&a, &c, &u).await;
+    assert!(a.devkeys(u.id).await.unwrap().is_empty(), "a new passkey");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+#[tokio::test]
+async fn an_account_without_a_password_keeps_one_way_in() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.82");
+    let u = make_user(&a, &[]).await;
+    let key = crate::testkit::EdKey::new();
+    let ns = a.host.config().ssh_namespace();
+    let token = a.ssh_challenge(Some(&u), NONCE);
+    a.ssh_add(&c, &u, &token, NONCE, &key.ssh_public(""), &key.ssh_sign(&ns, token.as_bytes())).await.unwrap();
+    let fp = a.ssh_keys(u.id).await.unwrap()[0].ext_id.clone();
+    let mut nopw = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    nopw.has_password = false;
+    assert!(matches!(a.remove_credential(&c, &nopw, "ssh", &fp).await, Err(Error::Invalid(_))));
+    let other = make_user(&a, &[]).await;
+    assert!(matches!(a.remove_credential(&c, &other, "ssh", &fp).await, Err(Error::NotFound)), "someone else's key");
+    a.remove_credential(&c, &u, "ssh", &fp).await.unwrap();
+    assert!(a.ssh_keys(u.id).await.unwrap().is_empty());
+    cleanup(&a, &[u.id, other.id], &[]).await;
 }

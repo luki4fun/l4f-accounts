@@ -9,6 +9,7 @@
 mod account;
 mod admin;
 mod auth;
+mod keylogin;
 mod mfa;
 mod passkey;
 #[cfg(test)]
@@ -17,6 +18,7 @@ mod tests;
 pub use admin::{Actor, RoleForm, UserDetail};
 pub use auth::{LoginStep, NewSession, RegisterForm};
 pub use mfa::TotpSetup;
+pub use keylogin::NewDeviceKey;
 pub use passkey::PasskeyFor;
 #[cfg(feature = "axum")]
 pub(crate) use auth::token_hash;
@@ -83,6 +85,9 @@ pub struct Config {
     pub webauthn_origins: Vec<String>,
     /// The name authenticator apps list the account under. Empty: the host of `base_url`.
     pub totp_issuer: String,
+    /// What `ssh-keygen -Y sign -n` signs for, so a login signature is never
+    /// also a git or file signature. Empty: `login@` and the host of `base_url`.
+    pub ssh_namespace: String,
     #[serde(skip)]
     pub base_url: String,
     #[serde(skip)]
@@ -114,6 +119,7 @@ impl Default for Config {
             rp_id: String::new(),
             webauthn_origins: Vec::new(),
             totp_issuer: String::new(),
+            ssh_namespace: String::new(),
             base_url: String::new(),
             cookie_secure: true,
             ip_mode: IpMode::default(),
@@ -142,6 +148,10 @@ impl Config {
 
     pub fn issuer(&self) -> &str {
         if self.totp_issuer.is_empty() { self.host() } else { &self.totp_issuer }
+    }
+
+    pub fn ssh_namespace(&self) -> String {
+        if self.ssh_namespace.is_empty() { format!("login@{}", self.host()) } else { self.ssh_namespace.clone() }
     }
 }
 
@@ -285,6 +295,7 @@ impl From<sqlx::Error> for BootstrapError {
 pub struct Swept {
     pub sessions: u64,
     pub audit: u64,
+    pub devkeys: u64,
 }
 
 const DAY: i64 = 86_400;
@@ -461,6 +472,14 @@ impl<H: Host> Accounts<H> {
                 break;
             }
         }
+        loop {
+            let before = now - keylogin::DEVKEY_DAYS * DAY;
+            let n = self.store.delete_stale_credentials(keylogin::DEVKEY, before, SWEEP_BATCH).await?;
+            out.devkeys += n;
+            if n < SWEEP_BATCH {
+                break;
+            }
+        }
         if cfg.audit_retention_days > 0 {
             loop {
                 let n = self.store.delete_audit_before(now - cfg.audit_retention_days * DAY, SWEEP_BATCH).await?;
@@ -471,7 +490,7 @@ impl<H: Host> Accounts<H> {
             }
         }
         if out != Swept::default() {
-            tracing::info!(target: "accounts", sessions = out.sessions, audit = out.audit, "sweep");
+            tracing::info!(target: "accounts", sessions = out.sessions, audit = out.audit, devkeys = out.devkeys, "sweep");
         }
         Ok(out)
     }

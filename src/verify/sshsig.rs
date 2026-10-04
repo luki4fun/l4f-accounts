@@ -109,6 +109,21 @@ pub fn verify(armored: &str, namespace: &str, message: &[u8], enrolled: &[&[u8]]
     Ok(enrolled.iter().position(|k| *k == pk).expect("checked in verify_by"))
 }
 
+/// The public key a signature names, unverified: only for finding whose
+/// stored key to [`verify`] it against at login, where the account is not
+/// known yet.
+pub fn signer(armored: &str) -> Result<Vec<u8>, SshError> {
+    let raw = dearmor(armored)?;
+    let mut r = Rd(&raw);
+    if r.take(6)? != MAGIC {
+        return Err(SshError::Malformed);
+    }
+    if r.u32()? != 1 {
+        return Err(SshError::Version);
+    }
+    Ok(r.string()?.to_vec())
+}
+
 /// The signature check itself. With `enrolled` `None` it accepts whatever key
 /// the signer embedded and returns it; only tests want that.
 fn verify_by(armored: &str, namespace: &str, message: &[u8], enrolled: Option<&[&[u8]]>) -> Result<Vec<u8>, SshError> {
@@ -961,5 +976,15 @@ mod tests {
         assert_eq!(bits(&[0x01, 0, 0]), 17);
         assert_eq!(bits(&[0x80; 256]), 2048);
         assert_eq!(bits(&[]), 0);
+    }
+
+    #[test]
+    fn signer_names_the_key_without_verifying() {
+        for (pubkey, sig) in [(ED_PUB, ED_SIG), (RSA_PUB, RSA_SIG), (EC_PUB, EC_SIG)] {
+            let blob = parse_public_key(pubkey).unwrap().blob;
+            assert_eq!(signer(sig).unwrap(), blob);
+            assert_eq!(verify(sig, NS, MSG, &[&blob]), Ok(0));
+        }
+        assert_eq!(signer("not armor"), Err(SshError::Malformed));
     }
 }

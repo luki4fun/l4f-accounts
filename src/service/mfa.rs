@@ -63,6 +63,7 @@ impl<H: Host> Accounts<H> {
             return Err(Error::Invalid("Two-factor codes are already on."));
         }
         let codes = if self.store.recovery_left(user.id).await? == 0 { self.new_recovery(user.id).await? } else { Vec::new() };
+        self.revoke_devkeys(ctx, user.id, "totp_on").await?;
         self.audit(ctx, Some(user.id), Some(user.id), "totp_on", "").await?;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "totp_on", user = %user.id.hex());
         Ok(codes)
@@ -76,6 +77,7 @@ impl<H: Host> Accounts<H> {
         if !user.has_passkey {
             self.store.delete_recovery(user.id).await?;
         }
+        self.revoke_devkeys(ctx, user.id, "totp_off").await?;
         self.audit(ctx, Some(user.id), Some(user.id), "totp_off", "").await?;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "totp_off", user = %user.id.hex());
         Ok(())

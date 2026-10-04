@@ -745,6 +745,40 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
+    /// Every credential of one kind an account has, e.g. its device keys when a
+    /// second factor changes.
+    pub async fn delete_credentials_of(&self, user: AccountId, kind: &str) -> sqlx::Result<u64> {
+        let r = sqlx::query("DELETE FROM acct_credentials WHERE user_id = ? AND kind = ?")
+            .bind(&user.0[..])
+            .bind(kind)
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// One batch of credentials of `kind` unused since `before`.
+    pub async fn delete_stale_credentials(&self, kind: &str, before: i64, batch: u64) -> sqlx::Result<u64> {
+        let r = sqlx::query("DELETE FROM acct_credentials WHERE kind = ? AND COALESCE(last_used_at, created_at) < ? LIMIT ?")
+            .bind(kind)
+            .bind(before)
+            .bind(batch)
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Credentials that sign in on their own: passkeys, SSH keys, social
+    /// identities. Device keys only stand in for one of these, so they do not
+    /// count as a way in.
+    pub async fn login_credentials(&self, user: AccountId) -> sqlx::Result<i64> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM acct_credentials WHERE user_id = ? AND (kind IN ('passkey', 'ssh') OR kind LIKE 'oauth:%')",
+        )
+        .bind(&user.0[..])
+        .fetch_one(&self.0)
+        .await
+    }
+
     /// Records a use. The counter only moves forward (authenticators that keep
     /// it at 0 aside): false means another use raced this one or the
     /// authenticator went backwards, and the caller refuses.

@@ -312,6 +312,8 @@ impl<H: Host> Accounts<H> {
     /// "Sign out everywhere": every session of `user` but `except`.
     pub async fn logout_all(&self, ctx: &Ctx, user: AccountId, except: Option<&[u8; 32]>) -> sqlx::Result<u64> {
         let n = self.store.delete_sessions_of(user, except).await?;
+        // Remembered browsers too: they could sign straight back in.
+        self.revoke_devkeys(ctx, user, "logout_all").await?;
         self.audit(ctx, Some(user), Some(user), "logout_all", &n.to_string()).await?;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "logout_all", user = %user.hex(), sessions = n);
         Ok(n)

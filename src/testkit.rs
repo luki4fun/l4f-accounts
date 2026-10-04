@@ -84,3 +84,65 @@ impl Authenticator {
         .to_string()
     }
 }
+
+/// An Ed25519 key that signs like `ssh-keygen -Y sign` and like a browser's
+/// device key.
+pub(crate) struct EdKey(ring::signature::Ed25519KeyPair);
+
+fn ssh_string(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend((b.len() as u32).to_be_bytes());
+    out.extend(b);
+}
+
+impl EdKey {
+    pub fn new() -> Self {
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        Self(ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap())
+    }
+
+    pub fn raw_public(&self) -> Vec<u8> {
+        self.0.public_key().as_ref().to_vec()
+    }
+
+    fn ssh_blob(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        ssh_string(&mut b, b"ssh-ed25519");
+        ssh_string(&mut b, self.0.public_key().as_ref());
+        b
+    }
+
+    /// The `authorized_keys` line.
+    pub fn ssh_public(&self, comment: &str) -> String {
+        use base64::Engine;
+        format!("ssh-ed25519 {} {comment}", base64::engine::general_purpose::STANDARD.encode(self.ssh_blob()))
+    }
+
+    /// `ssh-keygen -Y sign -n <ns>` over `msg`, armored (PROTOCOL.sshsig, sha512).
+    pub fn ssh_sign(&self, ns: &str, msg: &[u8]) -> String {
+        use base64::Engine;
+        use sha2::Sha512;
+        let mut signed = b"SSHSIG".to_vec();
+        ssh_string(&mut signed, ns.as_bytes());
+        ssh_string(&mut signed, b"");
+        ssh_string(&mut signed, b"sha512");
+        ssh_string(&mut signed, &Sha512::digest(msg));
+        let mut sig = Vec::new();
+        ssh_string(&mut sig, b"ssh-ed25519");
+        ssh_string(&mut sig, self.0.sign(&signed).as_ref());
+        let mut blob = b"SSHSIG".to_vec();
+        blob.extend(1u32.to_be_bytes());
+        ssh_string(&mut blob, &self.ssh_blob());
+        ssh_string(&mut blob, ns.as_bytes());
+        ssh_string(&mut blob, b"");
+        ssh_string(&mut blob, b"sha512");
+        ssh_string(&mut blob, &sig);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
+        let lines: Vec<&str> = b64.as_bytes().chunks(70).map(|c| std::str::from_utf8(c).unwrap()).collect();
+        format!("-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n", lines.join("\n"))
+    }
+
+    /// A device key's signature over `devkey::message`.
+    pub fn devkey_sign(&self, origin: &str, device_id: &[u8], challenge: &[u8]) -> Vec<u8> {
+        self.0.sign(&crate::verify::devkey::message(origin, device_id, challenge)).as_ref().to_vec()
+    }
+}
