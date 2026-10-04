@@ -14,7 +14,7 @@ default = []
 mysql = ["dep:sqlx", "dep:tokio"]
 axum = ["mysql", "dep:axum", "dep:askama"]
 oauth = ["dep:reqwest", "dep:tokio"]
-email = ["dep:lettre", "dep:tokio"]
+email = ["mysql", "dep:lettre"]
 # Only to verify a YOURLS-era bcrypt hash once and rehash it to Argon2id.
 legacy-bcrypt = ["dep:bcrypt"]
 

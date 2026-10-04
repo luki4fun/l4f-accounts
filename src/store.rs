@@ -42,6 +42,16 @@ impl From<sqlx::Error> for WriteError {
     }
 }
 
+/// How `Store::confirm_email` went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EmailConfirm {
+    Done,
+    /// The pending address changed or was removed since the link was sent.
+    Stale,
+    /// Another account verified it first.
+    Taken,
+}
+
 /// `seen_at` is written at most this often: a write per request would turn every
 /// page view into a row lock and a binlog entry.
 pub const TOUCH_SECS: i64 = 600;
@@ -312,6 +322,50 @@ impl Store {
             .as_ref()
             .map(user)
             .transpose()
+    }
+
+    /// A verified address only: a pending one belongs to nobody yet.
+    pub async fn user_by_email(&self, email: &str) -> sqlx::Result<Option<User>> {
+        sqlx::query(AssertSqlSafe(format!("SELECT {USER_COLS} FROM acct_users WHERE email = ?")))
+            .bind(email)
+            .fetch_optional(&self.0)
+            .await?
+            .as_ref()
+            .map(user)
+            .transpose()
+    }
+
+    pub async fn set_email_pending(&self, id: AccountId, email: Option<&str>) -> sqlx::Result<bool> {
+        let r = sqlx::query("UPDATE acct_users SET email_pending = ? WHERE id = ?").bind(email).bind(&id.0[..]).execute(&self.0).await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// The pending address becomes the verified one, if it is still the one
+    /// the link was for.
+    pub async fn confirm_email(&self, id: AccountId, email: &str, now: i64) -> sqlx::Result<EmailConfirm> {
+        let r = sqlx::query(
+            "UPDATE acct_users SET email = email_pending, email_pending = NULL, email_verified_at = ?
+              WHERE id = ? AND email_pending = ?",
+        )
+        .bind(now)
+        .bind(&id.0[..])
+        .bind(email)
+        .execute(&self.0)
+        .await;
+        match r {
+            Ok(r) if r.rows_affected() == 1 => Ok(EmailConfirm::Done),
+            Ok(_) => Ok(EmailConfirm::Stale),
+            Err(e) if is_dup(&e) => Ok(EmailConfirm::Taken),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn clear_email(&self, id: AccountId) -> sqlx::Result<()> {
+        sqlx::query("UPDATE acct_users SET email = NULL, email_pending = NULL, email_verified_at = NULL WHERE id = ?")
+            .bind(&id.0[..])
+            .execute(&self.0)
+            .await
+            .map(|_| ())
     }
 
     pub async fn password_hash_of(&self, id: AccountId) -> sqlx::Result<Option<String>> {

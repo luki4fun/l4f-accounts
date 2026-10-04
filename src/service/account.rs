@@ -66,6 +66,48 @@ impl<H: Host> Accounts<H> {
         s.mfa_ok && s.auth_at > 0 && now - s.auth_at < self.host.config().step_up_minutes * 60
     }
 
+    /// Changes the password of a signed-in account; the caller checks for a
+    /// recent sign-in. This session stays, every other one goes.
+    pub async fn password_change(&self, ctx: &Ctx, user: &User, session: &SessionInfo, new: &str) -> Result<(), Error> {
+        if !session.mfa_ok || session.user_id != user.id {
+            return Err(Error::Forbidden);
+        }
+        let old = self.store.password_hash_of(user.id).await?;
+        self.set_password(ctx, user, new, old.as_deref(), Some(&session.token_hash), "change").await
+    }
+
+    /// The one way a password changes: the policy, Argon2, written only over
+    /// `old` (the hash the caller saw, `None` for an account without one), then
+    /// every session but `keep` and every remembered browser go, and the
+    /// owner is told. `NotFound` when the hash changed meanwhile.
+    pub(super) async fn set_password(
+        &self,
+        ctx: &Ctx,
+        user: &User,
+        new: &str,
+        old: Option<&str>,
+        keep: Option<&[u8; 32]>,
+        how: &str,
+    ) -> Result<(), Error> {
+        password::check_policy(new, self.host.config().min_password_len).map_err(Error::Invalid)?;
+        let pw = new.to_owned();
+        let hash = self.kdf(move || password::hash(&pw)).await?;
+        let written = match old {
+            Some(o) => self.store.rehash_password(user.id, o, &hash).await?,
+            None => self.store.set_password_hash(user.id, &hash).await?,
+        };
+        if !written {
+            return Err(Error::NotFound);
+        }
+        self.store.delete_sessions_of(user.id, keep).await?;
+        self.revoke_devkeys(ctx, user.id, "password").await?;
+        self.audit(ctx, Some(user.id), Some(user.id), "password_change", how).await?;
+        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "password_change", how, user = %user.id.hex());
+        #[cfg(feature = "email")]
+        self.password_notice(user, if how == "reset" { " with a reset link" } else { "" });
+        Ok(())
+    }
+
     /// The cleaned name as stored.
     pub async fn set_display_name(&self, ctx: &Ctx, user: AccountId, raw: &str) -> Result<String, Error> {
         let name = scope::clean_display_name(raw).map_err(Error::Invalid)?;

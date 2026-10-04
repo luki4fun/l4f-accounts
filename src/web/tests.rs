@@ -790,3 +790,68 @@ async fn a_remembered_browser_signs_in_through_the_json_endpoints() {
     assert!(text(r).await.contains("l4f-devkey-v1"));
     drop_user(&a, u.id).await;
 }
+
+// ---- password and mail
+
+#[tokio::test]
+async fn the_password_page_needs_a_recent_sign_in_and_changes_it() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (stale, _, _) = browser(&a, u.id, util::now() - 3600).await;
+    assert_eq!(location(&send(&app, get("/account/password", Some(&stale))).await), "/account/reauth?next=%2Faccount%2Fpassword");
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    assert_eq!(send(&app, get("/account/password", Some(&c))).await.status(), StatusCode::OK);
+    let r = send(&app, post("/account/password", &format!("csrf={t}&password=short"), Some(&c))).await;
+    assert!(text(r).await.contains("That password is too short."), "the policy, on the page");
+    let r = send(&app, post("/account/password", &format!("csrf={t}&password=a+much+better+password"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/security?ok=Password+changed."));
+    assert_eq!(send(&app, get("/account", Some(&stale))).await.status(), StatusCode::SEE_OTHER, "the other session went");
+    assert_eq!(send(&app, get("/account", Some(&c))).await.status(), StatusCode::OK, "this one stays");
+    drop_user(&a, u.id).await;
+}
+
+#[cfg(feature = "email")]
+#[tokio::test]
+async fn confirm_and_reset_links_work_through_their_pages() {
+    let Some(store) = crate::store::tests::shared().await else { return };
+    let (m, sent) = crate::email::Mailer::capture();
+    let keys = Keys::new(&[9; 32], None).unwrap();
+    let host = T { cfg: Arc::new(pk_cfg()) };
+    let a = Arc::new(Accounts::new(store, keys, Arc::default(), host, &[], Some(POW.to_vec()), Vec::new()).unwrap().with_mailer(m));
+    let app = Router::new().nest(BASE, router(a.clone()));
+    let link_token = |n: usize| {
+        let sent = sent.clone();
+        async move {
+            for _ in 0..100 {
+                if let Some(m) = sent.lock().unwrap().get(n) {
+                    return m.body.split("?t=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("no mail {n}");
+        }
+    };
+    let u = make_user(&a).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let addr = format!("{}@example.org", unique("w"));
+    let r = send(&app, post("/account/email", &format!("csrf={t}&_action=set&email={addr}"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/security?ok=A+link"));
+    let vt = link_token(0).await;
+    let page = text(send(&app, get(&format!("/account/verify-email?t={vt}"), None)).await).await;
+    assert!(page.contains(">Confirm</button>"), "opening the link changes nothing");
+    assert!(a.store.user_by_id(u.id).await.unwrap().unwrap().email.is_none());
+    let r = send(&app, post("/account/verify-email", &format!("t={vt}"), None)).await;
+    assert!(location(&r).starts_with("/account?ok=Your+address+is+confirmed."));
+
+    assert!(text(send(&app, get("/account/login", None)).await).await.contains("/account/forgot"));
+    let r = send(&app, post("/account/forgot", &format!("who={}", u.username), None)).await;
+    assert!(location(&r).starts_with("/account/login?ok=If+that+account"));
+    let rt = link_token(1).await;
+    assert!(text(send(&app, get(&format!("/account/reset?t={rt}"), None)).await).await.contains(r#"name="password""#));
+    let r = send(&app, post("/account/reset", &format!("t={rt}&password=reset+by+link+now"), None)).await;
+    assert!(location(&r).starts_with("/account/login?ok=Password+changed."));
+    let r = send(&app, post("/account/reset", &format!("t={rt}&password=and+again+please"), None)).await;
+    assert!(text(r).await.contains("not valid any more"));
+    assert_eq!(send(&app, get("/account", Some(&c))).await.status(), StatusCode::SEE_OTHER, "signed out by the reset");
+    drop_user(&a, u.id).await;
+}

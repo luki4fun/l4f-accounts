@@ -1,0 +1,21 @@
+<section class="hero">
+  <div class="wrap">
+    <div class="panel narrow-s">
+      <p class="crumb"><a href="{{ base }}/login">Sign in</a></p>
+      <h1>Forgot your password?</h1>
+      {% if ready %}
+      <p class="hint">A reset link goes to the account's confirmed address. Two-factor sign-in stays as it is.</p>
+      <form class="mt-2" method="post" action="{{ base }}/forgot">
+        {% if let Some(c) = csrf %}<input type="hidden" name="csrf" value="{{ c }}">{% endif %}
+        <div class="field">
+          <label for="who">Username or confirmed email address</label>
+          <input type="text" id="who" name="who" maxlength="254" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        </div>
+        <button class="btn" type="submit">Send a reset link</button>
+      </form>
+      {% else %}
+      <div class="notice mt-2" role="status">This site cannot send mail right now. Ask the admin for help.</div>
+      {% endif %}
+    </div>
+  </div>
+</section>

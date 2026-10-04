@@ -40,16 +40,16 @@ pub fn check_policy(pw: &str, min_len: usize) -> Result<(), &'static str> {
     // Bounded count, so a huge body costs no more than MAX_LEN steps.
     let len = pw.chars().take(MAX_LEN + 1).count();
     if len > MAX_LEN {
-        return Err("password is too long");
+        return Err("That password is too long.");
     }
     // An empty password is never acceptable, whatever the configured minimum.
     if len < min_len.max(1) {
-        return Err("password is too short");
+        return Err("That password is too short.");
     }
     // NUL truncates in C-string APIs (bcrypt among them), so two different
     // passwords could end up meaning the same thing somewhere downstream.
     if pw.contains('\0') {
-        return Err("password must not contain NUL characters");
+        return Err("A password cannot contain NUL characters.");
     }
     Ok(())
 }
@@ -238,19 +238,19 @@ mod tests {
 
     #[test]
     fn policy_rejects_short_long_and_nul() {
-        assert_eq!(check_policy("short", MIN_LEN_DEFAULT), Err("password is too short"));
-        assert_eq!(check_policy(&"x".repeat(MIN_LEN_DEFAULT - 1), MIN_LEN_DEFAULT), Err("password is too short"));
-        assert_eq!(check_policy(&"x".repeat(MAX_LEN + 1), MIN_LEN_DEFAULT), Err("password is too long"));
-        assert_eq!(check_policy(&"x".repeat(100_000), MIN_LEN_DEFAULT), Err("password is too long"));
+        assert_eq!(check_policy("short", MIN_LEN_DEFAULT), Err("That password is too short."));
+        assert_eq!(check_policy(&"x".repeat(MIN_LEN_DEFAULT - 1), MIN_LEN_DEFAULT), Err("That password is too short."));
+        assert_eq!(check_policy(&"x".repeat(MAX_LEN + 1), MIN_LEN_DEFAULT), Err("That password is too long."));
+        assert_eq!(check_policy(&"x".repeat(100_000), MIN_LEN_DEFAULT), Err("That password is too long."));
         assert_eq!(
             check_policy("long enough\0but nul", MIN_LEN_DEFAULT),
-            Err("password must not contain NUL characters")
+            Err("A password cannot contain NUL characters.")
         );
     }
 
     #[test]
     fn policy_never_accepts_empty_even_with_zero_min() {
-        assert_eq!(check_policy("", 0), Err("password is too short"));
+        assert_eq!(check_policy("", 0), Err("That password is too short."));
         assert_eq!(check_policy("a", 0), Ok(()));
     }
 
@@ -259,10 +259,10 @@ mod tests {
         // 10 two-byte chars = 20 bytes: passes min 10, as it should.
         assert_eq!(check_policy(&"é".repeat(10), 10), Ok(()));
         // 5 four-byte chars = 20 bytes but only 5 symbols: too short.
-        assert_eq!(check_policy(&"🔑".repeat(5), 10), Err("password is too short"));
+        assert_eq!(check_policy(&"🔑".repeat(5), 10), Err("That password is too short."));
         // MAX_LEN multi-byte chars is fine even though bytes exceed MAX_LEN.
         assert_eq!(check_policy(&"é".repeat(MAX_LEN), 10), Ok(()));
-        assert_eq!(check_policy(&"é".repeat(MAX_LEN + 1), 10), Err("password is too long"));
+        assert_eq!(check_policy(&"é".repeat(MAX_LEN + 1), 10), Err("That password is too long."));
     }
 
     #[test]

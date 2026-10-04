@@ -1,0 +1,19 @@
+<section class="hero">
+  <div class="wrap">
+    <div class="panel narrow-s">
+      <h1>Choose a new password</h1>
+      <p class="hint">Every session is signed out. Sign in with the new password afterwards.</p>
+      {% if let Some(e) = error %}<div class="notice mt-2" role="alert">{{ e }}</div>{% endif %}
+      <form class="mt-2" method="post" action="{{ base }}/reset">
+        {% if let Some(c) = csrf %}<input type="hidden" name="csrf" value="{{ c }}">{% endif %}
+        <input type="hidden" name="t" value="{{ t }}">
+        <div class="field">
+          <label for="password">New password</label>
+          <input type="password" id="password" name="password" autocomplete="new-password" minlength="{{ min_len }}" maxlength="{{ max_len }}" required autofocus>
+          <p class="hint">At least {{ min_len }} characters.</p>
+        </div>
+        <button class="btn" type="submit">Save</button>
+      </form>
+    </div>
+  </div>
+</section>

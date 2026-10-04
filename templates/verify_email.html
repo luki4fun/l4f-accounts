@@ -1,0 +1,12 @@
+<section class="hero">
+  <div class="wrap">
+    <div class="panel narrow-s">
+      <h1>Confirm your address</h1>
+      <form class="mt-2" method="post" action="{{ base }}/verify-email">
+        {% if let Some(c) = csrf %}<input type="hidden" name="csrf" value="{{ c }}">{% endif %}
+        <input type="hidden" name="t" value="{{ t }}">
+        <button class="btn" type="submit">Confirm</button>
+      </form>
+    </div>
+  </div>
+</section>

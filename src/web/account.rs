@@ -41,6 +41,7 @@ struct DashboardTpl<'a> {
     can_users: bool,
     can_roles: bool,
     waiting_for_2fa: bool,
+    mail: bool,
     flash: Option<Flash>,
 }
 
@@ -74,6 +75,7 @@ pub(super) async fn dashboard<H: WebHost>(State(a): St<H>, me: Authed, h: Header
         can_roles: me.can("roles:admin"),
         // Held but not granted: the 2FA rule is holding them back.
         waiting_for_2fa: held.len() > me.scopes.len(),
+        mail: cfg!(feature = "email"),
         flash: flash::read(&a.keys, &fq),
     };
     page(&a, &h, "Your account", StatusCode::OK, &t)

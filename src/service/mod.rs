@@ -9,6 +9,8 @@
 mod account;
 mod admin;
 mod auth;
+#[cfg(feature = "email")]
+mod mail;
 mod keylogin;
 mod mfa;
 mod passkey;
@@ -318,7 +320,13 @@ pub struct Accounts<H: Host> {
     /// Argon2 runs at most two at once; owned permits move into the blocking
     /// task, so a client hanging up mid-hash cannot free its slot early.
     hash_permits: Arc<Semaphore>,
+    /// Without one, nothing that needs mail is offered.
+    #[cfg(feature = "email")]
+    mailer: Option<Arc<crate::email::Mailer>>,
 }
+
+/// Where the host serves the account pages; links in mail point below it.
+pub const ACCOUNT_PATH: &str = "/account";
 
 /// `scope::allowed`, for handlers that only hold the scope list.
 pub fn require(scopes: &[String], required: &str) -> bool {
@@ -374,6 +382,8 @@ impl<H: Host> Accounts<H> {
             ip_salt,
             reg_lock: Mutex::new(()),
             hash_permits: Arc::new(Semaphore::new(2)),
+            #[cfg(feature = "email")]
+            mailer: None,
         };
         if let Some(bad) = a.host.config().default_user_scopes.iter().find(|s| !a.known_grant(s)) {
             return Err(sqlx::Error::InvalidArgument(format!("default_user_scopes: unknown scope {bad:?}")));

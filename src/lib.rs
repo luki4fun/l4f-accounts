@@ -7,6 +7,8 @@
 //! integrations. See `docs/embedding.md`.
 
 pub mod challenge;
+#[cfg(feature = "email")]
+pub mod email;
 pub mod ip;
 pub mod keys;
 pub mod limit;

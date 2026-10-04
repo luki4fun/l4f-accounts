@@ -14,6 +14,7 @@ mod csrf;
 mod extract;
 mod flash;
 mod keylogin;
+mod mail;
 mod mfa;
 mod passkey;
 #[cfg(test)]
@@ -38,7 +39,7 @@ use crate::service::{Accounts, Config, Error, Host};
 use crate::util;
 
 /// Where the host nests the router. Redirects and form actions use it.
-pub const BASE: &str = "/account";
+pub const BASE: &str = crate::service::ACCOUNT_PATH;
 
 const DAY: u64 = 86_400;
 const DEVICE_DAYS: u64 = 365;
@@ -79,7 +80,14 @@ impl<H: WebHost> AccountsState for Arc<Accounts<H>> {
 
 /// The `/account` pages, for any host state `S`.
 pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>) -> Router<S> {
-    Router::new()
+    let r = Router::new();
+    #[cfg(feature = "email")]
+    let r = r
+        .route("/email", get(mail::email_form::<H>).post(mail::email::<H>))
+        .route("/verify-email", get(mail::verify_form::<H>).post(mail::verify::<H>))
+        .route("/forgot", get(mail::forgot_form::<H>).post(mail::forgot::<H>))
+        .route("/reset", get(mail::reset_form::<H>).post(mail::reset::<H>));
+    r.route("/password", get(mail::password_form::<H>).post(mail::password::<H>))
         .route("/", get(account::dashboard::<H>))
         .route("/sessions/{id}/revoke", post(account::revoke::<H>))
         .route("/display-name", post(account::display_name::<H>))

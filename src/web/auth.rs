@@ -24,6 +24,16 @@ pub(super) struct NextQuery {
     pub(super) next: String,
 }
 
+#[cfg(feature = "email")]
+fn mail_ready<H: WebHost>(a: &Accounts<H>) -> bool {
+    a.mail_ready()
+}
+
+#[cfg(not(feature = "email"))]
+fn mail_ready<H: WebHost>(_: &Accounts<H>) -> bool {
+    false
+}
+
 // ---- sign in
 
 #[derive(Template)]
@@ -36,6 +46,7 @@ struct LoginTpl<'a> {
     flash: Option<Flash>,
     error: Option<&'a str>,
     signup_open: bool,
+    forgot: bool,
     max_len: usize,
 }
 
@@ -57,6 +68,7 @@ fn login_page<H: WebHost>(
         flash,
         error,
         signup_open: cfg.enabled && cfg.registration_open && a.pow_key.is_some(),
+        forgot: mail_ready(a),
         max_len: MAX_LEN,
     };
     page(a, h, "Sign in", status, &t)

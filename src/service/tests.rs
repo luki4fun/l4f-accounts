@@ -1126,3 +1126,103 @@ async fn an_account_without_a_password_keeps_one_way_in() {
     assert!(a.ssh_keys(u.id).await.unwrap().is_empty());
     cleanup(&a, &[u.id, other.id], &[]).await;
 }
+
+// ---- mail
+
+#[cfg(feature = "email")]
+mod mail_flows {
+    use super::*;
+    use crate::email::{Mailer, Sent};
+    use std::sync::{Arc, Mutex};
+
+    async fn with_mail(cfg: Config) -> Option<(Accounts<Stub>, Arc<Mutex<Vec<Sent>>>)> {
+        let (m, sent) = Mailer::capture();
+        Some((on(shared_store().await?, cfg).await.with_mailer(m), sent))
+    }
+
+    /// Mail goes out on a spawned task: wait for message number `n`.
+    async fn nth(sent: &Arc<Mutex<Vec<Sent>>>, n: usize) -> Sent {
+        for _ in 0..100 {
+            if let Some(m) = sent.lock().unwrap().get(n) {
+                return m.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no mail number {n}");
+    }
+
+    fn token_in(body: &str) -> String {
+        body.split("?t=").nth(1).unwrap().split_whitespace().next().unwrap().to_string()
+    }
+
+    fn mail_cfg() -> Config {
+        Config { base_url: "https://l4f.cc".into(), ..cfg() }
+    }
+
+    #[tokio::test]
+    async fn an_address_is_confirmed_by_its_link_and_belongs_to_one_account() {
+        let Some((a, sent)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.90");
+        let u = make_user(&a, &[]).await;
+        let addr = format!("{}@example.org", unique("m"));
+        a.email_set(&c, &u, &format!(" {} ", addr.to_uppercase())).await.unwrap();
+        let m = nth(&sent, 0).await;
+        assert_eq!(m.to, addr);
+        assert!(m.body.contains("https://l4f.cc/account/verify-email?t=") && m.body.contains(&u.username));
+        let t = token_in(&m.body);
+        assert_eq!(a.store.user_by_id(u.id).await.unwrap().unwrap().email_pending.as_deref(), Some(addr.as_str()));
+        assert!(matches!(a.email_confirm(&c, &format!("{t}x")).await, Err(Error::Invalid(_))), "a forged link");
+        a.email_confirm(&c, &t).await.unwrap();
+        let v = a.store.user_by_id(u.id).await.unwrap().unwrap();
+        assert_eq!((v.email.as_deref(), v.email_pending.as_deref()), (Some(addr.as_str()), None));
+        assert!(matches!(a.email_confirm(&c, &t).await, Err(Error::Invalid(_))), "used up: nothing pending");
+
+        let other = make_user(&a, &[]).await;
+        a.email_set(&c, &other, &addr).await.unwrap();
+        let t2 = token_in(&nth(&sent, 1).await.body);
+        assert!(matches!(a.email_confirm(&c, &t2).await, Err(Error::Invalid("That address belongs to another account."))));
+        assert!(matches!(a.email_set(&c, &other, &addr).await, Err(Error::RateLimited) | Ok(())));
+        cleanup(&a, &[u.id, other.id], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn a_reset_link_sets_a_password_once_and_signs_everything_out() {
+        let Some((a, sent)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.91");
+        let u = make_user(&a, &[]).await;
+        let addr = format!("{}@example.org", unique("r"));
+        a.email_set(&c, &u, &addr).await.unwrap();
+        a.email_confirm(&c, &token_in(&nth(&sent, 0).await.body)).await.unwrap();
+        let s = signed_in(a.login_password(&c, &u.username, PW, None).await);
+
+        a.password_forgot(&c, "nobody-at-all").await.unwrap();
+        a.password_forgot(&c, &addr.to_uppercase()).await.unwrap();
+        let m = nth(&sent, 1).await;
+        assert!(m.body.contains("/account/reset?t="));
+        assert_eq!(sent.lock().unwrap().len(), 2, "nothing for a name nobody has");
+        let t = token_in(&m.body);
+        assert!(matches!(a.password_reset(&c, &t, "short").await, Err(Error::Invalid(_))));
+        a.password_reset(&c, &t, "a whole new password").await.unwrap();
+        assert!(a.session_from_token(&s.token, util::now()).await.unwrap().is_none(), "every session went");
+        assert!(matches!(a.password_reset(&c, &t, "yet another password").await, Err(Error::Invalid(_))), "once");
+        assert!(matches!(a.login_password(&c, &u.username, PW, None).await, Err(Error::BadLogin)));
+        signed_in(a.login_password(&c, &u.username, "a whole new password", None).await);
+        assert!(nth(&sent, 2).await.body.contains("with a reset link"), "the owner is told");
+        cleanup(&a, &[u.id], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_keeps_this_session_only() {
+        let Some((a, _)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.92");
+        let u = make_user(&a, &[]).await;
+        let here = signed_in(a.login_password(&c, &u.username, PW, None).await);
+        let there = signed_in(a.login_password(&c, &u.username, PW, None).await);
+        assert!(matches!(a.password_change(&c, &u, &here.info, "tiny").await, Err(Error::Invalid(_))));
+        a.password_change(&c, &u, &here.info, "brand new password").await.unwrap();
+        assert!(a.session_from_token(&here.token, util::now()).await.unwrap().is_some());
+        assert!(a.session_from_token(&there.token, util::now()).await.unwrap().is_none());
+        signed_in(a.login_password(&c, &u.username, "brand new password", None).await);
+        cleanup(&a, &[u.id], &[]).await;
+    }
+}
