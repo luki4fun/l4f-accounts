@@ -90,6 +90,17 @@ pub struct Config {
     /// What `ssh-keygen -Y sign -n` signs for, so a login signature is never
     /// also a git or file signature. Empty: `login@` and the host of `base_url`.
     pub ssh_namespace: String,
+    /// Outgoing mail (feature email), read once at boot by the host: the
+    /// server's name, its implicit-TLS port, the login and the sender. The
+    /// password is a secret and comes from the host's environment. Empty
+    /// host: no mail, and nothing that needs it is offered.
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_user: String,
+    pub smtp_from: String,
+    /// The host's egress forwarder for outbound TLS (SMTP, OAuth), e.g.
+    /// 127.0.0.1:8443, when the service may not reach the internet itself.
+    pub egress: Option<std::net::SocketAddr>,
     #[serde(skip)]
     pub base_url: String,
     #[serde(skip)]
@@ -122,6 +133,11 @@ impl Default for Config {
             webauthn_origins: Vec::new(),
             totp_issuer: String::new(),
             ssh_namespace: String::new(),
+            smtp_host: String::new(),
+            smtp_port: 465,
+            smtp_user: String::new(),
+            smtp_from: String::new(),
+            egress: None,
             base_url: String::new(),
             cookie_secure: true,
             ip_mode: IpMode::default(),
