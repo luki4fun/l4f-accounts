@@ -9,6 +9,9 @@
   </div>
   <p class="muted">@{{ user.username }}{% for r in roles %} <span class="tag">{% if let Some(b) = r.badge %}{{ b }}{% else %}{{ r.name }}{% endif %}</span>{% endfor %}</p>
   {% include "_flash.html" %}
+  {% if waiting_for_2fa %}
+  <div class="callout warn mt-2"><p>Your roles include admin rights, which work only with two-factor sign-in. <a href="{{ base }}/security">Set it up</a>.</p></div>
+  {% endif %}
 
   {% if !links.is_empty() || can_users || can_roles %}
   <h2 class="mt-3">Manage</h2>
@@ -32,7 +35,7 @@
   <h2 class="mt-3">Security</h2>
   <dl class="kv mt-2">
     <dt>Password</dt><dd>{% if user.has_password %}Set{% else %}None{% endif %}</dd>
-    <dt>Two-factor</dt><dd>{% if user.totp_enabled %}On{% else %}Not set up{% endif %}</dd>
+    <dt>Two-factor</dt><dd>{% if user.totp_enabled && user.has_passkey %}Authenticator app and passkeys{% else %}{% if user.totp_enabled %}Authenticator app{% else %}{% if user.has_passkey %}Passkeys{% else %}Not set up{% endif %}{% endif %}{% endif %} &middot; <a href="{{ base }}/security">Manage</a></dd>
     <dt>Email</dt><dd>{% if let Some(e) = user.email %}{{ e }}{% else %}{% if let Some(p) = user.email_pending %}{{ p }} <span class="tag warn">not confirmed</span>{% else %}None{% endif %}{% endif %}</dd>
   </dl>
 

@@ -2,11 +2,25 @@
   <div class="wrap">
     <div class="panel narrow-s">
       <h1>Confirm it's you</h1>
-      {% if two_factor %}
-      <div class="notice mt-2" role="status">Your account has a second factor, which this step needs. That is not available yet.</div>
-      {% else %}
-      <p class="hint">This needs a recent sign-in. Enter your password; it counts for {{ minutes }} minutes.</p>
+      <p class="hint">This needs a recent sign-in. It counts for {{ minutes }} minutes.</p>
       {% if let Some(e) = error %}<div class="notice mt-2" role="alert">{{ e }}</div>{% endif %}
+      {% if passkey %}
+      <button class="btn mt-2" type="button" hidden data-passkey="step-up" data-base="{{ base }}" data-csrf="{{ csrf }}" data-next="{{ next }}" data-status="pk-status">Use your passkey</button>
+      <p class="hint" id="pk-status" role="status" aria-live="polite"></p>
+      {% endif %}
+      {% if totp %}
+      <form class="mt-2" method="post" action="{{ base }}/reauth">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="next" value="{{ next }}">
+        <input type="hidden" name="_action" value="totp">
+        <div class="field">
+          <label for="code">Code from your authenticator app</label>
+          <input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required autofocus>
+        </div>
+        <button class="btn" type="submit">Continue</button>
+      </form>
+      {% endif %}
+      {% if !totp && !passkey %}
       <form class="mt-2" method="post" action="{{ base }}/reauth">
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <input type="hidden" name="next" value="{{ next }}">
@@ -18,6 +32,8 @@
         <button class="btn" type="submit">Continue</button>
       </form>
       {% endif %}
+      {% if passkey && !totp %}<noscript><p class="hint">This needs JavaScript for your passkey.</p></noscript>{% endif %}
     </div>
   </div>
 </section>
+{% if passkey %}<script src="{{ base }}/assets/passkey.js" defer></script>{% endif %}

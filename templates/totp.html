@@ -1,0 +1,20 @@
+<div class="wrap page">
+<div class="panel read">
+  <p class="crumb"><a href="{{ base }}">Your account</a> / <a href="{{ base }}/security">Security</a></p>
+  <h1>Set up an authenticator app</h1>
+  <p>Scan this code with the app, or type the key in. Then enter the code it shows.</p>
+  {% if !qr.is_empty() %}<figure class="qr mt-2">{{ qr|safe }}</figure>{% endif %}
+  <p class="mono anywhere">{{ secret }}</p>
+  {% if let Some(e) = error %}<div class="notice mt-2" role="alert">{{ e }}</div>{% endif %}
+  <form class="narrow mt-2" method="post" action="{{ base }}/totp">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="_action" value="enable">
+    <input type="hidden" name="setup" value="{{ sealed }}">
+    <div class="field">
+      <label for="code">The six-digit code from the app</label>
+      <input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required>
+    </div>
+    <button class="btn" type="submit">Turn on</button>
+  </form>
+</div>
+</div>

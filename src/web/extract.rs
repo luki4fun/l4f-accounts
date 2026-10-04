@@ -109,6 +109,43 @@ impl<S: AccountsState> FromRequestParts<S> for Authed {
     }
 }
 
+/// A session that passed the password and waits for its second factor. Only
+/// the second-step pages accept it; anything else sees nobody signed in.
+pub struct PendingMfa {
+    pub user: User,
+    pub session: SessionInfo,
+    csrf: String,
+}
+
+impl PendingMfa {
+    pub fn csrf(&self) -> &str {
+        &self.csrf
+    }
+}
+
+impl<S: AccountsState> FromRequestParts<S> for PendingMfa {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, st: &S) -> Result<Self, Response> {
+        let a = st.accounts();
+        let cfg = a.host.config();
+        let token = session_token(&cfg, &parts.headers);
+        if let Some((t, hash)) = token.and_then(|t| Some((t, token_hash(t)?))) {
+            match a.session_from_token(t, util::now()).await {
+                Ok(Some((user, session, _))) if !session.mfa_ok => {
+                    return Ok(PendingMfa { user, session, csrf: csrf::token(&a.keys, &hash) });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(target: "accounts", error = %e, "session lookup failed");
+                    return Err(error_page(a, &parts.headers, StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again."));
+                }
+            }
+        }
+        Err(see_other(&format!("{BASE}/login"), &[]))
+    }
+}
+
 /// Whoever is signed in, or nobody. A database error counts as nobody, which
 /// grants nothing.
 pub struct Viewer(pub Option<Authed>);

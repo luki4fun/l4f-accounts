@@ -13,10 +13,12 @@ mod auth;
 mod csrf;
 mod extract;
 mod flash;
+mod mfa;
+mod passkey;
 #[cfg(test)]
 mod tests;
 
-pub use extract::{Authed, Viewer};
+pub use extract::{Authed, PendingMfa, Viewer};
 
 use std::{net::IpAddr, sync::Arc};
 
@@ -86,6 +88,20 @@ pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>)
         .route("/admin/users/{id}", get(admin::user::<H>).post(admin::user_action::<H>))
         .route("/admin/roles", get(admin::roles::<H>).post(admin::role_create::<H>))
         .route("/admin/roles/{name}", get(admin::role::<H>).post(admin::role_action::<H>))
+        .route("/mfa", get(mfa::mfa_form::<H>).post(mfa::mfa::<H>))
+        .route("/security", get(mfa::security::<H>))
+        .route("/totp", get(mfa::totp_form::<H>).post(mfa::totp::<H>))
+        .route("/recovery", post(mfa::recovery::<H>))
+        .route("/passkey/options/login", post(passkey::options_login::<H>))
+        .route("/passkey/options/add", post(passkey::options_add::<H>))
+        .route("/passkey/options/mfa", post(passkey::options_mfa::<H>))
+        .route("/passkey/options/step-up", post(passkey::options_step_up::<H>))
+        .route("/passkey/login", post(passkey::login::<H>))
+        .route("/passkey/add", post(passkey::add::<H>))
+        .route("/passkey/mfa", post(passkey::mfa::<H>))
+        .route("/passkey/step-up", post(passkey::step_up::<H>))
+        .route("/passkey/{id}/delete", post(passkey::remove::<H>))
+        .route("/assets/passkey.js", get(passkey::script))
         .route("/login", get(auth::login_form::<H>).post(auth::login::<H>))
         .route("/logout", post(auth::logout::<H>))
         .route("/logout-all", post(auth::logout_all::<H>))
@@ -148,6 +164,20 @@ fn clear_device(cfg: &Config) -> String {
     util::set_cookie(&device_name(cfg), "", 0, cfg.cookie_secure, true)
 }
 
+/// The browser nonce a passkey challenge is bound to: a cookie only this
+/// browser sends, so a challenge cannot be completed somewhere else.
+fn new_nonce(cfg: &Config) -> (Vec<u8>, String) {
+    let n = util::random::<16>();
+    let cookie = util::set_cookie(&util::cookie_name("acct-ch", cfg.cookie_secure), &util::b64u(&n), 600, cfg.cookie_secure, true);
+    (n.to_vec(), cookie)
+}
+
+fn nonce_of(cfg: &Config, h: &HeaderMap) -> Vec<u8> {
+    util::cookie(h.get(header::COOKIE).and_then(|v| v.to_str().ok()), &util::cookie_name("acct-ch", cfg.cookie_secure))
+        .and_then(util::b64u_dec)
+        .unwrap_or_default()
+}
+
 fn known_device<H: Host>(a: &Accounts<H>, cfg: &Config, h: &HeaderMap) -> Option<AccountId> {
     let v = util::cookie(h.get(header::COOKIE).and_then(|v| v.to_str().ok()), &device_name(cfg))?;
     let (hex, sig) = v.split_once('.')?;
@@ -200,6 +230,29 @@ struct ErrorTpl<'a> {
 /// the host's own scope-guarded pages refuse the same way.
 pub fn error_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, msg: &str) -> Response {
     page(a, h, "Something went wrong", status, &ErrorTpl { msg, base: BASE })
+}
+
+/// A JSON answer for the scripts, with cookies.
+fn json_ok(v: serde_json::Value, cookies: &[String]) -> Response {
+    let mut r = axum::Json(v).into_response();
+    for c in cookies {
+        if let Ok(v) = HeaderValue::from_str(c) {
+            r.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    r
+}
+
+/// A refusal for the scripts: never a 2xx, and the sentence to show.
+fn json_refused(e: &Error) -> Response {
+    if let Error::Db(err) = e {
+        tracing::error!(target: "accounts", error = %err, "database error");
+    }
+    let status = match status_of(e) {
+        StatusCode::OK => StatusCode::BAD_REQUEST,
+        s => s,
+    };
+    (status, axum::Json(serde_json::json!({ "error": e.message() }))).into_response()
 }
 
 /// The status a refused service call answers with when its page is shown again.

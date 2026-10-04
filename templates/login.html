@@ -9,7 +9,7 @@
         <input type="hidden" name="next" value="{{ next }}">
         <div class="field">
           <label for="username">Username</label>
-          <input type="text" id="username" name="username" value="{{ username }}" autocomplete="username"
+          <input type="text" id="username" name="username" value="{{ username }}" autocomplete="username webauthn"
                  autocapitalize="none" spellcheck="false" maxlength="64" required>
         </div>
         <div class="field">
@@ -18,7 +18,10 @@
         </div>
         <button class="btn" type="submit">Sign in</button>
       </form>
+      <button class="btn btn-quiet mt-2" type="button" hidden data-passkey="login" data-base="{{ base }}" data-next="{{ next }}" data-status="pk-status"{% if let Some(t) = csrf %} data-csrf="{{ t }}"{% endif %}>Sign in with a passkey</button>
+      <p class="hint" id="pk-status" role="status" aria-live="polite"></p>
       {% if signup_open %}<p class="hint mt-2">No account yet? <a href="{{ base }}/register">Create one</a>.</p>{% endif %}
     </div>
   </div>
 </section>
+<script src="{{ base }}/assets/passkey.js" defer></script>

@@ -40,12 +40,14 @@ struct DashboardTpl<'a> {
     links: Vec<(String, String)>,
     can_users: bool,
     can_roles: bool,
+    waiting_for_2fa: bool,
     flash: Option<Flash>,
 }
 
 pub(super) async fn dashboard<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderMap, Query(fq): Query<flash::Query>) -> Response {
     let now = util::now();
-    let (roles, sessions) = match tokio::try_join!(a.store.user_roles(me.user.id), a.sessions(me.user.id, now)) {
+    let (roles, sessions, held) =
+        match tokio::try_join!(a.store.user_roles(me.user.id), a.sessions(me.user.id, now), a.store.user_scopes(me.user.id)) {
         Ok(v) => v,
         Err(e) => return refused(&a, &h, &Error::Db(e)),
     };
@@ -70,6 +72,8 @@ pub(super) async fn dashboard<H: WebHost>(State(a): St<H>, me: Authed, h: Header
         links: a.host.dashboard_links(&me.scopes),
         can_users: me.can("users:read"),
         can_roles: me.can("roles:admin"),
+        // Held but not granted: the 2FA rule is holding them back.
+        waiting_for_2fa: held.len() > me.scopes.len(),
         flash: flash::read(&a.keys, &fq),
     };
     page(&a, &h, "Your account", StatusCode::OK, &t)

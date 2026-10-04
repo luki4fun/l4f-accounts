@@ -25,12 +25,16 @@ fn sig(keys: &Keys, kind: &str, msg: &str) -> String {
     keys.sign("notice", format!("{kind}\0{msg}").as_bytes())
 }
 
-/// 303 to `path` with the message, plus cookies.
-pub(super) fn to(keys: &Keys, path: &str, good: bool, msg: &str, cookies: &[String]) -> Response {
+/// `path` with the message attached.
+pub(super) fn url(keys: &Keys, path: &str, good: bool, msg: &str) -> String {
     let kind = if good { "ok" } else { "err" };
     let sep = if path.contains('?') { '&' } else { '?' };
-    let url = format!("{path}{sep}{kind}={}&sig={}", util::urlencode(msg), sig(keys, kind, msg));
-    see_other(&url, cookies)
+    format!("{path}{sep}{kind}={}&sig={}", util::urlencode(msg), sig(keys, kind, msg))
+}
+
+/// 303 to `path` with the message, plus cookies.
+pub(super) fn to(keys: &Keys, path: &str, good: bool, msg: &str, cookies: &[String]) -> Response {
+    see_other(&url(keys, path, good, msg), cookies)
 }
 
 /// The message in the query, if its signature holds.

@@ -34,6 +34,17 @@ impl<H: Host> Accounts<H> {
         }
     }
 
+    /// The same setup again, from what the form sent back: after a wrong code
+    /// the QR code the app already scanned stays valid.
+    pub fn totp_setup_again(&self, user: &User, sealed: &str) -> Option<TotpSetup> {
+        let (secret, _) = self.keys.open("totp-setup", &user.id.0, &util::b64u_dec(sealed)?)?;
+        Some(TotpSetup {
+            secret: totp::base32_encode(&secret),
+            uri: totp::otpauth_uri(self.host.config().issuer(), &user.username, &secret),
+            sealed: sealed.to_string(),
+        })
+    }
+
     /// Turns codes on once a code from the new secret checks out. Returns new
     /// recovery codes when the account had none left, else nothing.
     pub async fn totp_enable(&self, ctx: &Ctx, user: &User, sealed: &str, code: &str) -> Result<Vec<String>, Error> {

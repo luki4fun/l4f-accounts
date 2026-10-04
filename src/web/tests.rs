@@ -572,3 +572,142 @@ async fn roles_are_created_edited_and_deleted() {
     drop_role(&a, &admin_role).await;
     drop_role(&a, &second).await;
 }
+
+// ---- second factors
+
+fn pk_cfg() -> Config {
+    Config { base_url: "https://l4f.cc".into(), ..cfg() }
+}
+
+fn post_json(uri: &str, body: &serde_json::Value, cookie: Option<&str>, csrf: Option<&str>) -> Request<Body> {
+    let mut b = Request::post(uri).header(header::CONTENT_TYPE, "application/json").header("sec-fetch-site", "same-origin");
+    if let Some(c) = cookie {
+        b = b.header(header::COOKIE, c);
+    }
+    if let Some(t) = csrf {
+        b = b.header("x-csrf", t);
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
+async fn json_of(r: Response) -> serde_json::Value {
+    serde_json::from_str(&text(r).await).unwrap()
+}
+
+#[tokio::test]
+async fn totp_setup_then_sign_in_through_the_second_step() {
+    let Some((app, a)) = shared(pk_cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let page = text(send(&app, get("/account/totp", Some(&c))).await).await;
+    assert!(page.contains("<svg") || page.contains("<?xml"), "a QR code");
+    let sealed = field(&page, "setup");
+    let secret = crate::totp::base32_decode(&page[page.find(r#"<p class="mono anywhere">"#).unwrap() + 25..].split('<').next().unwrap().replace(' ', "")).unwrap();
+    let step = util::now() / 30;
+    let code = |s: i64| format!("{:06}", crate::totp::code_at(&secret, s));
+    let r = send(&app, post("/account/totp", &format!("csrf={t}&_action=enable&setup={sealed}&code=000000"), Some(&c))).await;
+    assert!(text(r).await.contains("That code is not right."), "a wrong code shows the same setup again");
+    let r = send(&app, post("/account/totp", &format!("csrf={t}&_action=enable&setup={sealed}&code={}", code(step)), Some(&c))).await;
+    let codes_page = text(r).await;
+    assert!(codes_page.contains("Your recovery codes"));
+    let first_code = codes_page.split("<li>").nth(1).unwrap().split('<').next().unwrap().to_string();
+
+    // Signing in again stops at the second step.
+    let body = format!("username={}&password={}&next=%2Faccount%2Fsecurity", u.username, util::urlencode(PW));
+    let r = send(&app, post("/account/login", &body, None)).await;
+    assert_eq!(location(&r), "/account/mfa?next=%2Faccount%2Fsecurity");
+    let pending = set_cookie(&r, "__Host-acct").unwrap();
+    assert!(set_cookie(&r, "__Host-acct-dev").is_none(), "not a known device before the second step");
+    assert_eq!(send(&app, get("/account", Some(&pending))).await.status(), StatusCode::SEE_OTHER, "a pending session is nobody");
+    let page = text(send(&app, get("/account/mfa?next=%2Faccount%2Fsecurity", Some(&pending))).await).await;
+    assert!(page.contains("authenticator app") && !page.contains(r#"data-passkey="mfa""#));
+    let pt = field(&page, "csrf");
+    let r = send(&app, post("/account/mfa", &format!("csrf={pt}&_action=totp&next=%2Faccount%2Fsecurity&code={}", code(step + 1)), Some(&pending))).await;
+    assert_eq!((r.status(), location(&r)), (StatusCode::SEE_OTHER, "/account/security"));
+    let full = set_cookie(&r, "__Host-acct").unwrap();
+    assert!(set_cookie(&r, "__Host-acct-dev").is_some());
+    assert_eq!(send(&app, get("/account", Some(&full))).await.status(), StatusCode::OK);
+    let reauth = text(send(&app, get("/account/reauth", Some(&full))).await).await;
+    assert!(reauth.contains("authenticator app") && !reauth.contains(r#"name="password""#), "step-up takes the code");
+
+    // A recovery code finishes another sign-in and lands on the security page.
+    let r = send(&app, post("/account/login", &body, None)).await;
+    let pending = set_cookie(&r, "__Host-acct").unwrap();
+    let pt = field(&text(send(&app, get("/account/mfa", Some(&pending))).await).await, "csrf");
+    let r = send(&app, post("/account/mfa", &format!("csrf={pt}&_action=recovery&code={first_code}"), Some(&pending))).await;
+    assert!(location(&r).starts_with("/account/security?ok=Signed+in+with+a+recovery+code.+9+left"), "{}", location(&r));
+    drop_user(&a, u.id).await;
+}
+
+#[tokio::test]
+async fn passkeys_are_added_and_used_through_the_json_endpoints() {
+    let Some((app, a)) = shared(pk_cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let r = send(&app, post_json("/account/passkey/options/add", &serde_json::json!({}), Some(&c), None)).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "JSON with a session cookie needs X-CSRF");
+    let r = send(&app, post_json("/account/passkey/options/add", &serde_json::json!({}), Some(&c), Some(&t))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let nonce = set_cookie(&r, "__Host-acct-ch").unwrap();
+    let o = json_of(r).await;
+    let token = o["token"].as_str().unwrap().to_string();
+    let ch = crate::challenge::challenge_bytes(&token);
+    let mut auth = crate::testkit::Authenticator::new();
+    let cred: serde_json::Value = serde_json::from_str(&auth.create(&ch, "https://l4f.cc", "l4f.cc")).unwrap();
+    let both = format!("{c}; {nonce}");
+    let r = send(&app, post_json("/account/passkey/add", &serde_json::json!({ "token": token, "credential": cred, "name": "Phone" }), Some(&both), Some(&t))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(json_of(r).await["next"].as_str().unwrap().starts_with("/account/security?ok=Passkey+added."));
+    let page = text(send(&app, get("/account/security", Some(&c))).await).await;
+    assert!(page.contains("<td>Phone</td>"));
+
+    // Signing in with it, no session yet: no CSRF token needed.
+    let r = send(&app, post_json("/account/passkey/options/login", &serde_json::json!({}), None, None)).await;
+    let nonce = set_cookie(&r, "__Host-acct-ch").unwrap();
+    let token = json_of(r).await["token"].as_str().unwrap().to_string();
+    let get_json = auth.get(&crate::challenge::challenge_bytes(&token), "https://l4f.cc", "l4f.cc", Some(&u.id.0), true);
+    let body = serde_json::json!({ "token": token, "credential": serde_json::from_str::<serde_json::Value>(&get_json).unwrap(), "next": "/account" });
+    let r = send(&app, post_json("/account/passkey/login", &body, None, None)).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "without the browser nonce cookie");
+    let r = send(&app, post_json("/account/passkey/login", &body, Some(&nonce), None)).await;
+    assert_eq!(r.status(), StatusCode::OK, "the refusal above did not spend the challenge");
+    assert!(set_cookie(&r, "__Host-acct").is_some());
+    assert_eq!(json_of(r).await["next"], "/account");
+    let r = send(&app, post_json("/account/passkey/login", &body, Some(&nonce), None)).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "a replay is refused (here by the counter, before the burn)");
+
+    let r = send(&app, post_json("/account/passkey/options/login", &serde_json::json!({}), None, None)).await;
+    let nonce = set_cookie(&r, "__Host-acct-ch").unwrap();
+    let token = json_of(r).await["token"].as_str().unwrap().to_string();
+    let get_json = auth.get(&crate::challenge::challenge_bytes(&token), "https://l4f.cc", "l4f.cc", Some(&u.id.0), true);
+    let body = serde_json::json!({ "token": token, "credential": serde_json::from_str::<serde_json::Value>(&get_json).unwrap(), "next": "//evil" });
+    let r = send(&app, post_json("/account/passkey/login", &body, Some(&nonce), None)).await;
+    assert_eq!(json_of(r).await["next"], "/account", "next stays on this site");
+
+    // Removing it, with a recent sign-in, from the security page's form.
+    let id = util::b64u(&auth.id);
+    let r = send(&app, post(&format!("/account/passkey/{id}/delete"), &format!("csrf={t}"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/security?ok=Passkey+removed."));
+    assert!(!a.store.user_by_id(u.id).await.unwrap().unwrap().has_passkey);
+    drop_user(&a, u.id).await;
+}
+
+#[tokio::test]
+async fn the_passkey_script_is_served_and_privileged_accounts_are_told_about_2fa() {
+    let Some((app, a)) = shared(Config { require_2fa_for_privileged: true, ..pk_cfg() }).await else { return };
+    let r = send(&app, get("/account/assets/passkey.js", None)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+    assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache");
+    assert!(text(r).await.contains("parseCreationOptionsFromJSON"));
+
+    let admin_role = role_with(&a, &["users:read"]).await;
+    let u = make_user(&a).await;
+    give(&a, u.id, &admin_role).await;
+    let (c, _, _) = browser(&a, u.id, util::now()).await;
+    let page = text(send(&app, get("/account", Some(&c))).await).await;
+    assert!(page.contains("work only with two-factor sign-in"));
+    assert_eq!(send(&app, get("/account/admin/users", Some(&c))).await.status(), StatusCode::FORBIDDEN, "held, not granted");
+    drop_user(&a, u.id).await;
+    drop_role(&a, &admin_role).await;
+}

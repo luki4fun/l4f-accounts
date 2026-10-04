@@ -1,0 +1,42 @@
+<section class="hero">
+  <div class="wrap">
+    <div class="panel narrow-s">
+      <h1>Second step</h1>
+      {% if let Some(e) = error %}<div class="notice mt-2" role="alert">{{ e }}</div>{% endif %}
+      {% if passkey %}
+      <button class="btn mt-2" type="button" hidden data-passkey="mfa" data-base="{{ base }}" data-csrf="{{ csrf }}" data-next="{{ next }}" data-status="pk-status">Use your passkey</button>
+      <p class="hint" id="pk-status" role="status" aria-live="polite"></p>
+      {% endif %}
+      {% if totp %}
+      <form class="mt-2" method="post" action="{{ base }}/mfa">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="next" value="{{ next }}">
+        <input type="hidden" name="_action" value="totp">
+        <div class="field">
+          <label for="code">Code from your authenticator app</label>
+          <input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9 ]{6,7}" maxlength="7" autocomplete="one-time-code" required autofocus>
+        </div>
+        <button class="btn" type="submit">Continue</button>
+      </form>
+      {% endif %}
+      <details class="opt mt-3">
+        <summary>Use a recovery code</summary>
+        <form class="mt-2" method="post" action="{{ base }}/mfa">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="next" value="{{ next }}">
+          <input type="hidden" name="_action" value="recovery">
+          <div class="field">
+            <label for="rcode">Recovery code</label>
+            <input type="text" id="rcode" name="code" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="32" required>
+          </div>
+          <button class="btn btn-quiet" type="submit">Continue</button>
+        </form>
+      </details>
+      <form class="mt-3" method="post" action="{{ base }}/logout">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="btn btn-sm btn-quiet" type="submit">Cancel and sign out</button>
+      </form>
+    </div>
+  </div>
+</section>
+{% if passkey %}<script src="{{ base }}/assets/passkey.js" defer></script>{% endif %}

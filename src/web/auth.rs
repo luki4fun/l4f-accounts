@@ -11,17 +11,17 @@ use serde::Deserialize;
 
 use super::flash::{self, Flash};
 use super::{
-    Authed, BASE, St, Viewer, WebHost, clear_session, csrf_for_cookie, error_page, known_device, page, refused, see_other,
+    Authed, BASE, St, Viewer, WebHost, clear_session, csrf_for_cookie, known_device, page, refused, see_other,
     session_token, set_device, set_session, status_of,
 };
 use crate::password::MAX_LEN;
-use crate::service::{Accounts, Ctx, Error, LoginStep, has_second_factor};
+use crate::service::{Accounts, Ctx, Error, LoginStep};
 use crate::{pow, util};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(super) struct NextQuery {
-    next: String,
+    pub(super) next: String,
 }
 
 // ---- sign in
@@ -92,12 +92,9 @@ pub(super) async fn login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, F
             see_other(util::safe_next(&f.next, BASE), &cookies)
         }
         Ok(LoginStep::NeedMfa(s)) => {
-            // The second step arrives with 2FA itself; until then nobody can
-            // enrol a factor, so this only happens to a hand-edited account.
-            if let Err(e) = a.logout(&s.token).await {
-                tracing::warn!(target: "accounts", error = %e, "pending session not removed");
-            }
-            error_page(&a, &h, StatusCode::SERVICE_UNAVAILABLE, "Two-factor sign-in is not available yet.")
+            // A session that grants nothing until the second step completes it.
+            let to = format!("{BASE}/mfa?next={}", util::urlencode(util::safe_next(&f.next, BASE)));
+            see_other(&to, &[set_session(&cfg, &s.token)])
         }
         Err(e) => {
             if let Error::Db(err) = &e {
@@ -228,7 +225,8 @@ struct ReauthTpl<'a> {
     username: &'a str,
     csrf: &'a str,
     minutes: i64,
-    two_factor: bool,
+    totp: bool,
+    passkey: bool,
     max_len: usize,
     error: Option<&'a str>,
 }
@@ -240,7 +238,8 @@ fn reauth_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, m
         username: &me.user.username,
         csrf: me.csrf(),
         minutes: a.host.config().step_up_minutes,
-        two_factor: has_second_factor(&me.user),
+        totp: me.user.totp_enabled,
+        passkey: me.user.has_passkey,
         max_len: MAX_LEN,
         error,
     };
@@ -254,12 +253,20 @@ pub(super) async fn reauth_form<H: WebHost>(State(a): St<H>, me: Authed, h: Head
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(super) struct ReauthForm {
+    #[serde(rename = "_action")]
+    action: String,
     password: String,
+    code: String,
     next: String,
 }
 
 pub(super) async fn reauth<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Form(f): Form<ReauthForm>) -> Response {
-    match a.step_up(&ctx, &me.user, &me.session, &f.password).await {
+    let r = if f.action == "totp" {
+        a.step_up_totp(&ctx, &me.user, &me.session, &f.code).await
+    } else {
+        a.step_up(&ctx, &me.user, &me.session, &f.password).await
+    };
+    match r {
         Ok(s) => see_other(util::safe_next(&f.next, BASE), &[set_session(&a.host.config(), &s.token)]),
         Err(e) => {
             if let Error::Db(err) = &e {
