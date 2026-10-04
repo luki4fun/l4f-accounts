@@ -208,6 +208,7 @@ impl<H: Host> Accounts<H> {
             name: scope::clean_display_name(&id.handle).unwrap_or_else(|_| kind.label().to_string()),
             created_at: util::now(),
             last_used_at: None,
+            public: false,
         }
     }
 

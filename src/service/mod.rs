@@ -14,6 +14,7 @@ mod mail;
 mod keylogin;
 mod mfa;
 mod passkey;
+mod profile;
 #[cfg(feature = "oauth")]
 mod social;
 mod storage;
@@ -25,6 +26,7 @@ pub use auth::{LoginStep, NewSession, RegisterForm};
 pub use mfa::TotpSetup;
 pub use keylogin::NewDeviceKey;
 pub use passkey::PasskeyFor;
+pub use profile::{AVATAR_MAX, PublicProfile, image_type, uuid_of};
 pub use storage::Put;
 #[cfg(feature = "oauth")]
 pub use social::{Intent, OAuth, SocialOutcome};
@@ -59,6 +61,12 @@ pub trait Host: Send + Sync + 'static {
         user: AccountId,
         delete_owned: bool,
     ) -> impl Future<Output = sqlx::Result<()>> + Send;
+    /// The host's own public links for a profile, as (label, url): l4f's
+    /// short links marked public, say. None by default.
+    fn profile_links(&self, user: AccountId) -> impl Future<Output = Vec<(String, String)>> + Send {
+        let _ = user;
+        std::future::ready(Vec::new())
+    }
 }
 
 /// The host's `[accounts]` section. Unknown keys are refused, so a typo in a

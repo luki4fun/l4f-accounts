@@ -90,6 +90,7 @@ impl<H: Host> Accounts<H> {
             name,
             created_at: util::now(),
             last_used_at: None,
+            public: false,
         };
         if !self.store.insert_credential(&row).await? {
             return Err(Error::Invalid("That key is already registered."));
@@ -181,6 +182,7 @@ impl<H: Host> Accounts<H> {
             name: ctx.ua.chars().take(64).collect(),
             created_at: util::now(),
             last_used_at: None,
+            public: false,
         };
         if !self.store.insert_credential(&row).await? {
             return Err(Error::Invalid("This browser is already remembered."));

@@ -8,6 +8,7 @@ use sha2::Digest;
 
 use super::admin::role_name;
 use super::storage::KV_MAX_BYTES;
+use super::profile::uuid_of;
 use super::auth::{clean_email, new_token, token_hash};
 use super::*;
 use crate::model::{SessionInfo, UserStatus};
@@ -1432,4 +1433,50 @@ async fn the_vault_takes_ciphertext_shaped_entries_only() {
     assert!(slots.is_empty() && items.is_empty());
     assert!(matches!(a.vault_list(&u, &["storage:sync".to_string()]).await, Err(Error::Forbidden)), "needs vault:use");
     cleanup(&a, &[u.id], &[]).await;
+}
+
+// ---- profile
+
+fn png() -> Vec<u8> {
+    let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+    b.extend([0u8; 64]);
+    b
+}
+
+#[tokio::test]
+async fn a_profile_shows_what_its_owner_chose_behind_a_rotatable_link() {
+    let Some(a) = shared(Config { require_2fa_for_privileged: false, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.120");
+    let role = make_role(&a, &["profile:public"]).await;
+    a.store.update_role(a.store.role_by_name(&role).await.unwrap().unwrap().id, "", Some("Helper")).await.unwrap();
+    let u = make_user(&a, &[&role]).await;
+    let scopes = a.effective_scopes(&u).await.unwrap();
+    assert!(matches!(a.profile_save(&c, &u, &[], true, "", true).await, Err(Error::Forbidden)), "needs profile:public");
+    a.profile_save(&c, &u, &scopes, true, "Hello\r\nthere", true).await.unwrap();
+    let id = a.profile_settings(u.id).await.unwrap().public_id.unwrap();
+    let link = uuid_of(&id);
+    let p = a.public_profile(&link).await.unwrap().unwrap();
+    assert_eq!((p.display_name.as_str(), p.bio.as_str(), p.badges.clone()), ("T", "Hello\nthere", vec!["Helper".to_string()]));
+    assert!(!p.avatar);
+    a.profile_save(&c, &u, &scopes, true, "Hello", false).await.unwrap();
+    assert!(a.public_profile(&link).await.unwrap().unwrap().badges.is_empty(), "badges hidden");
+    assert_eq!(a.profile_settings(u.id).await.unwrap().public_id, Some(id), "saving keeps the link");
+
+    a.profile_rotate(&c, &u).await.unwrap();
+    assert!(a.public_profile(&link).await.unwrap().is_none(), "the old link is dead");
+    let new = uuid_of(&a.profile_settings(u.id).await.unwrap().public_id.unwrap());
+    assert!(a.public_profile(&new).await.unwrap().is_some());
+
+    a.avatar_put(&c, &u, &scopes, &png()).await.unwrap();
+    assert_eq!(a.avatar(u.id).await.unwrap().unwrap().1, "image/png");
+    assert!(a.public_profile(&new).await.unwrap().unwrap().avatar);
+    assert!(matches!(a.avatar_put(&c, &u, &scopes, b"<svg/>").await, Err(Error::Invalid(_))));
+    assert!(matches!(a.avatar_put(&c, &u, &scopes, &[png(), vec![0; 70_000]].concat()).await, Err(Error::Invalid(_))));
+
+    // Losing the scope hides the profile; switching it off drops the link.
+    a.store.revoke_role(u.id, a.store.role_by_name(&role).await.unwrap().unwrap().id).await.unwrap();
+    assert!(a.public_profile(&new).await.unwrap().is_none());
+    a.profile_save(&c, &u, &scopes, false, "", true).await.unwrap();
+    assert!(a.profile_settings(u.id).await.unwrap().public_id.is_none());
+    cleanup(&a, &[u.id], &[&role]).await;
 }

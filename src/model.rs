@@ -97,6 +97,8 @@ pub struct Credential {
     pub name: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    /// Shown on the public profile (linked identities only).
+    pub public: bool,
 }
 
 /// `Credential::flags` bit for a passkey that may be synced (backup eligible).

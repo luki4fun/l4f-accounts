@@ -62,6 +62,14 @@ pub enum PutBlob {
     Quota,
 }
 
+/// An account's profile settings. `public_id` `None`: the profile is off.
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub public_id: Option<[u8; 16]>,
+    pub bio: String,
+    pub show_badges: bool,
+}
+
 /// How `Store::confirm_email` went.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EmailConfirm {
@@ -80,7 +88,7 @@ const USER_COLS: &str = "id, username, display_name, email, email_pending, passw
      totp_enc IS NOT NULL, status, sync_enabled, created_at, \
      EXISTS (SELECT 1 FROM acct_credentials c WHERE c.user_id = acct_users.id AND c.kind = 'passkey')";
 
-const CRED_COLS: &str = "kind, ext_id, user_id, public_key, alg, sign_count, flags, name, created_at, last_used_at";
+const CRED_COLS: &str = "kind, ext_id, user_id, public_key, alg, sign_count, flags, name, created_at, last_used_at, public";
 
 const SESSION_COLS: &str = "token_hash, user_id, created_at, seen_at, expires_at, auth_at, mfa_ok, method, ip, ua";
 /// Signed-in sessions kept per account; the oldest go first.
@@ -165,6 +173,7 @@ fn credential(r: &MySqlRow) -> sqlx::Result<Credential> {
         name: r.try_get(7)?,
         created_at: r.try_get(8)?,
         last_used_at: r.try_get(9)?,
+        public: r.try_get(10)?,
     })
 }
 
@@ -846,6 +855,59 @@ impl Store {
     pub async fn delete_blobs(&self, user: AccountId, ns: &str) -> sqlx::Result<u64> {
         let r = sqlx::query("DELETE FROM acct_blobs WHERE user_id = ? AND ns = ?").bind(&user.0[..]).bind(ns).execute(&self.0).await?;
         Ok(r.rows_affected())
+    }
+
+    // -------------------------------------------------------------- profile
+
+    pub async fn profile(&self, user: AccountId) -> sqlx::Result<Profile> {
+        let row: Option<(Option<Vec<u8>>, String, bool)> =
+            sqlx::query_as("SELECT public_id, bio, show_badges FROM acct_profiles WHERE user_id = ?").bind(&user.0[..]).fetch_optional(&self.0).await?;
+        Ok(match row {
+            Some((id, bio, show_badges)) => Profile { public_id: id.and_then(|b| b.try_into().ok()), bio, show_badges },
+            None => Profile { public_id: None, bio: String::new(), show_badges: true },
+        })
+    }
+
+    pub async fn save_profile(&self, user: AccountId, p: &Profile, now: i64) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO acct_profiles (user_id, public_id, bio, show_badges, updated_at) VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE public_id = VALUES(public_id), bio = VALUES(bio), show_badges = VALUES(show_badges), updated_at = VALUES(updated_at)",
+        )
+        .bind(&user.0[..])
+        .bind(p.public_id.as_ref().map(|b| &b[..]))
+        .bind(clip(&p.bio, 1000))
+        .bind(p.show_badges)
+        .bind(now)
+        .execute(&self.0)
+        .await
+        .map(|_| ())
+    }
+
+    /// The account behind a public profile link, if the profile is on.
+    pub async fn profile_owner(&self, public_id: &[u8; 16]) -> sqlx::Result<Option<AccountId>> {
+        let owner: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT user_id FROM acct_profiles WHERE public_id = ?").bind(&public_id[..]).fetch_optional(&self.0).await?;
+        owner.map(id).transpose()
+    }
+
+    /// Whether a credential (a linked identity) shows on the public profile.
+    pub async fn set_credential_public(&self, user: AccountId, kind: &str, ext_id: &[u8], public: bool) -> sqlx::Result<bool> {
+        let r = sqlx::query("UPDATE acct_credentials SET public = ? WHERE user_id = ? AND kind = ? AND ext_id = ?")
+            .bind(public)
+            .bind(&user.0[..])
+            .bind(kind)
+            .bind(ext_id)
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// Linked identities shown on the profile: (kind, name).
+    pub async fn public_identities(&self, user: AccountId) -> sqlx::Result<Vec<(String, String)>> {
+        sqlx::query_as("SELECT kind, name FROM acct_credentials WHERE user_id = ? AND public = 1 AND kind LIKE 'oauth:%' ORDER BY kind")
+            .bind(&user.0[..])
+            .fetch_all(&self.0)
+            .await
     }
 
     // ---------------------------------------------------------- credentials

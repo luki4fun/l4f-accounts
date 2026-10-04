@@ -127,6 +127,7 @@ impl<H: Host> Accounts<H> {
             name,
             created_at: util::now(),
             last_used_at: None,
+            public: false,
         };
         if !self.store.insert_credential(&row).await? {
             return Err(Error::Invalid("That passkey is already registered."));

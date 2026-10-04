@@ -17,6 +17,7 @@ mod keylogin;
 mod mail;
 mod mfa;
 mod passkey;
+mod profile;
 #[cfg(feature = "oauth")]
 mod social;
 mod storage;
@@ -24,6 +25,7 @@ mod storage;
 mod tests;
 
 pub use extract::{Authed, PendingMfa, Viewer};
+pub use profile::profile_router;
 
 use std::{net::IpAddr, sync::Arc};
 
@@ -109,6 +111,9 @@ pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>)
         .route("/api/vault/slots/{k}", axum::routing::put(storage::vault_put_slot::<H>).delete(storage::vault_delete_slot::<H>))
         .route("/vault", get(storage::vault_page::<H>))
         .route("/vault/wipe", post(storage::vault_wipe::<H>))
+        .route("/profile", get(profile::settings::<H>).post(profile::save::<H>))
+        .route("/api/avatar", axum::routing::put(profile::avatar_put::<H>))
+        .route("/assets/avatar.js", get(profile::avatar_script))
         .route("/assets/sync.js", get(storage::sync_script))
         .route("/assets/vault.js", get(storage::vault_script))
         .route("/", get(account::dashboard::<H>))

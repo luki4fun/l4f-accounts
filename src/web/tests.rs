@@ -988,3 +988,36 @@ async fn the_vault_api_takes_up_to_72_kib_of_ciphertext_per_item() {
     drop_user(&a, u.id).await;
     drop_role(&a, &role).await;
 }
+
+// ---- profile
+
+#[tokio::test]
+async fn the_public_profile_is_private_noindex_and_its_avatar_sandboxed() {
+    let Some((_, a)) = shared(cfg()).await else { return };
+    let app = Router::new().nest(BASE, router(a.clone())).nest("/profile", profile_router(a.clone()));
+    let role = role_with(&a, &["profile:public"]).await;
+    let u = make_user(&a).await;
+    give(&a, u.id, &role).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let page = text(send(&app, get("/account/profile", Some(&c))).await).await;
+    assert!(page.contains("Your profile is off."));
+    let r = send(&app, post("/account/profile", &format!("csrf={t}&_action=save&on=1&bio=Hi+there&show_badges=1"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/profile?ok=Profile+saved."));
+    let id = crate::service::uuid_of(&a.store.profile(u.id).await.unwrap().public_id.unwrap());
+    let r = send(&app, get(&format!("/profile/{id}"), None)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!((r.headers()["x-robots-tag"].to_str().unwrap(), r.headers()[header::CACHE_CONTROL].to_str().unwrap()), ("noindex, nofollow", "private, no-store"));
+    assert!(text(r).await.contains("Hi there"));
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend([0u8; 32]);
+    let r = send(&app, put_raw("/account/api/avatar", png, "image/png", &c, Some(&t), 0)).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = send(&app, get(&format!("/profile/{id}/avatar"), None)).await;
+    assert_eq!(r.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(r.headers()[header::CONTENT_SECURITY_POLICY], "default-src 'none'; sandbox");
+    assert_eq!(r.headers()["cross-origin-resource-policy"], "same-origin");
+    assert_eq!(send(&app, get("/profile/00000000-0000-4000-8000-000000000000", None)).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(send(&app, get("/profile/garbage/avatar", None)).await.status(), StatusCode::NOT_FOUND);
+    drop_user(&a, u.id).await;
+    drop_role(&a, &role).await;
+}
