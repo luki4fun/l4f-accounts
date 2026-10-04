@@ -58,6 +58,9 @@ pub struct Assertion {
     pub user_handle: Option<Vec<u8>>,
     pub sign_count: u32,
     pub user_verified: bool,
+    /// Compare with the stored `backup_eligible`: it never changes for a
+    /// credential (L3 §7.2), so a flip means another authenticator.
+    pub backup_eligible: bool,
     pub backed_up: bool,
 }
 
@@ -192,7 +195,8 @@ pub fn parse_assertion_ids(json: &str) -> Result<(Vec<u8>, Option<Vec<u8>>), Web
 /// handle are not signed, so `stored_spki` must be the key stored under exactly
 /// this credential id, and the user is that key's owner. In a discoverable login
 /// the user handle must be present and be the owner's (W3C L3 §7.2 step 6); with
-/// an allow-list it must be absent or the owner's. Then store `sign_count`.
+/// an allow-list it must be absent or the owner's. For MFA and step-up the
+/// owner must also be the account already signed in. Then store `sign_count`.
 pub fn verify_assertion(
     rp: &Rp,
     expected_challenge: &[u8],
@@ -231,6 +235,7 @@ pub fn verify_assertion(
         user_handle,
         sign_count: ad.sign_count,
         user_verified: ad.flags & UV != 0,
+        backup_eligible: ad.flags & BE != 0,
         backed_up: ad.flags & BS != 0,
     })
 }

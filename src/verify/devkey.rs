@@ -66,6 +66,8 @@ fn small_order(public_key: &[u8; 32]) -> bool {
 /// `challenge` the 32-byte `challenge::challenge_bytes`; other lengths, an origin
 /// containing NUL, a signature that is not 64 bytes, or a small-order key (which
 /// would accept one signature for every origin, device and challenge) are refused.
+/// The key's owner is the account this proves; for step-up it must be the one
+/// already signed in.
 pub fn verify(public_key: &[u8], origin: &str, device_id: &[u8], challenge: &[u8], signature: &[u8]) -> bool {
     let Ok(pk) = <&[u8; 32]>::try_from(public_key) else {
         return false;

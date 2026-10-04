@@ -42,6 +42,8 @@ pub enum SshError {
     /// Signature algorithm does not fit the key, or is SHA-1 `ssh-rsa`.
     SigAlg,
     BadSignature,
+    /// Signed by a key that is not one of the enrolled ones.
+    WrongKey,
 }
 
 const MAGIC: &[u8] = b"SSHSIG";
@@ -98,13 +100,18 @@ pub fn fingerprint(blob: &[u8]) -> String {
     format!("SHA256:{}", STANDARD_NO_PAD.encode(Sha256::digest(blob)))
 }
 
-/// Verify an armored SSHSIG over `message` in `namespace` and return the
-/// signer's public key blob.
-///
-/// The blob is whatever key the signer embedded: this proves possession of that
-/// key, nothing more. The caller must match it (or its fingerprint) against a
-/// stored key before trusting it.
-pub fn verify(armored: &str, namespace: &str, message: &[u8]) -> Result<Vec<u8>, SshError> {
+/// Verify an armored SSHSIG over `message` in `namespace`, made by one of the
+/// `enrolled` key blobs (the stored keys at login, the pasted key at
+/// enrollment). Returns which one. A signature by any other key is `WrongKey`,
+/// refused before any RSA or ECDSA work.
+pub fn verify(armored: &str, namespace: &str, message: &[u8], enrolled: &[&[u8]]) -> Result<usize, SshError> {
+    let pk = verify_by(armored, namespace, message, Some(enrolled))?;
+    Ok(enrolled.iter().position(|k| *k == pk).expect("checked in verify_by"))
+}
+
+/// The signature check itself. With `enrolled` `None` it accepts whatever key
+/// the signer embedded and returns it; only tests want that.
+fn verify_by(armored: &str, namespace: &str, message: &[u8], enrolled: Option<&[&[u8]]>) -> Result<Vec<u8>, SshError> {
     // The namespace is the only domain separation (a login signature must not
     // double as a git or file signature); PROTOCOL.sshsig forbids an empty one.
     if namespace.is_empty() {
@@ -127,6 +134,9 @@ pub fn verify(armored: &str, namespace: &str, message: &[u8]) -> Result<Vec<u8>,
 
     if ns != namespace.as_bytes() {
         return Err(SshError::Namespace);
+    }
+    if enrolled.is_some_and(|keys| !keys.contains(&pk)) {
+        return Err(SshError::WrongKey);
     }
     if !reserved.is_empty() {
         return Err(SshError::Malformed);
@@ -462,7 +472,7 @@ mod tests {
             ("ecdsa-p256 33-byte r,s", EC_PADDED_SIG, EC_PUB),
             ("ecdsa-p256 short r", EC_SHORT_SIG, EC_PUB),
         ] {
-            assert_eq!(verify(sig, NS, MSG), Ok(blob(key)), "{name} must verify and return its key");
+            assert_eq!(any(sig, NS, MSG), Ok(blob(key)), "{name} must verify and return its key");
         }
     }
 
@@ -514,7 +524,7 @@ mod tests {
     #[test]
     fn rsa_1024_is_refused_at_parse_and_verify() {
         assert_eq!(parse_public_key(RSA1024_PUB), Err(SshError::KeySize));
-        assert_eq!(verify(RSA1024_SIG, NS, MSG), Err(SshError::KeySize), "a real 1024-bit signature");
+        assert_eq!(any(RSA1024_SIG, NS, MSG), Err(SshError::KeySize), "a real 1024-bit signature");
     }
 
     #[test]
@@ -611,29 +621,43 @@ mod tests {
 
     #[test]
     fn wrong_namespace_or_message_fails() {
-        assert_eq!(verify(ED_SIG, "file", MSG), Err(SshError::Namespace));
-        assert_eq!(verify(ED_SIG, "login@l4f.cc.evil", MSG), Err(SshError::Namespace));
+        assert_eq!(any(ED_SIG, "file", MSG), Err(SshError::Namespace));
+        assert_eq!(any(ED_SIG, "login@l4f.cc.evil", MSG), Err(SshError::Namespace));
         let mut p = split(ED_SIG);
         p.ns = vec![];
-        assert_eq!(verify(&join(&p), "", MSG), Err(SshError::Namespace), "empty, even if the signature's is too");
+        assert_eq!(any(&join(&p), "", MSG), Err(SshError::Namespace), "empty, even if the signature's is too");
         for sig in [ED_SIG, RSA_SIG, EC_SIG] {
-            assert_eq!(verify(sig, NS, b"l4f-challenge-tesT"), Err(SshError::BadSignature));
-            assert_eq!(verify(sig, NS, b"l4f-challenge-test\n"), Err(SshError::BadSignature));
+            assert_eq!(any(sig, NS, b"l4f-challenge-tesT"), Err(SshError::BadSignature));
+            assert_eq!(any(sig, NS, b"l4f-challenge-test\n"), Err(SshError::BadSignature));
         }
+    }
+
+    /// Test shorthand: any embedded key, returned.
+    fn any(armored: &str, namespace: &str, message: &[u8]) -> Result<Vec<u8>, SshError> {
+        verify_by(armored, namespace, message, None)
+    }
+
+    #[test]
+    fn only_an_enrolled_key_is_accepted() {
+        let (ed, rsa) = (blob(ED_PUB), blob(RSA_PUB));
+        assert_eq!(verify(ED_SIG, NS, MSG, &[&rsa, &ed]), Ok(1), "says which key signed");
+        assert_eq!(verify(ED_SIG, NS, MSG, &[&rsa]), Err(SshError::WrongKey), "a valid signature by another key");
+        assert_eq!(verify(ED_SIG, NS, MSG, &[]), Err(SshError::WrongKey));
+        assert_eq!(verify(ED_SIG, NS, b"other", &[&ed]), Err(SshError::BadSignature));
     }
 
     #[test]
     fn signer_key_is_returned_not_assumed() {
-        let signer = verify(ED_SIG, NS, MSG).unwrap();
+        let signer = any(ED_SIG, NS, MSG).unwrap();
         assert_ne!(signer, blob(ED2_PUB), "caller compares against the stored key");
         assert_ne!(fingerprint(&signer), fingerprint(&blob(ED2_PUB)));
         let mut p = split(ED_SIG);
         p.pk = blob(ED2_PUB);
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::BadSignature), "same type, someone else's key");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::BadSignature), "same type, someone else's key");
         for (sig, other) in [(RSA_SIG, ED_PUB), (EC_SIG, RSA_PUB), (ED_SIG, EC_PUB)] {
             let mut p = split(sig);
             p.pk = blob(other);
-            assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::SigAlg), "other key type in the envelope");
+            assert_eq!(any(&join(&p), NS, MSG), Err(SshError::SigAlg), "other key type in the envelope");
         }
     }
 
@@ -644,28 +668,28 @@ mod tests {
             // Near the end: signature bytes for every type, never a length field.
             let at = p.sig.len() - 2;
             p.sig[at] ^= 0x40;
-            assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::BadSignature), "{name}");
+            assert_eq!(any(&join(&p), NS, MSG), Err(SshError::BadSignature), "{name}");
         }
         let mut p = split(EC_SIG);
         p.sig[10] ^= 0x01;
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::BadSignature), "ecdsa r");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::BadSignature), "ecdsa r");
         let mut p = split(RSA_SIG);
         p.sig.pop();
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::BadSignature), "a cut-off signature");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::BadSignature), "a cut-off signature");
         p.sig = vec![1; 385];
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed), "longer than the modulus");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed), "longer than the modulus");
         let mut p = split(ED_SIG);
         p.sig.push(0);
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed), "ed25519 sig must be 64 bytes");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed), "ed25519 sig must be 64 bytes");
     }
 
     #[test]
     fn short_rsa_signatures_are_left_padded_to_the_modulus() {
         let mut p = split(RSA2048_SHORT_SIG);
         p.sig.insert(0, 0);
-        assert_eq!(verify(&join(&p), NS, MSG), Ok(blob(RSA2048_PUB)), "the full-length form verifies too");
+        assert_eq!(any(&join(&p), NS, MSG), Ok(blob(RSA2048_PUB)), "the full-length form verifies too");
         p.sig.insert(0, 0);
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed), "but nothing longer than the modulus");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed), "but nothing longer than the modulus");
     }
 
     #[test]
@@ -696,7 +720,7 @@ mod tests {
         p.sig = [identity, [0; 32]].concat();
         let anything: &[u8] = b"anything at all";
         for msg in [MSG, anything] {
-            assert_eq!(verify(&join(&p), NS, msg), Err(SshError::UnsupportedKey), "forgery over {msg:?}");
+            assert_eq!(any(&join(&p), NS, msg), Err(SshError::UnsupportedKey), "forgery over {msg:?}");
         }
     }
 
@@ -732,7 +756,7 @@ mod tests {
         }
         let mut p = split(RSA_SIG);
         p.pk = rsa_blob(&[1], n);
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed), "the signer key gets the same checks");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed), "the signer key gets the same checks");
     }
 
     #[test]
@@ -777,8 +801,8 @@ mod tests {
             for i in 0..raw.len() {
                 let mut bad = raw.clone();
                 bad[i] ^= 0x01;
-                assert!(verify(&armor(&bad), NS, MSG).is_err(), "flip at byte {i} accepted");
-                assert!(verify(&armor(&raw[..i]), NS, MSG).is_err(), "truncation at {i} accepted");
+                assert!(any(&armor(&bad), NS, MSG).is_err(), "flip at byte {i} accepted");
+                assert!(any(&armor(&raw[..i]), NS, MSG).is_err(), "truncation at {i} accepted");
             }
         }
     }
@@ -787,16 +811,16 @@ mod tests {
     fn version_magic_and_reserved_are_checked() {
         let mut p = split(ED_SIG);
         p.version = 2;
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Version));
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Version));
         let mut p = split(ED_SIG);
         p.version = 0;
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Version));
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Version));
         let mut p = split(ED_SIG);
         p.magic = b"SSHSIH".to_vec();
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed));
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed));
         let mut p = split(ED_SIG);
         p.reserved = b"x".to_vec();
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed));
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed));
     }
 
     #[test]
@@ -805,11 +829,11 @@ mod tests {
         for h in hashes {
             let mut p = split(ED_SIG);
             p.hash = h.to_vec();
-            assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::HashAlg), "{:?}", String::from_utf8_lossy(h));
+            assert_eq!(any(&join(&p), NS, MSG), Err(SshError::HashAlg), "{:?}", String::from_utf8_lossy(h));
         }
         let mut p = split(RSA_SIG);
         p.algo = b"ssh-rsa".to_vec();
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::SigAlg), "SHA-1 RSA is refused");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::SigAlg), "SHA-1 RSA is refused");
         let swaps: [(&str, &[u8]); 5] = [
             (ED_SIG, b"rsa-sha2-512"),
             (ED_SIG, b"ecdsa-sha2-nistp256"),
@@ -820,7 +844,7 @@ mod tests {
         for (sig, algo) in swaps {
             let mut p = split(sig);
             p.algo = algo.to_vec();
-            assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::SigAlg), "{:?}", String::from_utf8_lossy(algo));
+            assert_eq!(any(&join(&p), NS, MSG), Err(SshError::SigAlg), "{:?}", String::from_utf8_lossy(algo));
         }
         let mut p = split(ED_SIG);
         let mut sk = Vec::new();
@@ -829,23 +853,23 @@ mod tests {
             put_string(&mut sk, f);
         }
         p.pk = sk;
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::UnsupportedKey));
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::UnsupportedKey));
     }
 
     #[test]
     fn trailing_bytes_are_rejected_everywhere() {
         let mut raw = dearmor(ED_SIG).unwrap();
         raw.push(0);
-        assert_eq!(verify(&armor(&raw), NS, MSG), Err(SshError::Malformed), "after the envelope");
+        assert_eq!(any(&armor(&raw), NS, MSG), Err(SshError::Malformed), "after the envelope");
         let mut p = split(ED_SIG);
         p.sig_tail = vec![0];
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed), "inside the signature string");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed), "inside the signature string");
         let mut p = split(ED_SIG);
         p.pk.push(0);
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed), "inside the public key");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed), "inside the public key");
         let mut p = split(EC_SIG);
         p.sig.push(0);
-        assert_eq!(verify(&join(&p), NS, MSG), Err(SshError::Malformed), "inside the ECDSA r,s string");
+        assert_eq!(any(&join(&p), NS, MSG), Err(SshError::Malformed), "inside the ECDSA r,s string");
     }
 
     #[test]
@@ -867,22 +891,22 @@ mod tests {
         ] {
             let mut q = split(EC_SIG);
             q.sig = ec_sig(&r, &s);
-            assert_eq!(verify(&join(&q), NS, MSG), Err(SshError::Malformed), "{name}");
+            assert_eq!(any(&join(&q), NS, MSG), Err(SshError::Malformed), "{name}");
         }
         let mut q = split(EC_SIG);
         q.sig = ec_sig(&r, &s);
-        assert!(verify(&join(&q), NS, MSG).is_ok(), "rebuilding untouched r,s round-trips");
+        assert!(any(&join(&q), NS, MSG).is_ok(), "rebuilding untouched r,s round-trips");
     }
 
     #[test]
     fn armor_is_strict_but_tolerates_line_endings() {
         let crlf = ED_SIG.replace('\n', "\r\n");
-        assert!(verify(&format!("\n  {crlf}  \n"), NS, MSG).is_ok(), "CRLF paste with surrounding blanks");
+        assert!(any(&format!("\n  {crlf}  \n"), NS, MSG).is_ok(), "CRLF paste with surrounding blanks");
         let at_cap = format!("{ED_SIG}{}", "\n".repeat(MAX_INPUT - ED_SIG.len()));
-        assert!(verify(&at_cap, NS, MSG).is_ok(), "exactly MAX_INPUT bytes is still allowed");
+        assert!(any(&at_cap, NS, MSG).is_ok(), "exactly MAX_INPUT bytes is still allowed");
         let raw = dearmor(ED_SIG).unwrap();
         let one_line = format!("{BEGIN}{}{END}", STANDARD.encode(&raw));
-        assert!(verify(&one_line, NS, MSG).is_ok(), "line breaks are optional");
+        assert!(any(&one_line, NS, MSG).is_ok(), "line breaks are optional");
 
         let body = ED_SIG.trim().strip_prefix(BEGIN).unwrap().strip_suffix(END).unwrap();
         for (name, bad) in [
@@ -897,7 +921,7 @@ mod tests {
             ("oversized", format!("{ED_SIG}{}", "\n".repeat(MAX_INPUT))),
             ("empty", String::new()),
         ] {
-            assert_eq!(verify(&bad, NS, MSG), Err(SshError::Malformed), "{name}");
+            assert_eq!(any(&bad, NS, MSG), Err(SshError::Malformed), "{name}");
         }
     }
 
@@ -919,7 +943,7 @@ mod tests {
                 for v in [u32::MAX, raw.len() as u32] {
                     let mut bad = raw.clone();
                     bad[o..o + 4].copy_from_slice(&v.to_be_bytes());
-                    assert_eq!(verify(&armor(&bad), NS, MSG), Err(SshError::Malformed), "length {v} at {o}");
+                    assert_eq!(any(&armor(&bad), NS, MSG), Err(SshError::Malformed), "length {v} at {o}");
                 }
             }
         }
