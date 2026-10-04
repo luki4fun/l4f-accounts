@@ -3,6 +3,13 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.8.0 (2026-10-04)
+
+Documentation. No code or migration changes.
+
+- README.md, docs/embedding.md: features, host duties, cookies, scopes, calls
+  without HTTP, what a SQLite store would need.
+
 ## v0.7.0 (2026-10-04)
 
 Public profiles. No new migrations (acct_profiles existed since 0009).
