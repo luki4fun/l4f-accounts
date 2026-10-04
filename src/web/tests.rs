@@ -358,3 +358,106 @@ async fn step_up_takes_the_password_and_rotates_the_cookie() {
     assert!(a.viewer(&[(header::COOKIE, cookie.parse().unwrap())].into_iter().collect()).await.unwrap().is_none(), "old cookie dead");
     drop_user(&a, u.id).await;
 }
+
+#[test]
+fn when_formats_utc() {
+    assert_eq!(when(0), "1970-01-01 00:00 UTC");
+    assert_eq!(when(1_791_129_600), "2026-10-04 16:00 UTC");
+    assert_eq!(when(951_825_600), "2000-02-29 12:00 UTC");
+    assert_eq!(when(-1), "1969-12-31 23:59 UTC");
+}
+
+#[tokio::test]
+async fn the_dashboard_needs_a_session() {
+    let (app, _) = app(nowhere(), cfg());
+    let r = send(&app, get("/account", None)).await;
+    assert_eq!((r.status(), location(&r)), (StatusCode::SEE_OTHER, "/account/login?next=%2Faccount"));
+}
+
+/// A signed-in browser: its cookie header and form token. `auth_at` decides
+/// whether it counts as a recent sign-in.
+async fn browser(a: &Accounts<T>, user: AccountId, auth_at: i64) -> (String, String, [u8; 32]) {
+    let ctx = crate::service::Ctx { ip: "203.0.113.99".parse().unwrap(), ua: "Test/1".into(), sec_fetch_site: String::new() };
+    let s = a.create_session(user, "password", true, auth_at, &ctx).await.unwrap();
+    (format!("__Host-acct={}", s.token), csrf::token(&a.keys, &s.info.token_hash), s.info.token_hash)
+}
+
+#[tokio::test]
+async fn dashboard_sessions_and_sign_out_everywhere() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (c1, t1, h1) = browser(&a, u.id, util::now()).await;
+    let (c2, _, h2) = browser(&a, u.id, util::now()).await;
+    let (c3, _, _) = browser(&a, u.id, util::now()).await;
+    let r = send(&app, get("/account", Some(&c1))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let page = text(r).await;
+    assert!(page.contains(&format!("@{}", u.username)) && page.contains("this browser") && page.contains("Test/1"));
+    assert_eq!(page.matches("/revoke\"").count(), 3);
+    assert!(page.contains(&hex::encode(h2)));
+
+    let r = send(&app, post(&format!("/account/sessions/{}/revoke", hex::encode(h2)), &format!("csrf={t1}"), Some(&c1))).await;
+    assert!(location(&r).starts_with("/account?ok=That+session"));
+    assert_eq!(send(&app, get("/account", Some(&c2))).await.status(), StatusCode::SEE_OTHER, "revoked");
+    let r = send(&app, post("/account/sessions/zz/revoke", &format!("csrf={t1}"), Some(&c1))).await;
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+    let r = send(&app, post("/account/logout-all", &format!("csrf={t1}"), Some(&c1))).await;
+    assert!(location(&r).starts_with("/account?ok=Signed+out+of+1+other+session."), "{}", location(&r));
+    assert_eq!(send(&app, get("/account", Some(&c3))).await.status(), StatusCode::SEE_OTHER);
+    assert_eq!(send(&app, get("/account", Some(&c1))).await.status(), StatusCode::OK, "this one stays");
+
+    let r = send(&app, post(&format!("/account/sessions/{}/revoke", hex::encode(h1)), &format!("csrf={t1}"), Some(&c1))).await;
+    assert!(location(&r).starts_with("/account/login?ok=Signed+out."), "revoking this browser signs it out");
+    assert_eq!(set_cookie(&r, "__Host-acct").as_deref(), Some("__Host-acct="));
+    drop_user(&a, u.id).await;
+}
+
+#[tokio::test]
+async fn display_name_is_cleaned() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let r = send(&app, post("/account/display-name", &format!("csrf={t}&display_name=+Dee+"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account?ok="));
+    let r = send(&app, post("/account/display-name", &format!("csrf={t}&display_name=a%E2%80%AEb"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account?err="), "bidi override refused");
+    let page = text(send(&app, get(location(&r), Some(&c))).await).await;
+    assert!(page.contains("text-direction") && page.contains("<h1>Dee</h1>"));
+    drop_user(&a, u.id).await;
+}
+
+#[tokio::test]
+async fn deleting_needs_a_recent_sign_in() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (stale, st, _) = browser(&a, u.id, util::now() - 3600).await;
+    let r = send(&app, get("/account/delete", Some(&stale))).await;
+    assert_eq!((r.status(), location(&r)), (StatusCode::SEE_OTHER, "/account/reauth?next=%2Faccount%2Fdelete"));
+    let r = send(&app, post("/account/delete", &format!("csrf={st}"), Some(&stale))).await;
+    assert_eq!(location(&r), "/account/reauth?next=%2Faccount%2Fdelete", "the post too");
+    assert!(a.store.user_by_id(u.id).await.unwrap().is_some());
+
+    let (fresh, ft, _) = browser(&a, u.id, util::now()).await;
+    assert_eq!(send(&app, get("/account/delete", Some(&fresh))).await.status(), StatusCode::OK);
+    let r = send(&app, post("/account/delete", &format!("csrf={ft}&delete_owned=1"), Some(&fresh))).await;
+    assert!(location(&r).starts_with("/account/login?ok=Your+account+is+deleted."));
+    assert_eq!(set_cookie(&r, "__Host-acct-dev").as_deref(), Some("__Host-acct-dev="));
+    assert!(a.store.user_by_id(u.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn export_is_a_json_attachment_without_secrets() {
+    let Some((app, a)) = shared(cfg()).await else { return };
+    let u = make_user(&a).await;
+    let (c, _, h) = browser(&a, u.id, util::now()).await;
+    let r = send(&app, get("/account/data", Some(&c))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[header::CONTENT_TYPE], "application/json");
+    assert_eq!(r.headers()[header::CONTENT_DISPOSITION], format!("attachment; filename=\"account-{}.json\"", u.username).as_str());
+    let body = text(r).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.is_object());
+    assert!(!body.contains("$argon2") && !body.contains(&hex::encode(h)), "no hash, no session id");
+    drop_user(&a, u.id).await;
+}

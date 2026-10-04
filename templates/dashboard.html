@@ -1,0 +1,74 @@
+<div class="wrap page">
+<div class="panel">
+  <div class="spread">
+    <h1>{{ user.display_name }}</h1>
+    <form method="post" action="{{ base }}/logout">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-sm btn-quiet" type="submit">Sign out</button>
+    </form>
+  </div>
+  <p class="muted">@{{ user.username }}{% for r in roles %} <span class="tag">{% if let Some(b) = r.badge %}{{ b }}{% else %}{{ r.name }}{% endif %}</span>{% endfor %}</p>
+  {% include "_flash.html" %}
+
+  {% if !links.is_empty() || can_users || can_roles %}
+  <h2 class="mt-3">Manage</h2>
+  <div class="btn-row">
+    {% for (label, href) in links %}<a class="btn btn-sm btn-quiet" href="{{ href }}">{{ label }}</a>{% endfor %}
+    {% if can_users %}<a class="btn btn-sm btn-quiet" href="{{ base }}/admin/users">Users</a>{% endif %}
+    {% if can_roles %}<a class="btn btn-sm btn-quiet" href="{{ base }}/admin/roles">Roles</a>{% endif %}
+  </div>
+  {% endif %}
+
+  <h2 class="mt-3">Profile</h2>
+  <form class="narrow mt-2" method="post" action="{{ base }}/display-name">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="field">
+      <label for="display_name">Display name</label>
+      <input type="text" id="display_name" name="display_name" value="{{ user.display_name }}" maxlength="64" required autocomplete="nickname">
+    </div>
+    <button class="btn btn-sm" type="submit">Save</button>
+  </form>
+
+  <h2 class="mt-3">Security</h2>
+  <dl class="kv mt-2">
+    <dt>Password</dt><dd>{% if user.has_password %}Set{% else %}None{% endif %}</dd>
+    <dt>Two-factor</dt><dd>{% if user.totp_enabled %}On{% else %}Not set up{% endif %}</dd>
+    <dt>Email</dt><dd>{% if let Some(e) = user.email %}{{ e }}{% else %}{% if let Some(p) = user.email_pending %}{{ p }} <span class="tag warn">not confirmed</span>{% else %}None{% endif %}{% endif %}</dd>
+  </dl>
+
+  <h2 class="mt-3">Sessions</h2>
+  <div class="table-wrap mt-2">
+    <table>
+      <thead><tr><th>Signed in</th><th>Last seen</th><th>From</th><th>Browser</th><th></th></tr></thead>
+      <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td class="nowrap">{{ s.created }}{% if s.current %} <span class="tag">this browser</span>{% endif %}{% if s.pending %} <span class="tag warn">waiting for second factor</span>{% endif %}</td>
+        <td class="nowrap">{{ s.seen }}</td>
+        <td class="mono small">{% if s.ip.is_empty() %}&ndash;{% else %}{{ s.ip }}{% endif %}</td>
+        <td class="small anywhere">{{ s.ua }}</td>
+        <td>
+          <form method="post" action="{{ base }}/sessions/{{ s.id }}/revoke">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <button class="btn btn-sm btn-quiet" type="submit">Sign out</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if sessions.len() > 1 %}
+  <form class="mt-2" method="post" action="{{ base }}/logout-all">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button class="btn btn-sm btn-quiet" type="submit">Sign out everywhere else</button>
+  </form>
+  {% endif %}
+
+  <h2 class="mt-3">Your data</h2>
+  <div class="btn-row">
+    <a class="btn btn-sm btn-quiet" href="{{ base }}/data">Download everything (JSON)</a>
+    <a class="btn btn-sm btn-danger" href="{{ base }}/delete">Delete account</a>
+  </div>
+</div>
+</div>

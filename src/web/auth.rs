@@ -269,3 +269,12 @@ pub(super) async fn reauth<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h:
         }
     }
 }
+
+/// For a handler that needs a recent sign-in: `None` when the session has one,
+/// else the redirect to the step-up page, which comes back to `back`.
+pub(super) fn need_fresh<H: WebHost>(a: &Accounts<H>, me: &Authed, back: &str) -> Option<Response> {
+    if a.fresh(&me.session, util::now()) {
+        return None;
+    }
+    Some(see_other(&format!("{BASE}/reauth?next={}", util::urlencode(back)), &[]))
+}

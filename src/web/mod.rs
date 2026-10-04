@@ -7,6 +7,7 @@
 //! - insert [`ClientIp`] into every request after its own proxy check;
 //! - serve `/static/js/pow.js` (the ALTCHA solver the sign-up form loads).
 
+mod account;
 mod auth;
 mod csrf;
 mod extract;
@@ -43,6 +44,13 @@ pub trait WebHost: Host {
     /// Wraps a body fragment (rendered and escaped by the crate) in the site's
     /// page. Account pages are noindex and carry no canonical link.
     fn page(&self, headers: &HeaderMap, title: &str, body: String) -> Response;
+
+    /// The host's own pages a signed-in account can use, as (label, href),
+    /// listed on the dashboard. `scopes` are the session's.
+    fn dashboard_links(&self, scopes: &[String]) -> Vec<(String, String)> {
+        let _ = scopes;
+        Vec::new()
+    }
 }
 
 /// The client address as the host's proxy check established it, inserted as
@@ -68,6 +76,11 @@ impl<H: WebHost> AccountsState for Arc<Accounts<H>> {
 /// The `/account` pages, for any host state `S`.
 pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>) -> Router<S> {
     Router::new()
+        .route("/", get(account::dashboard::<H>))
+        .route("/sessions/{id}/revoke", post(account::revoke::<H>))
+        .route("/display-name", post(account::display_name::<H>))
+        .route("/data", get(account::export::<H>))
+        .route("/delete", get(account::delete_form::<H>).post(account::delete::<H>))
         .route("/login", get(auth::login_form::<H>).post(auth::login::<H>))
         .route("/logout", post(auth::logout::<H>))
         .route("/logout-all", post(auth::logout_all::<H>))
@@ -124,6 +137,10 @@ fn set_device<H: Host>(a: &Accounts<H>, cfg: &Config, user: AccountId) -> String
     let hex = user.hex();
     let v = format!("{hex}.{}", a.keys.sign("device", hex.as_bytes()));
     util::set_cookie(&device_name(cfg), &v, DEVICE_DAYS * DAY, cfg.cookie_secure, true)
+}
+
+fn clear_device(cfg: &Config) -> String {
+    util::set_cookie(&device_name(cfg), "", 0, cfg.cookie_secure, true)
 }
 
 fn known_device<H: Host>(a: &Accounts<H>, cfg: &Config, h: &HeaderMap) -> Option<AccountId> {
@@ -210,4 +227,20 @@ fn refused<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, e: &Error) -> Response {
         r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
     }
     r
+}
+
+/// `2026-10-04 17:30 UTC`, for timestamps shown to people. No date crate for one
+/// format: days to civil date after Howard Hinnant's `civil_from_days`.
+pub(crate) fn when(ts: i64) -> String {
+    let (days, secs) = (ts.div_euclid(86_400), ts.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", secs / 3600, secs % 3600 / 60)
 }

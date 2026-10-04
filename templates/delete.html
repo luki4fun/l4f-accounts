@@ -1,0 +1,14 @@
+<div class="wrap page">
+<div class="panel narrow">
+  <h1>Delete your account</h1>
+  <p class="mt-2">This deletes <b>@{{ username }}</b>, its sessions, roles and history, right away. It cannot be undone.</p>
+  <form class="mt-3" method="post" action="{{ base }}/delete" data-confirm="Delete @{{ username }} for good?">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <p class="chk"><input type="checkbox" id="delete_owned" name="delete_owned" value="1"> <label for="delete_owned">Also delete what I own on the site, such as my short links. Otherwise they stay, without my name.</label></p>
+    <div class="btn-row">
+      <button class="btn btn-danger" type="submit">Delete my account</button>
+      <a class="btn btn-quiet" href="{{ base }}">Cancel</a>
+    </div>
+  </form>
+</div>
+</div>
