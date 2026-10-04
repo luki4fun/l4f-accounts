@@ -34,12 +34,12 @@ pub async fn run(pool: &MySqlPool) -> Result<(), MigrateError> {
 }
 
 /// The boot lock: migrations, and other steps two processes starting at once
-/// must not interleave (the bootstrap admin). On a connection out of the pool
+/// must not interleave (the bootstrap admin, a host's own tables). On a connection out of the pool
 /// for good, so the lock dies with it whatever happens. Waits as long as the
 /// holder needs: a long migration on another instance is not an error. Named
 /// per database: GET_LOCK names are server-wide, and a test database on the
 /// same server must not wait for production's boot.
-pub(crate) async fn lock(pool: &MySqlPool) -> sqlx::Result<MySqlConnection> {
+pub async fn lock(pool: &MySqlPool) -> sqlx::Result<MySqlConnection> {
     let mut conn = pool.acquire().await?.detach();
     loop {
         let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(CONCAT(DATABASE(), '.l4f_boot'), 30)")
@@ -52,7 +52,7 @@ pub(crate) async fn lock(pool: &MySqlPool) -> sqlx::Result<MySqlConnection> {
     }
 }
 
-pub(crate) async fn unlock(mut conn: MySqlConnection) {
+pub async fn unlock(mut conn: MySqlConnection) {
     let _ = sqlx::query("SELECT RELEASE_LOCK(CONCAT(DATABASE(), '.l4f_boot'))").execute(&mut conn).await;
     let _ = conn.close().await;
 }
