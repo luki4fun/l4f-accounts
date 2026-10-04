@@ -49,7 +49,13 @@ impl WebHost for T {
 }
 
 fn cfg() -> Config {
-    let mut c = Config { login_per_15min: 100, login_per_15min_global: 1000, login_per_user_15min: 100, ..Config::default() };
+    let mut c = Config {
+        login_per_15min: 100,
+        login_per_15min_global: 1000,
+        login_per_user_15min: 100,
+        require_2fa_for_privileged: false,
+        ..Config::default()
+    };
     c.signup.min_form_seconds = 0;
     c.signup.pow_maxnumber = 1000;
     c.signup.max_accounts_per_ip_day = 1000;

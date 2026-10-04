@@ -7,7 +7,7 @@
 
 use sqlx::{AssertSqlSafe, Connection, MySql, MySqlConnection, MySqlPool, Row, Transaction, mysql::MySqlRow};
 
-use crate::model::{AccountId, AuditEntry, NewUser, Role, SessionInfo, User, UserStatus};
+use crate::model::{AccountId, AuditEntry, Credential, NewUser, Role, SessionInfo, User, UserStatus};
 use crate::util;
 
 #[derive(Clone)]
@@ -47,7 +47,10 @@ impl From<sqlx::Error> for WriteError {
 pub const TOUCH_SECS: i64 = 600;
 
 const USER_COLS: &str = "id, username, display_name, email, email_pending, password_hash IS NOT NULL, \
-     totp_enc IS NOT NULL, status, sync_enabled, created_at";
+     totp_enc IS NOT NULL, status, sync_enabled, created_at, \
+     EXISTS (SELECT 1 FROM acct_credentials c WHERE c.user_id = acct_users.id AND c.kind = 'passkey')";
+
+const CRED_COLS: &str = "kind, ext_id, user_id, public_key, alg, sign_count, flags, name, created_at, last_used_at";
 
 const SESSION_COLS: &str = "token_hash, user_id, created_at, seen_at, expires_at, auth_at, mfa_ok, method, ip, ua";
 /// Signed-in sessions kept per account; the oldest go first.
@@ -116,6 +119,22 @@ fn user(r: &MySqlRow) -> sqlx::Result<User> {
         status: UserStatus::from_db(r.try_get(7)?),
         sync_enabled: r.try_get(8)?,
         created_at: r.try_get(9)?,
+        has_passkey: r.try_get(10)?,
+    })
+}
+
+fn credential(r: &MySqlRow) -> sqlx::Result<Credential> {
+    Ok(Credential {
+        kind: r.try_get(0)?,
+        ext_id: r.try_get(1)?,
+        user_id: id(r.try_get(2)?)?,
+        public_key: r.try_get(3)?,
+        alg: r.try_get::<i32, _>(4)?.into(),
+        sign_count: r.try_get(5)?,
+        flags: r.try_get::<i32, _>(6)?.into(),
+        name: r.try_get(7)?,
+        created_at: r.try_get(8)?,
+        last_used_at: r.try_get(9)?,
     })
 }
 
@@ -499,6 +518,32 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
+    /// The second factor is done: a new token, `mfa_ok`, the full lifetime.
+    /// Only a pending session completes, and only once.
+    pub async fn complete_session(&self, old: &[u8; 32], new: &[u8; 32], auth_at: i64, expires_at: i64) -> sqlx::Result<bool> {
+        let r = sqlx::query(
+            "UPDATE acct_sessions SET token_hash = ?, mfa_ok = 1, auth_at = ?, expires_at = ? WHERE token_hash = ? AND mfa_ok = 0",
+        )
+        .bind(&new[..])
+        .bind(auth_at)
+        .bind(expires_at)
+        .bind(&old[..])
+        .execute(&self.0)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// Step-up: a new token and a fresh `auth_at`, on a complete session only.
+    pub async fn refresh_session(&self, old: &[u8; 32], new: &[u8; 32], auth_at: i64) -> sqlx::Result<bool> {
+        let r = sqlx::query("UPDATE acct_sessions SET token_hash = ?, auth_at = ? WHERE token_hash = ? AND mfa_ok = 1")
+            .bind(&new[..])
+            .bind(auth_at)
+            .bind(&old[..])
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
     /// Scoped to the owner: the revoke button posts a hash from a URL, and a
     /// hash belonging to someone else must delete nothing.
     pub async fn delete_session(&self, hash: &[u8; 32], user: AccountId) -> sqlx::Result<bool> {
@@ -556,6 +601,167 @@ impl Store {
             .await?
             .rows_affected();
         Ok(expired + idle)
+    }
+
+    // ------------------------------------------------------- second factors
+
+    /// The sealed TOTP secret and the last step a code was accepted for.
+    pub async fn totp_of(&self, user: AccountId) -> sqlx::Result<Option<(Vec<u8>, i64)>> {
+        let row: Option<(Option<Vec<u8>>, i64)> =
+            sqlx::query_as("SELECT totp_enc, totp_last_step FROM acct_users WHERE id = ?").bind(&user.0[..]).fetch_optional(&self.0).await?;
+        Ok(row.and_then(|(enc, step)| enc.map(|e| (e, step))))
+    }
+
+    /// Turns codes on (only while off, so two setups cannot race) or off.
+    pub async fn set_totp(&self, user: AccountId, sealed: Option<&[u8]>, last_step: i64) -> sqlx::Result<bool> {
+        let q = match sealed {
+            Some(s) => sqlx::query("UPDATE acct_users SET totp_enc = ?, totp_last_step = ? WHERE id = ? AND totp_enc IS NULL").bind(s),
+            None => sqlx::query("UPDATE acct_users SET totp_enc = NULL, totp_last_step = ? WHERE id = ? AND totp_enc IS NOT NULL"),
+        };
+        Ok(q.bind(last_step).bind(&user.0[..]).execute(&self.0).await?.rows_affected() == 1)
+    }
+
+    /// Accepts a code's step once: false when this step or a later one was
+    /// already used, so a code read over a shoulder is worth nothing after.
+    pub async fn advance_totp(&self, user: AccountId, step: i64) -> sqlx::Result<bool> {
+        let r = sqlx::query("UPDATE acct_users SET totp_last_step = ? WHERE id = ? AND totp_enc IS NOT NULL AND totp_last_step < ?")
+            .bind(step)
+            .bind(&user.0[..])
+            .bind(step)
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// The same secret under the current key, unless it changed meanwhile.
+    pub async fn reseal_totp(&self, user: AccountId, old: &[u8], new: &[u8]) -> sqlx::Result<bool> {
+        let r = sqlx::query("UPDATE acct_users SET totp_enc = ? WHERE id = ? AND totp_enc = ?")
+            .bind(new)
+            .bind(&user.0[..])
+            .bind(old)
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// A fresh set of recovery code hashes in place of the old one. Under READ
+    /// COMMITTED (see `BEGIN_GUARDED`): the DELETE's gap locks under REPEATABLE
+    /// READ deadlock with another account's codes going in next to them.
+    pub async fn replace_recovery(&self, user: AccountId, hashes: &[[u8; 32]]) -> sqlx::Result<()> {
+        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
+        sqlx::query("DELETE FROM acct_recovery WHERE user_id = ?").bind(&user.0[..]).execute(&mut *tx).await?;
+        for h in hashes {
+            sqlx::query("INSERT INTO acct_recovery (user_id, code_hash) VALUES (?, ?)")
+                .bind(&user.0[..])
+                .bind(&h[..])
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Spends one code: false when it is unknown or already spent.
+    pub async fn use_recovery(&self, user: AccountId, hash: &[u8; 32], now: i64) -> sqlx::Result<bool> {
+        let r = sqlx::query("UPDATE acct_recovery SET used_at = ? WHERE user_id = ? AND code_hash = ? AND used_at IS NULL")
+            .bind(now)
+            .bind(&user.0[..])
+            .bind(&hash[..])
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn recovery_left(&self, user: AccountId) -> sqlx::Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM acct_recovery WHERE user_id = ? AND used_at IS NULL")
+            .bind(&user.0[..])
+            .fetch_one(&self.0)
+            .await
+    }
+
+    pub async fn delete_recovery(&self, user: AccountId) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM acct_recovery WHERE user_id = ?").bind(&user.0[..]).execute(&self.0).await.map(|_| ())
+    }
+
+    // ---------------------------------------------------------- credentials
+
+    /// A plain INSERT: false when `(kind, ext_id)` already exists, so a key can
+    /// never be moved to a second account by registering it again.
+    pub async fn insert_credential(&self, c: &Credential) -> sqlx::Result<bool> {
+        let r = sqlx::query(
+            "INSERT INTO acct_credentials (kind, ext_id, user_id, public_key, alg, sign_count, flags, name, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&c.kind)
+        .bind(&c.ext_id)
+        .bind(&c.user_id.0[..])
+        .bind(&c.public_key)
+        .bind(c.alg)
+        .bind(c.sign_count)
+        .bind(c.flags)
+        .bind(clip(&c.name, 64))
+        .bind(c.created_at)
+        .execute(&self.0)
+        .await;
+        match r {
+            Ok(_) => Ok(true),
+            Err(e) if is_dup(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn credential(&self, kind: &str, ext_id: &[u8]) -> sqlx::Result<Option<Credential>> {
+        sqlx::query(AssertSqlSafe(format!("SELECT {CRED_COLS} FROM acct_credentials WHERE kind = ? AND ext_id = ?")))
+            .bind(kind)
+            .bind(ext_id)
+            .fetch_optional(&self.0)
+            .await?
+            .as_ref()
+            .map(credential)
+            .transpose()
+    }
+
+    /// Oldest first.
+    pub async fn credentials_of(&self, user: AccountId, kind: &str) -> sqlx::Result<Vec<Credential>> {
+        sqlx::query(AssertSqlSafe(format!(
+            "SELECT {CRED_COLS} FROM acct_credentials WHERE user_id = ? AND kind = ? ORDER BY created_at, ext_id"
+        )))
+        .bind(&user.0[..])
+        .bind(kind)
+        .fetch_all(&self.0)
+        .await?
+        .iter()
+        .map(credential)
+        .collect()
+    }
+
+    /// Scoped to the owner, like `delete_session`.
+    pub async fn delete_credential(&self, user: AccountId, kind: &str, ext_id: &[u8]) -> sqlx::Result<bool> {
+        let r = sqlx::query("DELETE FROM acct_credentials WHERE user_id = ? AND kind = ? AND ext_id = ?")
+            .bind(&user.0[..])
+            .bind(kind)
+            .bind(ext_id)
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// Records a use. The counter only moves forward (authenticators that keep
+    /// it at 0 aside): false means another use raced this one or the
+    /// authenticator went backwards, and the caller refuses.
+    pub async fn used_credential(&self, kind: &str, ext_id: &[u8], sign_count: i64, now: i64) -> sqlx::Result<bool> {
+        let r = sqlx::query(
+            "UPDATE acct_credentials SET sign_count = ?, last_used_at = ?
+              WHERE kind = ? AND ext_id = ? AND (? = 0 OR sign_count < ?)",
+        )
+        .bind(sign_count)
+        .bind(now)
+        .bind(kind)
+        .bind(ext_id)
+        .bind(sign_count)
+        .bind(sign_count)
+        .execute(&self.0)
+        .await?;
+        Ok(r.rows_affected() == 1)
     }
 
     // ------------------------------------------------------------------ roles
@@ -790,7 +996,7 @@ impl Store {
     /// secrets and nothing that works as a credential: no password hash, TOTP
     /// secret, session hashes, recovery hashes or public keys. Not in it: audit
     /// rows where this account acted on another one, which sit in that
-    /// account's log. TODO: recovery code use times (phase 2), blobs (phase 6)
+    /// account's log. TODO: blobs (phase 6)
     /// and the profile (phase 7) join this when something writes them. `None`
     /// when the account does not exist.
     pub async fn export_user(&self, id: AccountId) -> sqlx::Result<Option<serde_json::Value>> {
@@ -819,6 +1025,12 @@ impl Store {
             }))
         })
         .collect::<sqlx::Result<Vec<_>>>()?;
+        // When each recovery code was used; never the hashes.
+        let recovery: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT used_at FROM acct_recovery WHERE user_id = ? ORDER BY used_at IS NULL, used_at")
+                .bind(&id.0[..])
+                .fetch_all(&self.0)
+                .await?;
         let mut user = serde_json::json!(user);
         user["email_verified_at"] = serde_json::json!(verified_at);
         Ok(Some(serde_json::json!({
@@ -826,6 +1038,7 @@ impl Store {
             "roles": self.user_roles(id).await?,
             "sessions": self.sessions_of(id).await?,
             "credentials": credentials,
+            "recovery_codes": recovery.iter().map(|u| serde_json::json!({ "used_at": u })).collect::<Vec<_>>(),
             "audit": self.audit_of(id, EXPORT_AUDIT_ROWS).await?,
         })))
     }

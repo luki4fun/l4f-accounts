@@ -56,6 +56,8 @@ fn cfg() -> Config {
         login_per_15min: 100,
         login_per_15min_global: 1000,
         login_per_user_15min: 100,
+        // Tests about the 2FA rule turn it on; the rest test one thing at a time.
+        require_2fa_for_privileged: false,
         ..Config::default()
     }
 }
@@ -213,9 +215,9 @@ fn step_up_is_send(a: &Accounts<Stub>, c: &Ctx, u: &User, s: &SessionInfo) {
 }
 
 #[test]
-fn defaults_keep_signup_closed_and_the_2fa_rule_off_until_phase_2() {
+fn defaults_keep_signup_closed_and_privileged_scopes_behind_2fa() {
     let c = Config::default();
-    assert!(c.enabled && !c.registration_open && !c.require_2fa_for_privileged);
+    assert!(c.enabled && !c.registration_open && c.require_2fa_for_privileged);
     assert_eq!((c.min_password_len, c.session_idle_days, c.session_max_days, c.step_up_minutes), (10, 7, 30, 15));
     assert_eq!((c.login_per_15min, c.login_per_15min_global, c.login_per_user_15min), (10, 50, 10));
     assert_eq!(c.audit_retention_days, 180);
@@ -290,8 +292,10 @@ async fn register_then_sign_in_rotate_and_sign_out() {
     assert!(a.session_from_token(&s3.token, now).await.unwrap().is_none());
     a.logout("not a token").await.unwrap();
     assert!(a.session_from_token(&s1.token, now).await.unwrap().is_some(), "other sessions stay");
-    assert!(a.session_from_token(&s1.token, now + 7 * DAY + 1).await.unwrap().is_none(), "idle for a week");
-    assert!(a.session_from_token(&s1.token, now + 30 * DAY + 1).await.unwrap().is_none(), "past the absolute limit");
+    // From the session's own times: `now` was taken before it existed, and
+    // on a slow run the two are seconds apart.
+    assert!(a.session_from_token(&s1.token, s1.info.seen_at + 7 * DAY).await.unwrap().is_none(), "idle for a week");
+    assert!(a.session_from_token(&s1.token, s1.info.expires_at).await.unwrap().is_none(), "past the absolute limit");
     assert!(a.session_from_token("garbage", now).await.unwrap().is_none());
 
     assert_eq!(a.logout_all(&c, user.id, None).await.unwrap(), 1);
@@ -833,4 +837,193 @@ async fn display_name_sessions_and_revoke() {
     let ev = audit_events(&a, u.id).await;
     assert!(ev.contains(&"session_revoke".to_string()) && ev.contains(&"display_name".to_string()));
     cleanup(&a, &[u.id, other.id], &[]).await;
+}
+
+// ---- second factors
+
+fn totp_secret(setup: &TotpSetup) -> Vec<u8> {
+    crate::totp::base32_decode(&setup.secret).unwrap()
+}
+
+fn step_now() -> i64 {
+    util::now() / 30
+}
+
+fn pending_of(r: Result<LoginStep, Error>) -> NewSession {
+    match r {
+        Ok(LoginStep::NeedMfa(s)) => s,
+        Ok(LoginStep::Done(_)) => panic!("expected the second step, got a full sign-in"),
+        Err(e) => panic!("expected the second step, got {e:?}"),
+    }
+}
+
+#[tokio::test]
+async fn totp_turns_on_gates_sign_in_and_refuses_replays() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.70");
+    let u = make_user(&a, &[]).await;
+    let setup = a.totp_setup(&u);
+    assert!(setup.uri.starts_with("otpauth://totp/") && setup.uri.contains(&u.username));
+    let secret = totp_secret(&setup);
+    assert!(matches!(a.totp_enable(&c, &u, &setup.sealed, "000000").await, Err(Error::Invalid(_))), "a wrong code enables nothing");
+    let other = make_user(&a, &[]).await;
+    let code = format!("{:06}", crate::totp::code_at(&secret, step_now()));
+    assert!(matches!(a.totp_enable(&c, &other, &setup.sealed, &code).await, Err(Error::Invalid(_))), "sealed to its account");
+    let codes = a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    assert_eq!(codes.len(), 10, "recovery codes come with it");
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(u.totp_enabled && has_second_factor(&u));
+    assert!(matches!(a.totp_enable(&c, &u, &setup.sealed, &code).await, Err(Error::Invalid(_))), "already on");
+
+    // A password alone now opens a pending session that grants nothing.
+    let pending = pending_of(a.login_password(&c, &u.username, PW, None).await);
+    let (_, info, scopes) = a.session_from_token(&pending.token, util::now()).await.unwrap().unwrap();
+    assert!(!info.mfa_ok && scopes.is_empty() && info.expires_at <= util::now() + 600);
+    assert!(matches!(a.mfa_totp(&c, &u, &pending.info, &code).await, Err(Error::Invalid(_))), "the setup's code was spent");
+    let next = format!("{:06}", crate::totp::code_at(&secret, step_now() + 1));
+    let done = a.mfa_totp(&c, &u, &pending.info, &next).await.unwrap();
+    assert!(done.info.mfa_ok && done.info.auth_at > 0 && done.info.expires_at > util::now() + 29 * DAY);
+    assert!(a.session_from_token(&pending.token, util::now()).await.unwrap().is_none(), "the pending token is dead");
+    assert!(matches!(a.mfa_totp(&c, &u, &done.info, &next).await, Err(Error::Invalid(_)) | Err(Error::Forbidden)));
+
+    // Step-up takes a code, not the password. Its own limiter: this account
+    // spent its five tries above, which every code counts against.
+    let Some(b) = shared(cfg()).await else { return };
+    assert!(matches!(b.step_up(&c, &u, &done.info, PW).await, Err(Error::Invalid(_))));
+    sqlx::query("UPDATE acct_users SET totp_last_step = 0 WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    let up = b.step_up_totp(&c, &u, &done.info, &code).await.unwrap();
+    assert!(b.fresh(&up.info, util::now()));
+    assert!(matches!(a.step_up_totp(&c, &u, &up.info, &code).await, Err(Error::RateLimited)), "5 codes per 15 minutes");
+
+    b.totp_disable(&c, &u).await.unwrap();
+    assert_eq!(b.recovery_left(u.id).await.unwrap(), 0, "no second factor left, no recovery codes");
+    signed_in(b.login_password(&c, &u.username, PW, None).await);
+    cleanup(&a, &[u.id, other.id], &[]).await;
+}
+
+#[tokio::test]
+async fn recovery_codes_work_once_and_wrong_codes_are_capped() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.71");
+    let u = make_user(&a, &[]).await;
+    let setup = a.totp_setup(&u);
+    let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
+    let codes = a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let pending = pending_of(a.login_password(&c, &u.username, PW, None).await);
+    let typed = codes[0].to_uppercase().replace('-', " ");
+    let (s, left) = a.mfa_recovery(&c, &u, &pending.info, &typed).await.unwrap();
+    assert_eq!(left, 9);
+    assert!(s.info.mfa_ok && s.info.auth_at == 0, "a recovery code is never a recent sign-in");
+    let again = pending_of(a.login_password(&c, &u.username, PW, None).await);
+    assert!(matches!(a.mfa_recovery(&c, &u, &again.info, &codes[0]).await, Err(Error::Invalid(_))), "spent");
+    let fresh_codes = a.recovery_regenerate(&c, &u).await.unwrap();
+    assert!(matches!(a.mfa_recovery(&c, &u, &again.info, &codes[1]).await, Err(Error::Invalid(_))), "the old set is gone");
+    for _ in 0..2 {
+        let _ = a.mfa_totp(&c, &u, &again.info, "000000").await;
+    }
+    assert!(matches!(a.mfa_recovery(&c, &u, &again.info, &fresh_codes[0]).await, Err(Error::RateLimited)), "5 tries per 15 minutes");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+fn pk_cfg() -> Config {
+    Config { base_url: "https://l4f.cc".into(), ..cfg() }
+}
+
+const ORIGIN: &str = "https://l4f.cc";
+const NONCE: &[u8] = b"browser-nonce-0123456789";
+
+async fn add_passkey(a: &Accounts<Stub>, c: &Ctx, u: &User) -> crate::testkit::Authenticator {
+    let auth = crate::testkit::Authenticator::new();
+    let (opts, token) = a.passkey_options(PasskeyFor::Add, Some(u), NONCE).await.unwrap();
+    assert_eq!(opts["rp"]["id"], "l4f.cc");
+    let json = auth.create(&crate::challenge::challenge_bytes(&token), ORIGIN, "l4f.cc");
+    a.passkey_add(c, u, &token, NONCE, &json, "Laptop").await.unwrap();
+    assert!(matches!(a.passkey_add(c, u, &token, NONCE, &json, "Laptop").await, Err(Error::Invalid(_))), "a token works once");
+    auth
+}
+
+#[tokio::test]
+async fn a_passkey_signs_in_alone_with_user_verification() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.72");
+    let u = make_user(&a, &[]).await;
+    let mut auth = add_passkey(&a, &c, &u).await;
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(u.has_passkey && has_second_factor(&u));
+    let (opts, _) = a.passkey_options(PasskeyFor::Add, Some(&u), NONCE).await.unwrap();
+    assert_eq!(opts["excludeCredentials"][0]["id"], util::b64u(&auth.id), "no second registration of the same key");
+
+    let (opts, token) = a.passkey_options(PasskeyFor::Login, None, NONCE).await.unwrap();
+    assert_eq!(opts["userVerification"], "required");
+    let ch = crate::challenge::challenge_bytes(&token);
+    let no_uv = auth.get(&ch, ORIGIN, "l4f.cc", Some(&u.id.0), false);
+    assert!(matches!(a.passkey_login(&c, &token, NONCE, &no_uv).await, Err(Error::Invalid(_))), "alone, it must verify the user");
+    let (_, token) = a.passkey_options(PasskeyFor::Login, None, NONCE).await.unwrap();
+    let ch = crate::challenge::challenge_bytes(&token);
+    let json = auth.get(&ch, ORIGIN, "l4f.cc", Some(&u.id.0), true);
+    assert!(matches!(a.passkey_login(&c, &token, b"another-browser-nonce", &json).await, Err(Error::Invalid(_))), "bound to the browser");
+    let s = a.passkey_login(&c, &token, NONCE, &json).await.unwrap();
+    assert!(s.info.mfa_ok && s.info.method == "passkey" && a.fresh(&s.info, util::now()));
+    assert!(matches!(a.passkey_login(&c, &token, NONCE, &json).await, Err(Error::Invalid(_))), "a replay is refused");
+    let (_, token) = a.passkey_options(PasskeyFor::Login, None, NONCE).await.unwrap();
+    let wrong = auth.get(&crate::challenge::challenge_bytes(&token), ORIGIN, "l4f.cc", Some(&[9; 16]), true);
+    assert!(matches!(a.passkey_login(&c, &token, NONCE, &wrong).await, Err(Error::Invalid(_))), "the handle must be the owner");
+    let (_, token) = a.passkey_options(PasskeyFor::Login, None, NONCE).await.unwrap();
+    let evil = auth.get(&crate::challenge::challenge_bytes(&token), "https://evil.example", "l4f.cc", Some(&u.id.0), true);
+    assert!(matches!(a.passkey_login(&c, &token, NONCE, &evil).await, Err(Error::Invalid(_))), "another origin");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+#[tokio::test]
+async fn a_passkey_is_a_second_factor_and_a_step_up() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.73");
+    let u = make_user(&a, &[]).await;
+    let mut auth = add_passkey(&a, &c, &u).await;
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let pending = pending_of(a.login_password(&c, &u.username, PW, None).await);
+    let (opts, token) = a.passkey_options(PasskeyFor::Mfa, Some(&u), NONCE).await.unwrap();
+    assert_eq!(opts["allowCredentials"][0]["id"], util::b64u(&auth.id));
+    let json = auth.get(&crate::challenge::challenge_bytes(&token), ORIGIN, "l4f.cc", None, false);
+    let other = make_user(&a, &[]).await;
+    assert!(matches!(a.passkey_mfa(&c, &other, &pending.info, &token, NONCE, &json).await, Err(Error::Invalid(_))), "bound to its account");
+    let s = a.passkey_mfa(&c, &u, &pending.info, &token, NONCE, &json).await.unwrap();
+    assert!(s.info.mfa_ok && a.fresh(&s.info, util::now()));
+
+    sqlx::query("UPDATE acct_sessions SET auth_at = 1 WHERE token_hash = ?").bind(&s.info.token_hash[..]).execute(&a.store.0).await.unwrap();
+    let (_, info, _) = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap();
+    let (_, token) = a.passkey_options(PasskeyFor::StepUp, Some(&u), NONCE).await.unwrap();
+    let ch = crate::challenge::challenge_bytes(&token);
+    assert!(a.passkey_step_up(&c, &u, &info, &token, NONCE, &auth.get(&ch, ORIGIN, "l4f.cc", None, false)).await.is_err(), "step-up needs UV");
+    let (_, token) = a.passkey_options(PasskeyFor::StepUp, Some(&u), NONCE).await.unwrap();
+    let ch = crate::challenge::challenge_bytes(&token);
+    let up = a.passkey_step_up(&c, &u, &info, &token, NONCE, &auth.get(&ch, ORIGIN, "l4f.cc", None, true)).await.unwrap();
+    assert!(a.fresh(&up.info, util::now()));
+
+    // A counter that goes backwards means a cloned key.
+    auth.count = 0;
+    let (_, token) = a.passkey_options(PasskeyFor::Login, None, NONCE).await.unwrap();
+    let json = auth.get(&crate::challenge::challenge_bytes(&token), ORIGIN, "l4f.cc", Some(&u.id.0), true);
+    assert!(a.passkey_login(&c, &token, NONCE, &json).await.is_err());
+    cleanup(&a, &[u.id, other.id], &[]).await;
+}
+
+#[tokio::test]
+async fn removing_passkeys_keeps_a_way_in() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.74");
+    let u = make_user(&a, &[]).await;
+    let auth = add_passkey(&a, &c, &u).await;
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let codes = a.recovery_regenerate(&c, &u).await.unwrap();
+    assert_eq!(codes.len(), 10);
+    let mut nopw = u.clone();
+    nopw.has_password = false;
+    assert!(matches!(a.passkey_remove(&c, &nopw, &auth.id).await, Err(Error::Invalid(_))), "the only way in stays");
+    assert!(matches!(a.passkey_remove(&c, &u, &[1, 2, 3]).await, Err(Error::NotFound)));
+    a.passkey_remove(&c, &u, &auth.id).await.unwrap();
+    assert!(!a.store.user_by_id(u.id).await.unwrap().unwrap().has_passkey);
+    assert_eq!(a.recovery_left(u.id).await.unwrap(), 0, "recovery codes went with the last second factor");
+    cleanup(&a, &[u.id], &[]).await;
 }

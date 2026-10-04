@@ -1,10 +1,10 @@
 //! What a signed-in person does to their own account: confirm their password
 //! for step-up, rename themselves, see and end their sessions.
 
-use super::auth::{WINDOW, new_token};
+use super::auth::WINDOW;
 use super::{Accounts, Ctx, DAY, Error, Host, NewSession, has_second_factor};
 use crate::model::{AccountId, SessionInfo, User};
-use crate::{password, scope, util};
+use crate::{password, scope};
 
 impl<H: Host> Accounts<H> {
     /// The signed-in account's password, again. Shares the per-account sign-in
@@ -56,19 +56,7 @@ impl<H: Host> Accounts<H> {
             return Err(Error::Invalid("Confirm with your second factor instead."));
         }
         self.confirm_password(ctx, user, password).await?;
-        let now = util::now();
-        let (token, new) = new_token();
-        // Rotate first: if the second write fails, the old cookie is already
-        // dead, which signs the person out rather than leaving it fresh.
-        if !self.store.rotate_session(&session.token_hash, &new).await?
-            || !self.store.set_session_mfa(&new, true, now).await?
-        {
-            return Err(Error::NotFound);
-        }
-        let info = self.store.session_by_hash(&new, now).await?.ok_or(Error::NotFound)?;
-        self.audit(ctx, Some(user.id), Some(user.id), "step_up", "password").await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "step_up", user = %user.id.hex());
-        Ok(NewSession { token, info })
+        self.refresh(ctx, user, session, "password").await
     }
 
     /// The session authenticated recently enough for a sensitive action:

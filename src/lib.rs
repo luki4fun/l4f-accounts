@@ -24,6 +24,8 @@ pub mod service;
 pub mod store;
 pub mod totp;
 pub mod util;
+#[cfg(all(test, feature = "mysql"))]
+mod testkit;
 pub mod verify;
 #[cfg(feature = "axum")]
 pub mod web;

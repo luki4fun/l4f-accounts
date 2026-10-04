@@ -72,10 +72,35 @@ pub struct User {
     pub email_pending: Option<String>,
     pub has_password: bool,
     pub totp_enabled: bool,
+    /// At least one passkey: it can stand in for the password or be the second factor.
+    pub has_passkey: bool,
     pub status: UserStatus,
     pub sync_enabled: bool,
     pub created_at: i64,
 }
+
+/// A login method other than the password: a passkey now, SSH keys, device
+/// keys and social identities later. `(kind, ext_id)` is globally unique.
+#[derive(Clone, Debug, Serialize)]
+pub struct Credential {
+    pub kind: String,
+    /// Credential id, key fingerprint, device id or provider subject.
+    #[serde(skip)]
+    pub ext_id: Vec<u8>,
+    pub user_id: AccountId,
+    #[serde(skip)]
+    pub public_key: Option<Vec<u8>>,
+    pub alg: i64,
+    pub sign_count: i64,
+    /// Bit 0: a passkey's backup-eligible flag, which never changes for it.
+    pub flags: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+/// `Credential::flags` bit for a passkey that may be synced (backup eligible).
+pub const FLAG_BACKUP_ELIGIBLE: i64 = 1;
 
 /// What `Store::create_user` writes. The caller picks the id, so it knows it
 /// without a read back (MySQL has no `RETURNING`). No `Debug`: it carries the

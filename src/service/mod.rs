@@ -9,11 +9,15 @@
 mod account;
 mod admin;
 mod auth;
+mod mfa;
+mod passkey;
 #[cfg(test)]
 mod tests;
 
 pub use admin::{Actor, RoleForm, UserDetail};
 pub use auth::{LoginStep, NewSession, RegisterForm};
+pub use mfa::TotpSetup;
+pub use passkey::PasskeyFor;
 #[cfg(feature = "axum")]
 pub(crate) use auth::token_hash;
 
@@ -73,6 +77,12 @@ pub struct Config {
     /// anything else needs 2FA once `require_2fa_for_privileged` is on.
     pub default_user_scopes: Vec<String>,
     pub require_2fa_for_privileged: bool,
+    /// WebAuthn relying party id. Empty: the host of `base_url`.
+    pub rp_id: String,
+    /// Origins a passkey ceremony may run on. Empty: `base_url` alone.
+    pub webauthn_origins: Vec<String>,
+    /// The name authenticator apps list the account under. Empty: the host of `base_url`.
+    pub totp_issuer: String,
     #[serde(skip)]
     pub base_url: String,
     #[serde(skip)]
@@ -98,13 +108,40 @@ impl Default for Config {
             reserved_usernames: Vec::new(),
             audit_retention_days: 180,
             default_user_scopes: Vec::new(),
-            // Phase 2 flips this: until TOTP exists nobody could enrol, and the
-            // bootstrap admin would hold `*` without being able to use it.
-            require_2fa_for_privileged: false,
+            // A stolen password alone must not reach admin rights. The bootstrap
+            // admin enrols a second factor first; the dashboard says so.
+            require_2fa_for_privileged: true,
+            rp_id: String::new(),
+            webauthn_origins: Vec::new(),
+            totp_issuer: String::new(),
             base_url: String::new(),
             cookie_secure: true,
             ip_mode: IpMode::default(),
         }
+    }
+}
+
+impl Config {
+    /// `base_url` without scheme, port or path: `https://l4f.cc` is `l4f.cc`.
+    fn host(&self) -> &str {
+        let rest = self.base_url.split_once("://").map_or(self.base_url.as_str(), |(_, r)| r);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => authority.split(':').next().unwrap_or(""),
+        }
+    }
+
+    pub fn rp_id(&self) -> &str {
+        if self.rp_id.is_empty() { self.host() } else { &self.rp_id }
+    }
+
+    pub fn origins(&self) -> Vec<String> {
+        if self.webauthn_origins.is_empty() { vec![self.base_url.clone()] } else { self.webauthn_origins.clone() }
+    }
+
+    pub fn issuer(&self) -> &str {
+        if self.totp_issuer.is_empty() { self.host() } else { &self.totp_issuer }
     }
 }
 
@@ -277,9 +314,10 @@ pub fn require(scopes: &[String], required: &str) -> bool {
     scope::allowed(scopes, required)
 }
 
-/// TOTP for now; passkeys join in Phase 2.
+/// TOTP codes or a passkey. Once one exists, a password alone only opens a
+/// session that waits for it.
 pub fn has_second_factor(u: &User) -> bool {
-    u.totp_enabled
+    u.totp_enabled || u.has_passkey
 }
 
 impl<H: Host> Accounts<H> {
