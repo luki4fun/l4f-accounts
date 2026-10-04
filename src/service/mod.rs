@@ -16,6 +16,7 @@ mod mfa;
 mod passkey;
 #[cfg(feature = "oauth")]
 mod social;
+mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -24,6 +25,7 @@ pub use auth::{LoginStep, NewSession, RegisterForm};
 pub use mfa::TotpSetup;
 pub use keylogin::NewDeviceKey;
 pub use passkey::PasskeyFor;
+pub use storage::Put;
 #[cfg(feature = "oauth")]
 pub use social::{Intent, OAuth, SocialOutcome};
 #[cfg(feature = "axum")]
@@ -105,6 +107,8 @@ pub struct Config {
     /// The host's egress forwarder for outbound TLS (SMTP, OAuth), e.g.
     /// 127.0.0.1:8443, when the service may not reach the internet itself.
     pub egress: Option<std::net::SocketAddr>,
+    /// Synced settings, vault and avatar together, per account.
+    pub storage_quota_bytes: i64,
     #[serde(skip)]
     pub base_url: String,
     #[serde(skip)]
@@ -129,7 +133,9 @@ impl Default for Config {
             signup: pow::Limits::default(),
             reserved_usernames: Vec::new(),
             audit_retention_days: 180,
-            default_user_scopes: Vec::new(),
+            // What everyone may do with their own account; none of it needs a
+            // second factor.
+            default_user_scopes: ["storage:sync", "vault:use", "profile:public"].map(String::from).to_vec(),
             // A stolen password alone must not reach admin rights. The bootstrap
             // admin enrols a second factor first; the dashboard says so.
             require_2fa_for_privileged: true,
@@ -142,6 +148,7 @@ impl Default for Config {
             smtp_user: String::new(),
             smtp_from: String::new(),
             egress: None,
+            storage_quota_bytes: 1024 * 1024,
             base_url: String::new(),
             cookie_secure: true,
             ip_mode: IpMode::default(),

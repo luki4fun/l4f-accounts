@@ -42,6 +42,26 @@ impl From<sqlx::Error> for WriteError {
     }
 }
 
+/// One stored value: a synced setting, a vault item or slot, an avatar.
+#[derive(Clone, Debug)]
+pub struct Blob {
+    pub k: String,
+    pub v: Vec<u8>,
+    pub version: i64,
+    pub updated_at: i64,
+}
+
+/// How `Store::put_blob` went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PutBlob {
+    /// Written; the new version.
+    Done(i64),
+    /// Someone wrote it since `expect` (or it exists and `expect` was 0).
+    Conflict,
+    /// The account's storage would go over its quota.
+    Quota,
+}
+
 /// How `Store::confirm_email` went.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EmailConfirm {
@@ -736,6 +756,98 @@ impl Store {
         sqlx::query("DELETE FROM acct_recovery WHERE user_id = ?").bind(&user.0[..]).execute(&self.0).await.map(|_| ())
     }
 
+    // ---------------------------------------------------------------- blobs
+
+    pub async fn blobs(&self, user: AccountId, ns: &str) -> sqlx::Result<Vec<Blob>> {
+        let rows: Vec<(String, Vec<u8>, i64, i64)> =
+            sqlx::query_as("SELECT k, v, version, updated_at FROM acct_blobs WHERE user_id = ? AND ns = ? ORDER BY k")
+                .bind(&user.0[..])
+                .bind(ns)
+                .fetch_all(&self.0)
+                .await?;
+        Ok(rows.into_iter().map(|(k, v, version, updated_at)| Blob { k, v, version, updated_at }).collect())
+    }
+
+    pub async fn blob(&self, user: AccountId, ns: &str, k: &str) -> sqlx::Result<Option<Blob>> {
+        let row: Option<(String, Vec<u8>, i64, i64)> =
+            sqlx::query_as("SELECT k, v, version, updated_at FROM acct_blobs WHERE user_id = ? AND ns = ? AND k = ?")
+                .bind(&user.0[..])
+                .bind(ns)
+                .bind(k)
+                .fetch_optional(&self.0)
+                .await?;
+        Ok(row.map(|(k, v, version, updated_at)| Blob { k, v, version, updated_at }))
+    }
+
+    pub async fn blob_count(&self, user: AccountId, ns: &str) -> sqlx::Result<i64> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM acct_blobs WHERE user_id = ? AND ns = ?")
+            .bind(&user.0[..])
+            .bind(ns)
+            .fetch_one(&self.0)
+            .await
+    }
+
+    /// Compare-and-set: `expect` 0 creates (and finds a conflict if the key
+    /// exists), any other value replaces only that version. The account's row
+    /// is locked first, so two writes cannot both fit under the quota.
+    pub async fn put_blob(&self, user: AccountId, ns: &str, k: &str, v: &[u8], expect: i64, quota: i64) -> sqlx::Result<PutBlob> {
+        let now = util::now();
+        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
+        sqlx::query("SELECT id FROM acct_users WHERE id = ? FOR UPDATE").bind(&user.0[..]).execute(&mut *tx).await?;
+        let used: i64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(LENGTH(v)), 0) AS SIGNED) FROM acct_blobs WHERE user_id = ?")
+            .bind(&user.0[..])
+            .fetch_one(&mut *tx)
+            .await?;
+        let current: Option<(i64, i64)> =
+            sqlx::query_as("SELECT version, CAST(LENGTH(v) AS SIGNED) FROM acct_blobs WHERE user_id = ? AND ns = ? AND k = ?")
+                .bind(&user.0[..])
+                .bind(ns)
+                .bind(k)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let (old_len, version) = match current {
+            Some((ver, _)) if ver != expect => return Ok(PutBlob::Conflict),
+            None if expect != 0 => return Ok(PutBlob::Conflict),
+            Some((ver, len)) => (len, ver + 1),
+            None => (0, 1),
+        };
+        if used - old_len + v.len() as i64 > quota {
+            return Ok(PutBlob::Quota);
+        }
+        sqlx::query(
+            "INSERT INTO acct_blobs (user_id, ns, k, v, version, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE v = VALUES(v), version = VALUES(version), updated_at = VALUES(updated_at)",
+        )
+        .bind(&user.0[..])
+        .bind(ns)
+        .bind(k)
+        .bind(v)
+        .bind(version)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PutBlob::Done(version))
+    }
+
+    /// `expect` 0 deletes whatever version is there.
+    pub async fn delete_blob(&self, user: AccountId, ns: &str, k: &str, expect: i64) -> sqlx::Result<bool> {
+        let r = sqlx::query("DELETE FROM acct_blobs WHERE user_id = ? AND ns = ? AND k = ? AND (? = 0 OR version = ?)")
+            .bind(&user.0[..])
+            .bind(ns)
+            .bind(k)
+            .bind(expect)
+            .bind(expect)
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn delete_blobs(&self, user: AccountId, ns: &str) -> sqlx::Result<u64> {
+        let r = sqlx::query("DELETE FROM acct_blobs WHERE user_id = ? AND ns = ?").bind(&user.0[..]).bind(ns).execute(&self.0).await?;
+        Ok(r.rows_affected())
+    }
+
     // ---------------------------------------------------------- credentials
 
     /// A plain INSERT: false when `(kind, ext_id)` already exists, so a key can
@@ -1084,7 +1196,7 @@ impl Store {
     /// secrets and nothing that works as a credential: no password hash, TOTP
     /// secret, session hashes, recovery hashes or public keys. Not in it: audit
     /// rows where this account acted on another one, which sit in that
-    /// account's log. TODO: blobs (phase 6)
+    /// account's log.
     /// and the profile (phase 7) join this when something writes them. `None`
     /// when the account does not exist.
     pub async fn export_user(&self, id: AccountId) -> sqlx::Result<Option<serde_json::Value>> {
@@ -1113,6 +1225,23 @@ impl Store {
             }))
         })
         .collect::<sqlx::Result<Vec<_>>>()?;
+        // Synced settings as they are; vault entries as the ciphertext they
+        // are, which only the owner's keys open.
+        let blobs: Vec<(String, String, Vec<u8>, i64, i64)> =
+            sqlx::query_as("SELECT ns, k, v, version, updated_at FROM acct_blobs WHERE user_id = ? AND ns IN ('kv', 'vault', 'vault_slot') ORDER BY ns, k")
+                .bind(&id.0[..])
+                .fetch_all(&self.0)
+                .await?;
+        let blobs: Vec<serde_json::Value> = blobs
+            .into_iter()
+            .map(|(ns, k, v, version, updated_at)| {
+                let value = match ns.as_str() {
+                    "kv" | "vault_slot" => serde_json::from_slice(&v).unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::Value::String(util::b64u(&v)),
+                };
+                serde_json::json!({ "ns": ns, "k": k, "value": value, "version": version, "updated_at": updated_at })
+            })
+            .collect();
         // When each recovery code was used; never the hashes.
         let recovery: Vec<Option<i64>> =
             sqlx::query_scalar("SELECT used_at FROM acct_recovery WHERE user_id = ? ORDER BY used_at IS NULL, used_at")
@@ -1127,6 +1256,7 @@ impl Store {
             "sessions": self.sessions_of(id).await?,
             "credentials": credentials,
             "recovery_codes": recovery.iter().map(|u| serde_json::json!({ "used_at": u })).collect::<Vec<_>>(),
+            "storage": blobs,
             "audit": self.audit_of(id, EXPORT_AUDIT_ROWS).await?,
         })))
     }

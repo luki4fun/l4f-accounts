@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use sha2::Digest;
 
 use super::admin::role_name;
+use super::storage::KV_MAX_BYTES;
 use super::auth::{clean_email, new_token, token_hash};
 use super::*;
 use crate::model::{SessionInfo, UserStatus};
@@ -1372,4 +1373,63 @@ mod social_flows {
         assert!(a.fresh(&up.info, util::now()) && next == "/account/delete");
         cleanup(&a, &[u.id], &[]).await;
     }
+}
+
+// ---- storage
+
+#[tokio::test]
+async fn synced_settings_are_compare_and_set_and_go_with_sync() {
+    let Some(a) = shared(Config { storage_quota_bytes: 40 * 1024, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.110");
+    let u = make_user(&a, &[]).await;
+    // The built-in user role carries these on a fresh install; the shared test
+    // database seeded it long ago, so the scopes are given here.
+    assert!(Config::default().default_user_scopes.contains(&"storage:sync".to_string()));
+    let scopes = strings(&["storage:sync"]);
+    assert!(matches!(a.kv_put(&u, &scopes, "links:v1", b"[]", 0).await, Err(Error::Invalid("Sync is off."))));
+    a.sync_set(&c, &u, &scopes, true).await.unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let Put::Done(v1) = a.kv_put(&u, &scopes, "links:v1", b"[1]", 0).await.unwrap() else { panic!("created") };
+    assert!(matches!(a.kv_put(&u, &scopes, "links:v1", b"[2]", 0).await.unwrap(), Put::Conflict(Some(b)) if b.v == b"[1]"), "create finds it");
+    let Put::Done(v2) = a.kv_put(&u, &scopes, "links:v1", b"[2]", v1).await.unwrap() else { panic!("replaced") };
+    assert!(matches!(a.kv_put(&u, &scopes, "links:v1", b"[3]", v1).await.unwrap(), Put::Conflict(Some(b)) if b.version == v2), "stale version");
+    assert!(matches!(a.kv_put(&u, &scopes, "links:v1", b"not json", v2).await, Err(Error::Invalid(_))));
+    assert!(matches!(a.kv_put(&u, &scopes, "Bad Key", b"1", 0).await, Err(Error::Invalid(_))));
+    let big = format!("\"{}\"", "x".repeat(KV_MAX_BYTES));
+    assert!(matches!(a.kv_put(&u, &scopes, "big", big.as_bytes(), 0).await, Err(Error::Invalid(_))), "32 KiB a key");
+    let half = format!("\"{}\"", "x".repeat(30 * 1024));
+    assert!(matches!(a.kv_put(&u, &scopes, "a", half.as_bytes(), 0).await.unwrap(), Put::Done(_)));
+    assert!(matches!(a.kv_put(&u, &scopes, "b", half.as_bytes(), 0).await, Err(Error::Invalid("Your storage is full."))), "the quota");
+    assert_eq!(a.kv_list(&u, &scopes).await.unwrap().len(), 2);
+    assert!(a.kv_delete(&u, &scopes, "a", 0).await.unwrap());
+    a.sync_set(&c, &u, &scopes, false).await.unwrap();
+    assert_eq!(a.store.blob_count(u.id, "kv").await.unwrap(), 0, "the server's copy goes with sync");
+    assert!(matches!(a.kv_list(&u, &[]).await, Err(Error::Forbidden)), "needs storage:sync");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+#[tokio::test]
+async fn the_vault_takes_ciphertext_shaped_entries_only() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.111");
+    let u = make_user(&a, &[]).await;
+    let scopes = strings(&["vault:use"]);
+    let slot_id = util::b64u(&util::random::<16>());
+    let slot = serde_json::json!({ "v": 1, "id": slot_id, "kind": "pass", "kdf": { "alg": "PBKDF2-SHA256", "iter": 600000 } }).to_string();
+    assert!(matches!(a.vault_put(&u, &scopes, true, &slot_id, slot.as_bytes(), 0).await.unwrap(), Put::Done(1)));
+    let weak = slot.replace("600000", "1000");
+    assert!(matches!(a.vault_put(&u, &scopes, true, &slot_id, weak.as_bytes(), 1).await, Err(Error::Invalid(_))));
+    let item_k = format!("totp.{}", util::b64u(&util::random::<16>()));
+    let mut item = vec![1u8];
+    item.extend(util::random::<40>());
+    assert!(matches!(a.vault_put(&u, &scopes, false, &item_k, &item, 0).await.unwrap(), Put::Done(1)));
+    assert!(matches!(a.vault_put(&u, &scopes, false, "evil.AAAAAAAAAAAAAAAAAAAAAA", &item, 0).await, Err(Error::Invalid(_))));
+    assert!(matches!(a.vault_put(&u, &scopes, false, &item_k, &[2u8; 40], 1).await, Err(Error::Invalid(_))), "version byte");
+    let (slots, items) = a.vault_list(&u, &scopes).await.unwrap();
+    assert_eq!((slots.len(), items.len()), (1, 1));
+    a.vault_wipe(&c, &u, &scopes).await.unwrap();
+    let (slots, items) = a.vault_list(&u, &scopes).await.unwrap();
+    assert!(slots.is_empty() && items.is_empty());
+    assert!(matches!(a.vault_list(&u, &["storage:sync".to_string()]).await, Err(Error::Forbidden)), "needs vault:use");
+    cleanup(&a, &[u.id], &[]).await;
 }
