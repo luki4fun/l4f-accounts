@@ -21,6 +21,9 @@
       <button class="btn btn-quiet mt-2" type="button" hidden data-passkey="login" data-base="{{ base }}" data-next="{{ next }}" data-status="pk-status"{% if let Some(t) = csrf %} data-csrf="{{ t }}"{% endif %}>Sign in with a passkey</button>
       <button class="btn btn-quiet mt-2" type="button" hidden data-devkey="login" data-base="{{ base }}" data-next="{{ next }}" data-status="pk-status"{% if let Some(t) = csrf %} data-csrf="{{ t }}"{% endif %}>Sign in on this browser</button>
       <p class="hint" id="pk-status" role="status" aria-live="polite"></p>
+      {% for (slug, label) in providers %}
+      <a class="btn btn-quiet mt-2" href="{{ base }}/oauth/{{ slug }}{% if !next.is_empty() %}?next={{ next|urlencode }}{% endif %}">Sign in with {{ label }}</a>
+      {% endfor %}
       <p class="hint mt-2"><a href="{{ base }}/login/ssh{% if !next.is_empty() %}?next={{ next|urlencode }}{% endif %}">Sign in with an SSH key</a></p>
       {% if forgot %}<p class="hint mt-2"><a href="{{ base }}/forgot">Forgot your password?</a></p>{% endif %}
       {% if signup_open %}<p class="hint mt-2">No account yet? <a href="{{ base }}/register">Create one</a>.</p>{% endif %}

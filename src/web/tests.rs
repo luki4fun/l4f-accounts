@@ -855,3 +855,65 @@ async fn confirm_and_reset_links_work_through_their_pages() {
     assert_eq!(send(&app, get("/account", Some(&c))).await.status(), StatusCode::SEE_OTHER, "signed out by the reset");
     drop_user(&a, u.id).await;
 }
+
+// ---- social sign-in
+
+#[cfg(feature = "oauth")]
+#[tokio::test]
+async fn social_sign_in_runs_through_start_and_callback() {
+    use crate::oauth::{Kind, Provider};
+    use axum::routing::{get as aget, post as apost};
+    let Some(store) = crate::store::tests::shared().await else { return };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let subject = unique("d");
+    let sub = subject.clone();
+    let fake = Router::new()
+        .route("/d/token", apost(|| async { axum::Json(serde_json::json!({ "access_token": "at" })) }))
+        .route("/d/profile", aget(move || {
+            let s = sub.clone();
+            async move { axum::Json(serde_json::json!({ "id": s, "username": "pat" })) }
+        }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, fake).await.unwrap() });
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let oauth = crate::service::OAuth::new(http, vec![Provider::at(Kind::Discord, &format!("{base}/d"))]);
+    let host = T { cfg: Arc::new(pk_cfg()) };
+    let a = Arc::new(
+        Accounts::new(store, Keys::new(&[9; 32], None).unwrap(), Arc::default(), host, &[], Some(POW.to_vec()), Vec::new())
+            .unwrap()
+            .with_oauth(oauth),
+    );
+    let app = Router::new().nest(BASE, router(a.clone()));
+
+    let u = make_user(&a).await;
+    let (c, _, _) = browser(&a, u.id, util::now()).await;
+    let r = send(&app, get("/account/oauth/discord?intent=link", Some(&c))).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(location(&r).starts_with(&format!("{base}/d/authorize?")));
+    let flow = set_cookie(&r, "__Host-acct-oauth").unwrap();
+    let state = location(&r).split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    let both = format!("{c}; {flow}");
+    let r = send(&app, get(&format!("/account/oauth/discord/cb?state={state}&error=access_denied"), Some(&both))).await;
+    assert!(location(&r).starts_with("/account/security?err=Signing+in+there+was+cancelled."));
+    assert_eq!(set_cookie(&r, "__Host-acct-oauth").as_deref(), Some("__Host-acct-oauth="), "the flow cookie goes every time");
+    let r = send(&app, get(&format!("/account/oauth/discord/cb?state={state}&code=abc"), Some(&both))).await;
+    assert!(location(&r).starts_with("/account/security?ok=Linked."), "{}", location(&r));
+
+    // Now it signs in, and the login page offers it.
+    assert!(text(send(&app, get("/account/login", None)).await).await.contains("/account/oauth/discord"));
+    let r = send(&app, get("/account/oauth/discord?next=%2Faccount%2Fsecurity", None)).await;
+    let flow = set_cookie(&r, "__Host-acct-oauth").unwrap();
+    let state = location(&r).split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    let r = send(&app, get(&format!("/account/oauth/discord/cb?state={state}&code=abc"), Some(&flow))).await;
+    assert_eq!(location(&r), "/account/security");
+    assert!(set_cookie(&r, "__Host-acct").is_some());
+    let r = send(&app, get(&format!("/account/oauth/discord/cb?state={state}&code=abc"), None)).await;
+    assert!(location(&r).starts_with("/account/login?err="), "without the flow cookie: refused");
+
+    // An account with nothing but the identity confirms it there.
+    sqlx::query("UPDATE acct_users SET password_hash = NULL WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    let page = text(send(&app, get("/account/reauth?next=%2Faccount%2Fdelete", Some(&c))).await).await;
+    assert!(page.contains("/account/oauth/discord?intent=reauth") && !page.contains(r#"name="password""#));
+    drop_user(&a, u.id).await;
+}

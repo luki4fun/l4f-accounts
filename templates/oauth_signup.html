@@ -1,0 +1,33 @@
+<div class="wrap page">
+<div class="panel read">
+  <h1>Choose a username</h1>
+  <p>No account here uses that sign-in yet. Pick a name for a new one; you sign in the same way next time.</p>
+  {% if let Some(e) = error %}<div class="notice mt-3" role="alert">{{ e }}</div>{% endif %}
+  <form class="narrow mt-3" method="post" action="{{ base }}/oauth/signup">
+    {% if let Some(t) = csrf %}<input type="hidden" name="csrf" value="{{ t }}">{% endif %}
+    <div class="field">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" value="{{ username }}" autocomplete="username"
+             autocapitalize="none" spellcheck="false" minlength="3" maxlength="32" required aria-describedby="username-hint">
+      <p class="hint" id="username-hint">3 to 32 characters: lowercase letters, digits, <code>_</code> and <code>-</code>.</p>
+    </div>
+    <div class="hp" aria-hidden="true">
+      <label for="website">Leave this empty</label>
+      <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+    </div>
+    <input type="hidden" name="ts" value="{{ stamp }}">
+    <input type="hidden" name="altcha" id="altcha" value="">
+    <script type="application/json" id="pow-challenge">{{ challenge_json|safe }}</script>
+    <p class="hint" id="pow-status" aria-live="polite"></p>
+    <noscript>
+      <div class="callout">
+        <p>JavaScript is off, so the spam check runs differently: take at least
+           {{ min_form_seconds }} seconds to fill this in, and only one account
+           can be created per day from your connection.</p>
+      </div>
+    </noscript>
+    <button class="btn mt-1" type="submit">Create account</button>
+  </form>
+</div>
+</div>
+<script src="/static/js/pow.js" defer></script>

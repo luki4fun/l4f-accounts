@@ -9,6 +9,9 @@
   </div>
   <p class="muted">@{{ user.username }}{% for r in roles %} <span class="tag">{% if let Some(b) = r.badge %}{{ b }}{% else %}{{ r.name }}{% endif %}</span>{% endfor %}</p>
   {% include "_flash.html" %}
+  {% if !user.has_password && !user.has_passkey %}
+  <div class="callout warn mt-2"><p>This account has no password and no passkey. If the service you sign in with goes away, so does your way in: <a href="{{ base }}/password">set a password</a> or add a passkey on the <a href="{{ base }}/security">security page</a>.</p></div>
+  {% endif %}
   {% if waiting_for_2fa %}
   <div class="callout warn mt-2"><p>Your roles include admin rights, which work only with two-factor sign-in. <a href="{{ base }}/security">Set it up</a>.</p></div>
   {% endif %}

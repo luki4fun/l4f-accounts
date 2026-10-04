@@ -17,6 +17,8 @@ mod keylogin;
 mod mail;
 mod mfa;
 mod passkey;
+#[cfg(feature = "oauth")]
+mod social;
 #[cfg(test)]
 mod tests;
 
@@ -87,6 +89,12 @@ pub fn router<H: WebHost, S: Clone + Send + Sync + 'static>(a: Arc<Accounts<H>>)
         .route("/verify-email", get(mail::verify_form::<H>).post(mail::verify::<H>))
         .route("/forgot", get(mail::forgot_form::<H>).post(mail::forgot::<H>))
         .route("/reset", get(mail::reset_form::<H>).post(mail::reset::<H>));
+    #[cfg(feature = "oauth")]
+    let r = r
+        .route("/oauth/signup", get(social::signup_form::<H>).post(social::signup::<H>))
+        .route("/oauth/{p}", get(social::start::<H>))
+        .route("/oauth/{p}/cb", get(social::callback::<H>))
+        .route("/oauth/{p}/unlink", post(social::unlink::<H>));
     r.route("/password", get(mail::password_form::<H>).post(mail::password::<H>))
         .route("/", get(account::dashboard::<H>))
         .route("/sessions/{id}/revoke", post(account::revoke::<H>))
@@ -246,6 +254,17 @@ struct ErrorTpl<'a> {
 /// the host's own scope-guarded pages refuse the same way.
 pub fn error_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, msg: &str) -> Response {
     page(a, h, "Something went wrong", status, &ErrorTpl { msg, base: BASE })
+}
+
+/// The configured social providers as (slug, label); none without the feature.
+fn providers<H: Host>(a: &Accounts<H>) -> Vec<(&'static str, &'static str)> {
+    #[cfg(feature = "oauth")]
+    return a.oauth_kinds().into_iter().map(|k| (k.slug(), k.label())).collect();
+    #[cfg(not(feature = "oauth"))]
+    {
+        let _ = a;
+        Vec::new()
+    }
 }
 
 /// A JSON answer for the scripts, with cookies.

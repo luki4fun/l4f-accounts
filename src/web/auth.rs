@@ -47,6 +47,7 @@ struct LoginTpl<'a> {
     error: Option<&'a str>,
     signup_open: bool,
     forgot: bool,
+    providers: Vec<(&'static str, &'static str)>,
     max_len: usize,
 }
 
@@ -69,6 +70,7 @@ fn login_page<H: WebHost>(
         error,
         signup_open: cfg.enabled && cfg.registration_open && a.pow_key.is_some(),
         forgot: mail_ready(a),
+        providers: super::providers(a),
         max_len: MAX_LEN,
     };
     page(a, h, "Sign in", status, &t)
@@ -239,6 +241,9 @@ struct ReauthTpl<'a> {
     minutes: i64,
     totp: bool,
     passkey: bool,
+    password: bool,
+    /// Providers to confirm with, for accounts with nothing else to offer.
+    social: Vec<(&'static str, &'static str)>,
     max_len: usize,
     error: Option<&'a str>,
 }
@@ -252,6 +257,8 @@ fn reauth_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, m
         minutes: a.host.config().step_up_minutes,
         totp: me.user.totp_enabled,
         passkey: me.user.has_passkey,
+        password: me.user.has_password,
+        social: if me.user.totp_enabled || me.user.has_passkey || me.user.has_password { Vec::new() } else { super::providers(a) },
         max_len: MAX_LEN,
         error,
     };

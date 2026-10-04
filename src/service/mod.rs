@@ -14,6 +14,8 @@ mod mail;
 mod keylogin;
 mod mfa;
 mod passkey;
+#[cfg(feature = "oauth")]
+mod social;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +24,8 @@ pub use auth::{LoginStep, NewSession, RegisterForm};
 pub use mfa::TotpSetup;
 pub use keylogin::NewDeviceKey;
 pub use passkey::PasskeyFor;
+#[cfg(feature = "oauth")]
+pub use social::{Intent, OAuth, SocialOutcome};
 #[cfg(feature = "axum")]
 pub(crate) use auth::token_hash;
 
@@ -339,6 +343,8 @@ pub struct Accounts<H: Host> {
     /// Without one, nothing that needs mail is offered.
     #[cfg(feature = "email")]
     mailer: Option<Arc<crate::email::Mailer>>,
+    #[cfg(feature = "oauth")]
+    oauth: Option<Arc<social::OAuth>>,
 }
 
 /// Where the host serves the account pages; links in mail point below it.
@@ -400,6 +406,8 @@ impl<H: Host> Accounts<H> {
             hash_permits: Arc::new(Semaphore::new(2)),
             #[cfg(feature = "email")]
             mailer: None,
+            #[cfg(feature = "oauth")]
+            oauth: None,
         };
         if let Some(bad) = a.host.config().default_user_scopes.iter().find(|s| !a.known_grant(s)) {
             return Err(sqlx::Error::InvalidArgument(format!("default_user_scopes: unknown scope {bad:?}")));

@@ -20,7 +20,10 @@
         <button class="btn" type="submit">Continue</button>
       </form>
       {% endif %}
-      {% if !totp && !passkey %}
+      {% for (slug, label) in social %}
+      <a class="btn mt-2" href="{{ base }}/oauth/{{ slug }}?intent=reauth&amp;next={{ next|urlencode }}">Confirm with {{ label }}</a>
+      {% endfor %}
+      {% if !totp && !passkey && password %}
       <form class="mt-2" method="post" action="{{ base }}/reauth">
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <input type="hidden" name="next" value="{{ next }}">

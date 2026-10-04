@@ -86,6 +86,13 @@ struct KeyRow {
     used: String,
 }
 
+/// A linked social identity on the security page.
+pub(super) struct LinkRow {
+    pub slug: &'static str,
+    pub label: &'static str,
+    pub name: String,
+}
+
 fn rows(creds: Vec<crate::model::Credential>) -> Vec<KeyRow> {
     creds
         .into_iter()
@@ -109,6 +116,8 @@ struct SecurityTpl<'a> {
     passkeys: Vec<KeyRow>,
     ssh: Vec<KeyRow>,
     devkeys: Vec<KeyRow>,
+    linked: Vec<LinkRow>,
+    linkable: Vec<(&'static str, &'static str)>,
     username: &'a str,
     flash: Option<Flash>,
 }
@@ -119,10 +128,23 @@ pub(super) async fn security<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderM
         Ok(v) => v,
         Err(e) => return refused(&a, &h, &Error::Db(e)),
     };
+    #[cfg(feature = "oauth")]
+    let (linked, linkable) = match a.oauth_linked(id).await {
+        Ok(l) => {
+            let rows: Vec<LinkRow> = l.into_iter().map(|(k, c)| LinkRow { slug: k.slug(), label: k.label(), name: c.name }).collect();
+            let free = a.oauth_kinds().into_iter().filter(|k| !rows.iter().any(|r| r.slug == k.slug())).map(|k| (k.slug(), k.label())).collect();
+            (rows, free)
+        }
+        Err(e) => return refused(&a, &h, &Error::Db(e)),
+    };
+    #[cfg(not(feature = "oauth"))]
+    let (linked, linkable) = (Vec::new(), Vec::new());
     let t = SecurityTpl {
         base: BASE,
         csrf: me.csrf(),
         fresh: a.fresh(&me.session, util::now()),
+        linked,
+        linkable,
         totp: me.user.totp_enabled,
         recovery_left: left,
         passkeys: rows(passkeys),

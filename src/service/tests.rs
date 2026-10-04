@@ -1226,3 +1226,150 @@ mod mail_flows {
         cleanup(&a, &[u.id], &[]).await;
     }
 }
+
+// ---- social sign-in
+
+// The stand-in provider is an axum app.
+#[cfg(all(feature = "oauth", feature = "axum"))]
+mod social_flows {
+    use super::*;
+    use crate::oauth::{Kind, Provider};
+    use axum::{Json, Router, extract::State as AxState, routing::{get, post}};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Fake {
+        subject: String,
+        nonce: String,
+        auth_time: i64,
+    }
+
+    type Shared = Arc<Mutex<Fake>>;
+
+    async fn d_token() -> Json<serde_json::Value> {
+        Json(serde_json::json!({ "access_token": "at", "token_type": "Bearer" }))
+    }
+
+    async fn d_profile(AxState(f): AxState<Shared>) -> Json<serde_json::Value> {
+        let s = f.lock().unwrap().subject.clone();
+        Json(serde_json::json!({ "id": s, "username": "dee_d", "global_name": "Dee D" }))
+    }
+
+    async fn g_token(AxState(f): AxState<Shared>) -> Json<serde_json::Value> {
+        let f = f.lock().unwrap();
+        let claims = serde_json::json!({ "iss": "https://accounts.google.com", "aud": "client", "exp": util::now() + 600,
+            "sub": f.subject, "nonce": f.nonce, "name": "Dee G", "auth_time": f.auth_time });
+        Json(serde_json::json!({ "id_token": format!("e30.{}.sig", util::b64u(claims.to_string().as_bytes())) }))
+    }
+
+    /// A stand-in provider on a local port, and accounts that talk to it over
+    /// plain HTTP (the real client is HTTPS-only).
+    async fn setup() -> Option<(Accounts<Stub>, Shared)> {
+        // reqwest is built without a crypto provider: the host installs one.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fake: Shared = Arc::default();
+        let app = Router::new()
+            .route("/d/token", post(d_token))
+            .route("/d/profile", get(d_profile))
+            .route("/g/token", post(g_token))
+            .with_state(fake.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let providers = vec![Provider::at(Kind::Discord, &format!("{base}/d")), Provider::at(Kind::Google, &format!("{base}/g"))];
+        let a = on(shared_store().await?, pk_cfg()).await.with_oauth(super::super::OAuth::new(http, providers));
+        Some((a, fake))
+    }
+
+    fn param(url: &str, name: &str) -> String {
+        url.split(['?', '&']).find_map(|kv| kv.strip_prefix(&format!("{name}="))).unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_new_identity_signs_up_then_signs_in() {
+        let Some((a, fake)) = setup().await else { return };
+        let c = ctx("203.0.113.100");
+        fake.lock().unwrap().subject = unique("d");
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "/account/security").unwrap();
+        let state = param(&url, "state");
+        assert!(url.contains("code_challenge="));
+        assert!(matches!(a.oauth_finish(&c, Kind::Discord, &cookie, "wrong", "code", None).await, Err(Error::Invalid(_))), "state");
+        assert!(matches!(a.oauth_finish(&c, Kind::Google, &cookie, &state, "code", None).await, Err(Error::Invalid(_))), "provider");
+        let (out, next) = a.oauth_finish(&c, Kind::Discord, &cookie, &state, "code", None).await.unwrap();
+        assert_eq!(next, "/account/security");
+        let SocialOutcome::Signup { cookie: signup } = out else { panic!("expected the username page") };
+        assert_eq!(a.oauth_signup_suggestion(&signup).as_deref(), Some("deed"), "the display name, in the username alphabet");
+        let ts = pow::stamp(POW_KEY, util::now_secs() - 5);
+        let altcha = solve(&pow::issue(POW_KEY, 1000, 600));
+        let name = unique("o");
+        let s = a.oauth_signup(&c, &signup, &name, pow::Proof { altcha: &altcha, ts: &ts, ..pow::Proof::default() }).await.unwrap();
+        assert!(s.info.mfa_ok && s.info.auth_at == 0 && s.info.method == "oauth");
+        let u = a.store.user_by_username(&name).await.unwrap().unwrap();
+        assert!(!u.has_password && u.display_name == "Dee D");
+
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "").unwrap();
+        let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await.unwrap();
+        assert!(matches!(out, SocialOutcome::Signed(LoginStep::Done(_))), "the same identity signs in now");
+
+        sqlx::query("UPDATE acct_users SET totp_enc = x'00' WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "").unwrap();
+        let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await.unwrap();
+        assert!(matches!(out, SocialOutcome::Signed(LoginStep::NeedMfa(_))), "a first factor only, with 2FA on");
+        cleanup(&a, &[u.id], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn linking_needs_a_recent_sign_in_and_an_identity_has_one_account() {
+        let Some((a, fake)) = setup().await else { return };
+        let c = ctx("203.0.113.101");
+        fake.lock().unwrap().subject = unique("d");
+        let u = make_user(&a, &[]).await;
+        let now = util::now();
+        let fresh = a.create_session(u.id, "password", true, now, &c).await.unwrap();
+        let stale = a.create_session(u.id, "password", true, now - 3600, &c).await.unwrap();
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Link, Some(&u), "").unwrap();
+        let st = param(&url, "state");
+        assert!(matches!(a.oauth_finish(&c, Kind::Discord, &cookie, &st, "code", Some((&u, &stale.info))).await, Err(Error::Invalid(_))));
+        let other = make_user(&a, &[]).await;
+        assert!(matches!(a.oauth_finish(&c, Kind::Discord, &cookie, &st, "code", Some((&other, &fresh.info))).await, Err(Error::Forbidden)), "started by u");
+        let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &st, "code", Some((&u, &fresh.info))).await.unwrap();
+        assert!(matches!(out, SocialOutcome::Linked));
+        assert_eq!(a.oauth_linked(u.id).await.unwrap()[0].1.name, "Dee D");
+        let other_s = a.create_session(other.id, "password", true, now, &c).await.unwrap();
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Link, Some(&other), "").unwrap();
+        assert!(
+            matches!(a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", Some((&other, &other_s.info))).await, Err(Error::Invalid(_))),
+            "one identity, one account"
+        );
+        cleanup(&a, &[u.id, other.id], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn a_google_step_up_needs_a_fresh_sign_in_there() {
+        let Some((a, fake)) = setup().await else { return };
+        let c = ctx("203.0.113.102");
+        let sub = unique("g");
+        fake.lock().unwrap().subject = sub.clone();
+        let u = make_user(&a, &[]).await;
+        let s = a.create_session(u.id, "password", true, util::now(), &c).await.unwrap();
+        let (url, cookie) = a.oauth_begin(Kind::Google, Intent::Link, Some(&u), "").unwrap();
+        fake.lock().unwrap().nonce = param(&url, "nonce");
+        a.oauth_finish(&c, Kind::Google, &cookie, &param(&url, "state"), "code", Some((&u, &s.info))).await.unwrap();
+
+        let (url, cookie) = a.oauth_begin(Kind::Google, Intent::Reauth, Some(&u), "/account/delete").unwrap();
+        assert!(url.contains("max_age=0"));
+        {
+            let mut f = fake.lock().unwrap();
+            f.nonce = param(&url, "nonce");
+            f.auth_time = util::now() - 3600;
+        }
+        let st = param(&url, "state");
+        assert!(matches!(a.oauth_finish(&c, Kind::Google, &cookie, &st, "code", Some((&u, &s.info))).await, Err(Error::Invalid(_))), "an old sign-in");
+        fake.lock().unwrap().auth_time = util::now();
+        let (out, next) = a.oauth_finish(&c, Kind::Google, &cookie, &st, "code", Some((&u, &s.info))).await.unwrap();
+        let SocialOutcome::SteppedUp(up) = out else { panic!("expected a step-up") };
+        assert!(a.fresh(&up.info, util::now()) && next == "/account/delete");
+        cleanup(&a, &[u.id], &[]).await;
+    }
+}

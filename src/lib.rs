@@ -15,6 +15,8 @@ pub mod limit;
 #[cfg(feature = "mysql")]
 pub mod migrate;
 pub mod model;
+#[cfg(feature = "oauth")]
+pub mod oauth;
 pub mod password;
 pub mod pow;
 pub mod qr;
