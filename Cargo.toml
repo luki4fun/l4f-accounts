@@ -33,7 +33,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 tracing = "0.1"
 
 bcrypt = { version = "0.19", optional = true }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-none", "mysql", "derive"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-none", "mysql", "derive", "macros", "migrate"], optional = true }
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"], optional = true }
 axum = { version = "0.8", optional = true }
 askama = { version = "0.16", optional = true }

@@ -50,6 +50,13 @@ const USER_COLS: &str = "id, username, display_name, email, email_pending, passw
      totp_enc IS NOT NULL, status, sync_enabled, created_at";
 
 const SESSION_COLS: &str = "token_hash, user_id, created_at, seen_at, expires_at, auth_at, mfa_ok, method, ip, ua";
+/// Signed-in sessions kept per account; the oldest go first.
+pub const MAX_SESSIONS: u32 = 50;
+/// Sessions waiting for a second factor kept per account.
+pub const MAX_PENDING: u32 = 10;
+/// The export holds the newest this many audit rows, so one request cannot
+/// pull an unbounded trail into memory.
+const EXPORT_AUDIT_ROWS: u32 = 10_000;
 
 /// One row per scope, ordered by role then scope; a role without scopes still
 /// gets one row (NULL scope) from the LEFT JOIN.
@@ -210,9 +217,14 @@ async fn insert_scopes(c: &mut MySqlConnection, role: AccountId, scopes: &[Strin
 
 impl Store {
     /// A transaction for composing with `delete_user`, isolated the way the
-    /// last-admin guard needs (see `BEGIN_GUARDED`).
+    /// last-admin guard needs (see `BEGIN_GUARDED`), and holding the guard's
+    /// locks from the start. The caller's own writes come before
+    /// `delete_user`'s count; had they locked an admin's row first, two admins
+    /// deleting each other would each hold a row the other's count waits on.
     pub async fn begin(&self) -> sqlx::Result<Transaction<'static, MySql>> {
-        self.0.begin_with(BEGIN_GUARDED).await
+        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
+        star_holders_locked(&mut tx).await?;
+        Ok(tx)
     }
 
     // ------------------------------------------------------------------ users
@@ -392,9 +404,16 @@ impl Store {
 
     // --------------------------------------------------------------- sessions
 
+    /// Inserts only for an active account: a login still in flight when the
+    /// account is disabled or deleted gets `RowNotFound`, not a session. Keeps
+    /// the newest `MAX_SESSIONS` signed-in sessions per account (and
+    /// `MAX_PENDING` waiting for a second factor), so a script that logs in in a
+    /// loop cannot grow the table without bound. Pending sessions never push
+    /// out signed-in ones: knowing the password alone must not sign the owner out.
     pub async fn insert_session(&self, s: &SessionInfo) -> sqlx::Result<()> {
-        sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO acct_sessions ({SESSION_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        let n = sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO acct_sessions ({SESSION_COLS})
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM acct_users WHERE id = ? AND status = ?"
         )))
         .bind(&s.token_hash[..])
         .bind(&s.user_id.0[..])
@@ -406,9 +425,31 @@ impl Store {
         .bind(&s.method)
         .bind(&s.ip)
         .bind(clip(&s.ua, 256))
+        .bind(&s.user_id.0[..])
+        .bind(UserStatus::Active as i8)
         .execute(&self.0)
-        .await
-        .map(|_| ())
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        // Found by a plain read and deleted by primary key: a DELETE ranging
+        // over the user_id index takes gap locks that deadlock with other
+        // accounts' logins. Two racing logins may leave one extra row until
+        // the next one.
+        let over: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT token_hash FROM acct_sessions WHERE user_id = ? AND mfa_ok = ?
+              ORDER BY seen_at DESC, created_at DESC LIMIT ?, 1000",
+        )
+        .bind(&s.user_id.0[..])
+        .bind(s.mfa_ok)
+        .bind(if s.mfa_ok { MAX_SESSIONS } else { MAX_PENDING })
+        .fetch_all(&self.0)
+        .await?;
+        for h in over {
+            sqlx::query("DELETE FROM acct_sessions WHERE token_hash = ?").bind(h).execute(&self.0).await?;
+        }
+        Ok(())
     }
 
     /// Absolute expiry only; the idle limit is config, so the service checks
@@ -497,13 +538,24 @@ impl Store {
     /// One batch; the sweeper loops while a call returns a full one. Small
     /// batches keep each lock short.
     pub async fn delete_expired_sessions(&self, now: i64, idle_secs: i64, batch: u64) -> sqlx::Result<u64> {
-        let r = sqlx::query("DELETE FROM acct_sessions WHERE expires_at < ? OR seen_at < ? LIMIT ?")
+        // Two statements, one index each: an OR across both columns scanned and
+        // locked the whole table on every batch.
+        let expired = sqlx::query("DELETE FROM acct_sessions WHERE expires_at < ? LIMIT ?")
             .bind(now)
-            .bind(now - idle_secs)
             .bind(batch)
             .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected())
+            .await?
+            .rows_affected();
+        if expired >= batch {
+            return Ok(expired);
+        }
+        let idle = sqlx::query("DELETE FROM acct_sessions WHERE seen_at < ? LIMIT ?")
+            .bind(now - idle_secs)
+            .bind(batch - expired)
+            .execute(&self.0)
+            .await?
+            .rows_affected();
+        Ok(expired + idle)
     }
 
     // ------------------------------------------------------------------ roles
@@ -734,7 +786,7 @@ impl Store {
     // ----------------------------------------------------------------- export
 
     /// The GDPR download: the account row, roles, sessions, sign-in methods
-    /// and the audit rows about the account (as `audit_of` shows them). No
+    /// and the newest audit rows about the account (as `audit_of` shows them). No
     /// secrets and nothing that works as a credential: no password hash, TOTP
     /// secret, session hashes, recovery hashes or public keys. Not in it: audit
     /// rows where this account acted on another one, which sit in that
@@ -774,13 +826,13 @@ impl Store {
             "roles": self.user_roles(id).await?,
             "sessions": self.sessions_of(id).await?,
             "credentials": credentials,
-            "audit": self.audit_of(id, u32::MAX).await?,
+            "audit": self.audit_of(id, EXPORT_AUDIT_ROWS).await?,
         })))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::migrate;
     use sqlx::mysql::MySqlConnectOptions;
@@ -788,23 +840,23 @@ mod tests {
     /// The shared test database. Tests run in parallel against it, so every
     /// name carries a random suffix, nothing grants `*`, and nothing counts
     /// rows across the whole schema.
-    async fn shared() -> Option<Store> {
+    pub(crate) async fn shared() -> Option<Store> {
         let url = std::env::var("L4F_TEST_DATABASE_URL").ok()?;
         let pool = MySqlPool::connect(&url).await.expect("L4F_TEST_DATABASE_URL does not connect");
-        migrate::run(&pool, "acct", migrate::ACCOUNTS).await.unwrap();
+        migrate::run(&pool).await.unwrap();
         Some(Store(pool))
     }
 
     /// A database of its own (`l4f_test_<hex>`), for tests about global state:
     /// who holds `*`, how many rows a sweep removes. `done` drops it; a failed
     /// test leaves it behind on the throwaway server.
-    struct Fresh {
-        store: Store,
+    pub(crate) struct Fresh {
+        pub(crate) store: Store,
         name: String,
         opts: MySqlConnectOptions,
     }
 
-    async fn fresh() -> Option<Fresh> {
+    pub(crate) async fn fresh() -> Option<Fresh> {
         let url = std::env::var("L4F_TEST_DATABASE_URL").ok()?;
         let opts: MySqlConnectOptions = url.parse().expect("L4F_TEST_DATABASE_URL does not parse");
         let name = format!("l4f_test_{}", hex::encode(util::random::<6>()));
@@ -812,12 +864,12 @@ mod tests {
         sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE `{name}`"))).execute(&mut c).await.unwrap();
         let _ = c.close().await;
         let pool = MySqlPool::connect_with(opts.clone().database(&name)).await.unwrap();
-        migrate::run(&pool, "acct", migrate::ACCOUNTS).await.unwrap();
+        migrate::run(&pool).await.unwrap();
         Some(Fresh { store: Store(pool), name, opts })
     }
 
     impl Fresh {
-        async fn done(self) {
+        pub(crate) async fn done(self) {
             self.store.0.close().await;
             let mut c = MySqlConnection::connect_with(&self.opts).await.unwrap();
             sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE `{}`", self.name))).execute(&mut c).await.unwrap();
@@ -1009,6 +1061,32 @@ mod tests {
         for id in ids {
             delete(&s, id).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn sessions_are_capped_and_never_land_on_a_disabled_account() {
+        let Some(s) = shared().await else { return };
+        let u = make_user(&s, None).await;
+        let now = util::now();
+        let mut full = Vec::new();
+        for i in 0..MAX_SESSIONS as i64 + 3 {
+            let mut x = sess(u, now - 1000 + i, now - 1000 + i, now + 100);
+            x.mfa_ok = true;
+            s.insert_session(&x).await.unwrap();
+            full.push(x.token_hash);
+        }
+        for i in 0..MAX_PENDING as i64 + 3 {
+            s.insert_session(&sess(u, now + i, now + i, now + 100)).await.unwrap();
+        }
+        let left = s.sessions_of(u).await.unwrap();
+        assert_eq!(left.iter().filter(|x| x.mfa_ok).count(), MAX_SESSIONS as usize, "the oldest signed-in ones went");
+        assert_eq!(left.iter().filter(|x| !x.mfa_ok).count(), MAX_PENDING as usize, "pending ones did not push them out");
+        assert!(left.iter().any(|x| x.token_hash == full[full.len() - 1]) && !left.iter().any(|x| x.token_hash == full[0]));
+
+        assert!(s.set_status(u, UserStatus::Disabled).await.unwrap());
+        let late = sess(u, now, now, now + 100);
+        assert!(matches!(s.insert_session(&late).await, Err(sqlx::Error::RowNotFound)), "a login in flight gets no session");
+        assert!(s.session_by_hash(&late.token_hash, now).await.unwrap().is_none());
     }
 
     #[tokio::test]

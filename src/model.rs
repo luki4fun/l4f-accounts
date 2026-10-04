@@ -104,7 +104,7 @@ pub struct Role {
     pub scopes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SessionInfo {
     /// SHA-256 of the cookie value. Skipped in JSON: it names the session in the
     /// owner's revoke URL and has no business anywhere else.
@@ -120,6 +120,23 @@ pub struct SessionInfo {
     pub method: String,
     pub ip: String,
     pub ua: String,
+}
+
+/// By hand, to leave `token_hash` out of logs.
+impl std::fmt::Debug for SessionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionInfo")
+            .field("user_id", &self.user_id)
+            .field("created_at", &self.created_at)
+            .field("seen_at", &self.seen_at)
+            .field("expires_at", &self.expires_at)
+            .field("auth_at", &self.auth_at)
+            .field("mfa_ok", &self.mfa_ok)
+            .field("method", &self.method)
+            .field("ip", &self.ip)
+            .field("ua", &self.ua)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

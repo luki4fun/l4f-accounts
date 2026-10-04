@@ -14,5 +14,6 @@ CREATE TABLE IF NOT EXISTS acct_sessions (
   PRIMARY KEY (token_hash),
   KEY user_id (user_id),
   KEY expires_at (expires_at),
+  KEY seen_at (seen_at),
   CONSTRAINT acct_sessions_user FOREIGN KEY (user_id) REFERENCES acct_users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
