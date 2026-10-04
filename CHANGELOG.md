@@ -3,6 +3,18 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.6.0 (2026-10-04)
+
+Storage. No new migrations (acct_blobs existed since 0008).
+
+- Synced settings (`/account/api/kv`, `assets/sync.js`, `/account/sync`) and the
+  end-to-end encrypted vault (`/account/api/vault`, `/account/vault`,
+  `assets/vault.js`), compare-and-set, under `storage_quota_bytes` (1 MiB).
+- docs/vault-format.md with `tests/vault_vectors.rs` (vectors made by vault.js).
+- `default_user_scopes` defaults to storage:sync, vault:use, profile:public
+  (**BREAKING** for hosts that relied on the empty default).
+- `migrate::lock` / `unlock` are public, for a host's own tables.
+
 ## v0.5.0 (2026-10-04)
 
 Social sign-in. No new migrations.
