@@ -40,10 +40,16 @@ impl Host for T {
     async fn delete_user(&self, _: crate::store::StoreConn<'_>, _: AccountId, _: bool) -> sqlx::Result<()> {
         Ok(())
     }
+
+    async fn profile_links(&self, _: AccountId) -> Vec<(String, String)> {
+        ["https://l4f.cc/abc", "/x", "javascript:alert(1)", "data:text/html,hi"].map(|u| (u.to_string(), u.to_string())).to_vec()
+    }
 }
 
 impl WebHost for T {
+    /// The title is plain text, escaped here as a host must.
     fn page(&self, _: &HeaderMap, title: &str, body: String) -> Response {
+        let title = title.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
         Html(format!("<title>{title}</title>{body}")).into_response()
     }
 }
@@ -283,6 +289,18 @@ fn crate_cookies_take_prefix_and_secure_together() {
     assert_eq!(cookie_out(&off, SYNC_COOKIE, "1", 60, false), "acct-sync=1; Path=/; SameSite=Lax; Max-Age=60");
     let h: HeaderMap = [(header::COOKIE, "acct-ch=plain; __Host-acct-ch=host".parse().unwrap())].into_iter().collect();
     assert_eq!((cookie_in(&on, &h, CHALLENGE_COOKIE), cookie_in(&off, &h, CHALLENGE_COOKIE)), (Some("host"), Some("plain")));
+}
+
+#[tokio::test]
+async fn every_script_is_javascript_and_nosniff() {
+    let (app, _) = app(nowhere(), cfg());
+    for js in ["passkey", "devkey", "avatar", "sync", "vault"] {
+        let r = send(&app, get(&format!("/account/assets/{js}.js"), None)).await;
+        assert_eq!(r.status(), StatusCode::OK, "{js}");
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "text/javascript; charset=utf-8");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{js}");
+    }
 }
 
 /// Every refusal shown goes through `status_of` once: a database error is
@@ -1165,10 +1183,18 @@ async fn the_public_profile_is_private_noindex_and_its_avatar_sandboxed() {
     let r = send(&app, post("/account/profile", &format!("csrf={t}&_action=save&on=1&bio=Hi+there&show_badges=1"), Some(&c))).await;
     assert!(location(&r).starts_with("/account/profile?ok=Profile+saved."));
     let id = crate::service::uuid_of(&a.store.profile(u.id).await.unwrap().public_id.unwrap());
+    // A display name may hold markup characters; the page title is not the
+    // place for the owner's text (ADMIN-1).
+    a.store.set_display_name(u.id, "</title><b>Dee").await.unwrap();
     let r = send(&app, get(&format!("/profile/{id}"), None)).await;
     assert_eq!(r.status(), StatusCode::OK);
     assert_eq!((r.headers()["x-robots-tag"].to_str().unwrap(), r.headers()[header::CACHE_CONTROL].to_str().unwrap()), ("noindex, nofollow", "private, no-store"));
-    assert!(text(r).await.contains("Hi there"));
+    let page = text(r).await;
+    assert!(page.contains("Hi there") && page.starts_with("<title>Profile</title>"));
+    assert!(page.matches("</title>").count() == 1 && page.contains("Dee") && !page.contains("<b>"), "the name, escaped in the body");
+    // The host's links: web ones only (ADMIN-8).
+    assert!(page.contains(r#"href="https://l4f.cc/abc""#) && page.contains(r#"href="/x""#));
+    assert!(!page.contains("javascript:") && !page.contains("data:text"), "{page}");
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend([0u8; 32]);
     let r = send(&app, put_raw("/account/api/avatar", png, "image/png", &c, Some(&t), 0)).await;

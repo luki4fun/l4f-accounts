@@ -34,6 +34,8 @@ pub use storage::Put;
 pub use social::{Intent, OAuth, SocialOutcome};
 #[cfg(feature = "axum")]
 pub(crate) use auth::token_hash;
+#[cfg(feature = "axum")]
+pub(crate) use profile::provider_label;
 
 use std::{future::Future, net::IpAddr, sync::Arc, time::Duration};
 

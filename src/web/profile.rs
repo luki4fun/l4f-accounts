@@ -17,7 +17,7 @@ use serde::Deserialize;
 use super::flash::{self, Flash};
 use super::storage::Api;
 use super::{Authed, BASE, St, WebHost, json_ok, json_refused, page, refused};
-use crate::service::{Accounts, Ctx, Error, uuid_of};
+use crate::service::{Accounts, Ctx, Error, provider_label, uuid_of};
 use crate::util;
 
 const PROFILE_PAGE: &str = "/account/profile";
@@ -53,9 +53,7 @@ pub(super) async fn settings<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderM
     for kind in ["oauth:discord", "oauth:google", "oauth:facebook"] {
         let Ok(creds) = a.store.credentials_of(me.user.id, kind).await else { continue };
         for c in creds {
-            let label = kind.trim_start_matches("oauth:");
-            let label = format!("{}{}", label[..1].to_uppercase(), &label[1..]);
-            identities.push(IdentityRow { kind: kind.into(), id: util::b64u(&c.ext_id), label, name: c.name, public: c.public });
+            identities.push(IdentityRow { kind: kind.into(), id: util::b64u(&c.ext_id), label: provider_label(kind), name: c.name, public: c.public });
         }
     }
     let avatar = a.avatar(me.user.id).await.ok().flatten().is_some();
@@ -114,8 +112,7 @@ pub(super) async fn avatar_put<H: WebHost>(State(a): St<H>, Api(me): Api, ctx: C
 }
 
 pub(super) async fn avatar_script() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], include_str!("../../assets/avatar.js"))
-        .into_response()
+    super::script(include_str!("../../assets/avatar.js"))
 }
 
 // ---- the public profile
@@ -151,7 +148,7 @@ async fn public_page<H: WebHost>(State(a): St<H>, h: HeaderMap, Path(id): Path<S
         Ok(None) => return private(super::error_page(&a, &h, StatusCode::NOT_FOUND, "No such profile.")),
         Err(e) => return refused(&a, &h, &e),
     };
-    let links = a.host.profile_links(p.user).await;
+    let links: Vec<_> = a.host.profile_links(p.user).await.into_iter().filter(|(_, url)| web_link(url)).collect();
     let t = PublicTpl {
         link: &id,
         name: &p.display_name,
@@ -161,7 +158,15 @@ async fn public_page<H: WebHost>(State(a): St<H>, h: HeaderMap, Path(id): Path<S
         links: &links,
         avatar: p.avatar,
     };
-    private(page(&a, &h, &p.display_name, StatusCode::OK, &t))
+    // A fixed title: the name is the owner's to choose, and a host that put
+    // the title in its page unescaped would run the owner's markup.
+    private(page(&a, &h, "Profile", StatusCode::OK, &t))
+}
+
+/// `https://`, `http://` or a path on this site. Escaping keeps a link inside
+/// its `href`, but a `javascript:` or `data:` one would still run when clicked.
+fn web_link(url: &str) -> bool {
+    ["https://", "http://", "/"].iter().any(|p| url.starts_with(p))
 }
 
 /// The image alone in a sandbox: it can run nothing and be embedded nowhere else.

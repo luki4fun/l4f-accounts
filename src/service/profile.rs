@@ -5,9 +5,9 @@
 //! owner chose: display name, avatar, bio, role badges, the linked identities
 //! marked public, and whatever public links the host adds.
 
-use super::{Accounts, Ctx, Error, Host};
+use super::{Accounts, Ctx, Error, Host, Put, need};
 use crate::model::{AccountId, User, UserStatus};
-use crate::store::{Profile, PutBlob};
+use crate::store::Profile;
 use crate::{scope, util};
 
 pub const AVATAR_MAX: usize = 64 * 1024;
@@ -55,7 +55,7 @@ fn clean_bio(raw: &str) -> Result<String, Error> {
     if bio.chars().nth(1000).is_some() {
         return Err(Error::Invalid("Keep the bio to 1000 characters or fewer."));
     }
-    if bio.chars().any(|c| (c.is_control() && c != '\n') || matches!(c, '\u{2028}' | '\u{2029}') || scope::invisible(c)) {
+    if bio.chars().any(|c| c != '\n' && scope::breaks_text(c)) {
         return Err(Error::Invalid("The bio cannot contain control, invisible or text-direction characters."));
     }
     Ok(bio.to_string())
@@ -72,7 +72,7 @@ pub fn image_type(b: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn provider_label(kind: &str) -> String {
+pub(crate) fn provider_label(kind: &str) -> String {
     match kind.strip_prefix("oauth:").unwrap_or(kind) {
         "discord" => "Discord".into(),
         "google" => "Google".into(),
@@ -89,8 +89,8 @@ impl<H: Host> Accounts<H> {
     /// Turning it on needs `profile:public` and makes a link if there is none;
     /// turning it off drops the link, so turning it on again makes a new one.
     pub async fn profile_save(&self, ctx: &Ctx, user: &User, scopes: &[String], on: bool, bio: &str, show_badges: bool) -> Result<(), Error> {
-        if on && !scope::allowed(scopes, "profile:public") {
-            return Err(Error::Forbidden);
+        if on {
+            need(scopes, "profile:public")?;
         }
         let mut p = self.store.profile(user.id).await?;
         p.bio = clean_bio(bio)?;
@@ -101,7 +101,7 @@ impl<H: Host> Accounts<H> {
             (true, None) => Some(new_public_id()),
         };
         self.store.save_profile(user.id, &p, util::now()).await?;
-        self.audit(ctx, Some(user.id), Some(user.id), "profile_save", if on { "on" } else { "off" }).await?;
+        self.audit_after(ctx, Some(user.id), Some(user.id), "profile_save", if on { "on" } else { "off" }).await;
         Ok(())
     }
 
@@ -113,7 +113,7 @@ impl<H: Host> Accounts<H> {
         }
         p.public_id = Some(new_public_id());
         self.store.save_profile(user.id, &p, util::now()).await?;
-        self.audit(ctx, Some(user.id), Some(user.id), "profile_rotate", "").await?;
+        self.audit_after(ctx, Some(user.id), Some(user.id), "profile_rotate", "").await;
         Ok(())
     }
 
@@ -145,19 +145,15 @@ impl<H: Host> Accounts<H> {
 
     /// Replaces the avatar: PNG or WebP, at most 64 KiB, in the storage quota.
     pub async fn avatar_put(&self, ctx: &Ctx, user: &User, scopes: &[String], bytes: &[u8]) -> Result<(), Error> {
-        if !scope::allowed(scopes, "profile:public") {
-            return Err(Error::Forbidden);
-        }
+        need(scopes, "profile:public")?;
         if bytes.len() > AVATAR_MAX || image_type(bytes).is_none() {
             return Err(Error::Invalid("An avatar is a PNG or WebP image of at most 64 KiB."));
         }
         let expect = self.store.blob(user.id, AVATAR_NS, AVATAR_K).await?.map_or(0, |b| b.version);
-        match self.store.put_blob(user.id, AVATAR_NS, AVATAR_K, bytes, expect, self.host.config().storage_quota_bytes).await? {
-            PutBlob::Done(_) => {}
-            PutBlob::Conflict => return Err(Error::Invalid("It changed meanwhile. Try again.")),
-            PutBlob::Quota => return Err(Error::Invalid("Your storage is full.")),
+        if let Put::Conflict(_) = self.put(user, AVATAR_NS, AVATAR_K, bytes, expect, None).await? {
+            return Err(Error::Invalid("It changed meanwhile. Try again."));
         }
-        self.audit(ctx, Some(user.id), Some(user.id), "avatar", "").await?;
+        self.audit_after(ctx, Some(user.id), Some(user.id), "avatar", "").await;
         Ok(())
     }
 
