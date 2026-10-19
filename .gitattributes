@@ -1,0 +1,3 @@
+# sqlx checksums each migration's bytes: a CRLF checkout would refuse a
+# database that an LF build migrated, and the other way round.
+migrations/** -text

@@ -18,25 +18,25 @@ use crate::store::{Store, StoreConn};
 /// Bring the schema up to date. Concurrent boots wait on the boot lock. An
 /// older binary against a newer schema fails with `VersionMissing`.
 ///
-/// Runs on a connection taken out of the pool for good: the pool may cap every
-/// statement, which would also cut off DDL on a big table, and the lifted caps
-/// must not leak into a connection a request reuses.
+/// Runs on the boot lock's connection, without the pool's statement caps (see
+/// `lock`). SQLite must enforce foreign keys, or this refuses: deleting an
+/// account or a role is one DELETE that relies on ON DELETE CASCADE, which
+/// SQLite skips without a word when a pool turned them off.
 pub async fn run(store: &Store) -> Result<(), MigrateError> {
     let mut held = lock(store).await?;
     let r = match held.conn() {
         #[cfg(feature = "mysql")]
-        StoreConn::My(conn) => {
-            // MariaDB only; MySQL has no such variable and the default there is no cap.
-            let _ = sqlx::query("SET SESSION max_statement_time = 0").execute(&mut *conn).await;
-            // An ALTER waiting on a metadata lock blocks every later query on its table;
-            // the server default lets that last a year.
-            let _ = sqlx::query("SET SESSION lock_wait_timeout = 60").execute(&mut *conn).await;
-            ours(sqlx::migrate!("migrations/mysql")).run(conn).await
-        }
+        StoreConn::My(conn) => ours(sqlx::migrate!("migrations/mysql")).run(conn).await,
         #[cfg(feature = "postgres")]
         StoreConn::Pg(conn) => ours(sqlx::migrate!("migrations/postgres")).run(conn).await,
         #[cfg(feature = "sqlite")]
-        StoreConn::Lite(conn) => ours(sqlx::migrate!("migrations/sqlite")).run(conn).await,
+        StoreConn::Lite(conn) => match sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys").fetch_one(&mut *conn).await {
+            Ok(1) => ours(sqlx::migrate!("migrations/sqlite")).run(conn).await,
+            Ok(_) => Err(MigrateError::Execute(sqlx::Error::Configuration(
+                "SQLite foreign keys are off, and deleting an account or a role relies on ON DELETE CASCADE".into(),
+            ))),
+            Err(e) => Err(e.into()),
+        },
     };
     unlock(held).await;
     r
@@ -61,7 +61,8 @@ pub enum BootLock {
     #[cfg(feature = "postgres")]
     Pg(sqlx::PgConnection),
     /// SQLite has no named locks: an exclusive lock on `<database>.lock` next
-    /// to the file (none for an in-memory database, which one process owns).
+    /// to the file. Always `Some`: an in-memory or temporary database, which
+    /// had none, is refused (it would die with the lock's connection).
     #[cfg(feature = "sqlite")]
     Lite(sqlx::SqliteConnection, Option<std::fs::File>),
 }
@@ -87,24 +88,42 @@ const PG_BOOT_KEY: i64 = 0x6c34_665f_626f_6f74;
 /// Waits as long as the holder needs: a long migration on another instance is
 /// not an error. Named per database: GET_LOCK names are server-wide, and a test
 /// database on the same server must not wait for production's boot.
+///
+/// The connection leaves the pool for good, with the pool's statement caps
+/// lifted before the wait: a cap would cut off the wait and the DDL under the
+/// lock (a migration, a host's own tables), and the lifted caps must not leak
+/// into a connection a request reuses.
 pub async fn lock(store: &Store) -> sqlx::Result<BootLock> {
     match store {
         #[cfg(feature = "mysql")]
         Store::My(s) => {
             let mut conn = s.0.acquire().await?.detach();
+            // MariaDB only; MySQL has no such variable and the default there is no cap.
+            let _ = sqlx::query("SET SESSION max_statement_time = 0").execute(&mut conn).await;
+            // An ALTER waiting on a metadata lock blocks every later query on its table;
+            // the server default lets that last a year.
+            let _ = sqlx::query("SET SESSION lock_wait_timeout = 60").execute(&mut conn).await;
             loop {
                 let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(CONCAT(DATABASE(), '.l4f_boot'), 30)")
                     .fetch_one(&mut conn)
                     .await?;
-                if got == Some(1) {
-                    return Ok(BootLock::My(conn));
+                match got {
+                    Some(1) => return Ok(BootLock::My(conn)),
+                    Some(_) => tracing::warn!(target: "accounts", "another process holds the boot lock; still waiting"),
+                    // Not a wait: MariaDB answers a NULL name (no database
+                    // selected) with NULL at once, and looping would spin.
+                    None => {
+                        return Err(sqlx::Error::Configuration(
+                            "the boot lock's GET_LOCK answered NULL: no database selected (none in the URL?)".into(),
+                        ));
+                    }
                 }
-                tracing::warn!(target: "accounts", "another process holds the boot lock; still waiting");
             }
         }
         #[cfg(feature = "postgres")]
         Store::Pg(s) => {
             let mut conn = s.0.acquire().await?.detach();
+            sqlx::query("SET statement_timeout = 0").execute(&mut conn).await?;
             let mut waited = 0u32;
             loop {
                 let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)").bind(PG_BOOT_KEY).fetch_one(&mut conn).await?;
@@ -120,20 +139,34 @@ pub async fn lock(store: &Store) -> sqlx::Result<BootLock> {
         }
         #[cfg(feature = "sqlite")]
         Store::Lite(s) => {
-            let path = s.0.connect_options().get_filename().to_path_buf();
-            let file = if path.as_os_str().is_empty() || path.to_string_lossy().starts_with("file:") || path.as_os_str() == ":memory:" {
-                None
-            } else {
-                let mut lock_path = path.into_os_string();
-                lock_path.push(".lock");
-                let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)?;
-                let f = tokio::task::spawn_blocking(move || f.lock().map(|()| f))
-                    .await
-                    .map_err(|e| sqlx::Error::Io(std::io::Error::other(e)))??;
-                Some(f)
-            };
+            // SQLite's own answer, whatever the URL or options said: the full
+            // path, or "" for an in-memory or temporary database.
+            let path: String = sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'").fetch_one(&s.0).await?;
+            if path.is_empty() {
+                return Err(sqlx::Error::Configuration(
+                    "in-memory and temporary SQLite databases are not supported: the boot lock takes a connection \
+                     out of the pool for good, and such a database dies with it"
+                        .into(),
+                ));
+            }
+            let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(format!("{path}.lock"))?;
+            // Polled, not a blocking wait: a caller that gives up (a timeout)
+            // leaves no thread behind to take the lock later.
+            let mut waited = 0u32;
+            loop {
+                match f.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+                }
+                waited += 1;
+                if waited.is_multiple_of(30) {
+                    tracing::warn!(target: "accounts", "another process holds the boot lock; still waiting");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
             let conn = s.0.acquire().await?.detach();
-            Ok(BootLock::Lite(conn, file))
+            Ok(BootLock::Lite(conn, Some(f)))
         }
     }
 }
@@ -200,5 +233,91 @@ mod tests {
         unlock(held).await;
         let again = tokio::time::timeout(std::time::Duration::from_secs(5), lock(&store)).await;
         unlock(again.expect("free again after unlock").unwrap()).await;
+    }
+
+    /// A pool that caps every statement, as the l4f host's does: the lock's
+    /// connection runs without the cap, the wait included, and the pool
+    /// keeps it.
+    #[tokio::test]
+    async fn the_boot_lock_lifts_the_pools_statement_cap() {
+        let Some(store) = shared().await else { return };
+        match store {
+            #[cfg(feature = "mysql")]
+            Store::My(_) => {
+                let pool = sqlx::mysql::MySqlPoolOptions::new()
+                    .after_connect(|c, _| Box::pin(async move { sqlx::query("SET SESSION max_statement_time = 10").execute(c).await.map(|_| ()) }))
+                    .connect(&std::env::var("L4F_TEST_DATABASE_URL").unwrap())
+                    .await
+                    .unwrap();
+                let cap = "SELECT CAST(@@max_statement_time AS SIGNED)";
+                let mut held = lock(&Store::from(pool.clone())).await.unwrap();
+                let lifted: i64 = match held.conn() {
+                    StoreConn::My(c) => sqlx::query_scalar(cap).fetch_one(c).await.unwrap(),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!(),
+                };
+                unlock(held).await;
+                assert_eq!(lifted, 0);
+                assert_eq!(sqlx::query_scalar::<_, i64>(cap).fetch_one(&pool).await.unwrap(), 10, "the pool keeps its cap");
+                pool.close().await;
+            }
+            #[cfg(feature = "postgres")]
+            Store::Pg(_) => {
+                let opts: sqlx::postgres::PgConnectOptions = std::env::var("L4F_TEST_DATABASE_URL").unwrap().parse().unwrap();
+                let pool = sqlx::PgPool::connect_with(opts.options([("statement_timeout", "10s")])).await.unwrap();
+                let cap = "SELECT current_setting('statement_timeout')";
+                let mut held = lock(&Store::from(pool.clone())).await.unwrap();
+                let lifted: String = match held.conn() {
+                    StoreConn::Pg(c) => sqlx::query_scalar(cap).fetch_one(c).await.unwrap(),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!(),
+                };
+                unlock(held).await;
+                assert_eq!(lifted, "0");
+                assert_eq!(sqlx::query_scalar::<_, String>(cap).fetch_one(&pool).await.unwrap(), "10s", "the pool keeps its cap");
+                pool.close().await;
+            }
+            // SQLite has no statement cap to lift.
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
+    /// Without a database in the URL, MariaDB answers GET_LOCK with NULL at
+    /// once: an error, not a wait that spins.
+    #[cfg(feature = "mysql")]
+    #[tokio::test]
+    async fn mysql_boot_lock_without_a_database_is_an_error() {
+        let Some(Store::My(_)) = shared().await else { return };
+        let url = std::env::var("L4F_TEST_DATABASE_URL").unwrap();
+        let (server, _db) = url.split('?').next().unwrap().rsplit_once('/').unwrap();
+        let store = Store::connect(server).await.unwrap();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), lock(&store)).await.expect("an answer, not a wait");
+        let Err(e) = r else { panic!("a lock without a database") };
+        assert!(matches!(e, sqlx::Error::Configuration(_)), "{e}");
+        store.close().await;
+    }
+
+    /// What SQLite cannot keep: an in-memory or temporary database dies with
+    /// the lock's connection, and with foreign keys off a deletion leaves the
+    /// account's rows behind.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_without_a_file_or_foreign_keys_is_refused() {
+        for url in ["sqlite::memory:", "sqlite://?mode=memory", "sqlite://"] {
+            let store = Store::connect(url).await.unwrap();
+            let e = run(&store).await.unwrap_err();
+            assert!(e.to_string().contains("in-memory and temporary"), "{url}: {e}");
+            store.close().await;
+        }
+        let path = std::env::temp_dir().join(format!("l4f_fk_{}.db", hex::encode(crate::util::random::<6>())));
+        let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true).foreign_keys(false);
+        let store = Store::from(sqlx::SqlitePool::connect_with(opts).await.unwrap());
+        let e = run(&store).await.unwrap_err();
+        assert!(e.to_string().contains("foreign keys are off"), "{e}");
+        store.close().await;
+        for suffix in ["", "-wal", "-shm", ".lock"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
