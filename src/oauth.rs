@@ -12,7 +12,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -190,7 +189,7 @@ pub fn authorize_url(p: &Provider, redirect_uri: &str, f: &Flow, reauth: bool) -
             }
         }
         Kind::Google => {
-            q.push(("scope", "openid profile email".into()));
+            q.push(("scope", "openid profile".into()));
             q.push(("nonce", f.nonce.clone()));
             if reauth {
                 q.push(("prompt", "login".into()));
@@ -208,13 +207,19 @@ pub fn authorize_url(p: &Provider, redirect_uri: &str, f: &Flow, reauth: bool) -
     format!("{}?{}", p.authorize_url, qs.join("&"))
 }
 
+/// A transport error without the URL reqwest prints with it: Facebook's
+/// calls carry the app secret, the code and the access token in the query.
+fn net(e: reqwest::Error) -> OAuthError {
+    OAuthError::Http(e.without_url().to_string())
+}
+
 async fn body(r: reqwest::Response) -> Result<Vec<u8>, OAuthError> {
     if !r.status().is_success() {
         return Err(OAuthError::Status(r.status().as_u16()));
     }
     let mut r = r;
     let mut out = Vec::new();
-    while let Some(chunk) = r.chunk().await.map_err(|e| OAuthError::Http(e.to_string()))? {
+    while let Some(chunk) = r.chunk().await.map_err(net)? {
         out.extend_from_slice(&chunk);
         if out.len() > MAX_BODY {
             return Err(OAuthError::Malformed);
@@ -277,13 +282,14 @@ fn google_identity(p: &Provider, id_token: &str, nonce: &str, now: i64) -> Resul
         return Err(OAuthError::Claim("nonce"));
     }
     let email = c.email.filter(|_| c.email_verified == Some(true));
-    Ok(Identity { handle: c.name.or_else(|| email.clone()).unwrap_or_default(), subject: c.sub, email, auth_time: c.auth_time })
+    // The name only: a handle may become a public display name, which an
+    // address must never be.
+    Ok(Identity { handle: c.name.unwrap_or_default(), subject: c.sub, email, auth_time: c.auth_time })
 }
 
 /// The code for an identity: token endpoint, then the profile where the
 /// provider needs one. The tokens go out of scope here.
 pub async fn exchange(http: &reqwest::Client, p: &Provider, code: &str, redirect_uri: &str, f: &Flow) -> Result<Identity, OAuthError> {
-    let net = |e: reqwest::Error| OAuthError::Http(e.to_string());
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -307,9 +313,7 @@ pub async fn exchange(http: &reqwest::Client, p: &Provider, code: &str, redirect
         Kind::Facebook => {
             let at = token.access_token.ok_or(OAuthError::Malformed)?;
             // appsecret_proof: a leaked access token alone cannot call the API.
-            let mut mac = Hmac::<Sha256>::new_from_slice(p.client_secret.as_bytes()).expect("any key length");
-            mac.update(at.as_bytes());
-            let proof = hex::encode(mac.finalize().into_bytes());
+            let proof = hex::encode(util::mac_raw(p.client_secret.as_bytes(), at.as_bytes()));
             let q = [("fields", "id,name"), ("access_token", at.as_str()), ("appsecret_proof", proof.as_str())];
             let u: FacebookUser = json(&body(http.get(&p.profile_url).query(&q).send().await.map_err(net)?).await?)?;
             Ok(Identity { handle: u.name.unwrap_or_default(), subject: u.id, email: None, auth_time: None })
@@ -348,6 +352,7 @@ mod tests {
         }
         assert!(u.contains(&format!("code_challenge={}", pkce_challenge(&f.verifier))));
         assert!(!u.contains(&f.verifier), "the verifier never leaves");
+        assert!(u.contains("&scope=openid+profile&"), "no address asked for: {u}");
         let d = authorize_url(&Provider::new(Kind::Discord, "d".into(), "s".into()), "x", &f, false);
         assert!(!d.contains("prompt="));
         let fb = authorize_url(&Provider::new(Kind::Facebook, "f".into(), "s".into()), "x", &f, true);
@@ -376,9 +381,25 @@ mod tests {
             assert_eq!(google_identity(&p, &jwt(bad), "n", 1000), Err(OAuthError::Claim(claim)));
         }
         assert_eq!(google_identity(&p, &jwt(good.clone()), "n", 2000), Err(OAuthError::Claim("exp")));
+        let mut nameless = good.clone();
+        nameless.as_object_mut().unwrap().remove("name");
+        assert_eq!(google_identity(&p, &jwt(nameless), "n", 1000).unwrap().handle, "", "never the address");
         let mut unverified = good;
         unverified["email_verified"] = false.into();
         assert_eq!(google_identity(&p, &jwt(unverified), "n", 1000).unwrap().email, None, "an unverified address is dropped");
         assert_eq!(google_identity(&p, "garbage", "n", 1000), Err(OAuthError::Malformed));
+    }
+
+    /// reqwest prints the URL with a transport error, and Facebook's calls
+    /// carry their secrets in the query.
+    #[tokio::test]
+    async fn a_transport_error_leaves_the_url_out() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // A port nobody listens on any more.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let e = client(None).unwrap().get(format!("https://127.0.0.1:{port}/token?client_secret=hush")).send().await.unwrap_err();
+        assert!(e.to_string().contains("hush"), "the URL, as reqwest prints it");
+        let OAuthError::Http(s) = net(e) else { panic!("a transport error") };
+        assert!(!s.contains("hush") && !s.contains("127.0.0.1"), "{s}");
     }
 }
