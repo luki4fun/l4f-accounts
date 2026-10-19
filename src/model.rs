@@ -166,6 +166,20 @@ impl std::fmt::Debug for SessionInfo {
     }
 }
 
+/// A sign-up invite as the admin list shows it. The code itself is never
+/// stored; `id` is its hash in hex, which names it for revoking.
+#[derive(Clone, Debug, Serialize)]
+pub struct Invite {
+    pub id: String,
+    pub created_by: Option<AccountId>,
+    /// Bound to this name, or `None` for the holder's choice.
+    pub username: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub used_at: Option<i64>,
+    pub used_by: Option<AccountId>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AuditEntry {
     pub id: i64,

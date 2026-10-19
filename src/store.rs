@@ -12,7 +12,7 @@ use sqlx::{AssertSqlSafe, Connection, MySql, MySqlConnection, MySqlPool, Row, Tr
 
 use crate::model::AccountId;
 #[cfg(feature = "mysql")]
-use crate::model::{AuditEntry, Credential, NewUser, Role, SessionInfo, User, UserStatus};
+use crate::model::{AuditEntry, Credential, Invite, NewUser, Role, SessionInfo, User, UserStatus};
 #[cfg(feature = "mysql")]
 use crate::util;
 
@@ -92,6 +92,15 @@ pub struct Profile {
     pub public_id: Option<[u8; 16]>,
     pub bio: String,
     pub show_badges: bool,
+}
+
+/// How `Store::create_user_with_invite` went. Nothing changed unless `Done`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InviteSignup {
+    Done,
+    /// Unknown, used, expired, or bound to another name.
+    BadInvite,
+    UsernameTaken,
 }
 
 /// How `Store::confirm_email` went.
@@ -241,6 +250,19 @@ fn roles_from(rows: Vec<MySqlRow>) -> sqlx::Result<Vec<Role>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(feature = "mysql")]
+fn invite(r: &MySqlRow) -> sqlx::Result<Invite> {
+    Ok(Invite {
+        id: hex::encode(r.try_get::<Vec<u8>, _>(0)?),
+        created_by: opt_id(r.try_get(1)?)?,
+        username: r.try_get(2)?,
+        created_at: r.try_get(3)?,
+        expires_at: r.try_get(4)?,
+        used_at: r.try_get(5)?,
+        used_by: opt_id(r.try_get(6)?)?,
+    })
 }
 
 #[cfg(feature = "mysql")]
@@ -1284,6 +1306,119 @@ impl MySqlStore {
             .execute(&self.0)
             .await?;
         Ok(r.rows_affected())
+    }
+
+    // ---------------------------------------------------------------- invites
+
+    pub async fn insert_invite(&self, code_hash: &[u8; 32], by: Option<AccountId>, username: Option<&str>, expires_at: i64) -> sqlx::Result<()> {
+        sqlx::query("INSERT INTO acct_invites (code_hash, created_by, username, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(&code_hash[..])
+            .bind(by.as_ref().map(|b| &b.0[..]))
+            .bind(username)
+            .bind(util::now())
+            .bind(expires_at)
+            .execute(&self.0)
+            .await
+            .map(|_| ())
+    }
+
+    /// Unexpired ones, used or not, newest first.
+    pub async fn invites(&self, now: i64) -> sqlx::Result<Vec<Invite>> {
+        sqlx::query(
+            "SELECT code_hash, created_by, username, created_at, expires_at, used_at, used_by FROM acct_invites
+              WHERE expires_at > ? ORDER BY created_at DESC, code_hash LIMIT 1000",
+        )
+        .bind(now)
+        .fetch_all(&self.0)
+        .await?
+        .iter()
+        .map(invite)
+        .collect()
+    }
+
+    /// False when there was no such invite.
+    pub async fn delete_invite(&self, code_hash: &[u8; 32]) -> sqlx::Result<bool> {
+        let r = sqlx::query("DELETE FROM acct_invites WHERE code_hash = ?").bind(&code_hash[..]).execute(&self.0).await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    /// One batch of invites past their expiry, used or not.
+    pub async fn delete_expired_invites(&self, now: i64, batch: u64) -> sqlx::Result<u64> {
+        let r = sqlx::query("DELETE FROM acct_invites WHERE expires_at < ? LIMIT ?").bind(now).bind(batch).execute(&self.0).await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Spends the invite and creates the account in one transaction: a name
+    /// that turns out to be taken leaves the code unspent, and two people with
+    /// one code cannot both get in.
+    pub async fn create_user_with_invite(&self, u: &NewUser, role: &str, code_hash: &[u8; 32], now: i64) -> sqlx::Result<InviteSignup> {
+        let mut tx = self.0.begin().await?;
+        let claimed = sqlx::query(
+            "UPDATE acct_invites SET used_at = ?, used_by = ?
+              WHERE code_hash = ? AND used_at IS NULL AND expires_at > ? AND (username IS NULL OR username = ?)",
+        )
+        .bind(now)
+        .bind(&u.id.0[..])
+        .bind(&code_hash[..])
+        .bind(now)
+        .bind(&u.username)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if claimed != 1 {
+            return Ok(InviteSignup::BadInvite);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO acct_users (id, username, display_name, email_pending, password_hash, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&u.id.0[..])
+        .bind(&u.username)
+        .bind(&u.display_name)
+        .bind(&u.email_pending)
+        .bind(&u.password_hash)
+        .bind(u.created_at)
+        .execute(&mut *tx)
+        .await;
+        match inserted {
+            Err(e) if is_dup(&e) => return Ok(InviteSignup::UsernameTaken),
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+        let n = sqlx::query("INSERT INTO acct_user_roles (user_id, role_id, granted_at) SELECT ?, id, ? FROM acct_roles WHERE name = ?")
+            .bind(&u.id.0[..])
+            .bind(u.created_at)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n != 1 {
+            return Err(sqlx::Error::InvalidArgument(format!("no role named {role:?}")));
+        }
+        tx.commit().await?;
+        Ok(InviteSignup::Done)
+    }
+
+    /// Grants `admin` to `user` only while no active account holds `*`, under
+    /// the last-admin guard's locks: two accounts racing for an empty site get
+    /// one admin, not two. False when someone already holds it.
+    pub async fn grant_admin_if_none(&self, user: AccountId) -> Result<bool, WriteError> {
+        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
+        if star_holders_locked(&mut tx).await? > 0 {
+            return Ok(false);
+        }
+        let n = sqlx::query(
+            "INSERT INTO acct_user_roles (user_id, role_id, granted_at)
+             SELECT u.id, r.id, ? FROM acct_users u JOIN acct_roles r ON r.name = 'admin' WHERE u.id = ? AND u.status = ?",
+        )
+        .bind(util::now())
+        .bind(&user.0[..])
+        .bind(UserStatus::Active as i8)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(n == 1)
     }
 
     // ----------------------------------------------------------------- export

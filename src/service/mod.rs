@@ -9,6 +9,7 @@
 mod account;
 mod admin;
 mod auth;
+mod invite;
 #[cfg(feature = "email")]
 mod mail;
 mod keylogin;
@@ -23,6 +24,7 @@ mod tests;
 
 pub use admin::{Actor, RoleForm, UserDetail};
 pub use auth::{LoginStep, NewSession, RegisterForm};
+pub use invite::{InviteForm, MAX_INVITE_DAYS};
 pub use mfa::TotpSetup;
 pub use keylogin::NewDeviceKey;
 pub use passkey::PasskeyFor;
@@ -329,6 +331,7 @@ pub struct Swept {
     pub sessions: u64,
     pub audit: u64,
     pub devkeys: u64,
+    pub invites: u64,
 }
 
 const DAY: i64 = 86_400;
@@ -470,6 +473,30 @@ impl<H: Host> Accounts<H> {
         Ok(held)
     }
 
+    /// Holds a privileged scope that `effective_scopes` withholds for want of
+    /// a second factor: the host should ask the account to enrol one.
+    pub async fn needs_2fa(&self, user: &User) -> sqlx::Result<bool> {
+        let cfg = self.host.config();
+        if !cfg.require_2fa_for_privileged || has_second_factor(user) {
+            return Ok(false);
+        }
+        let held = self.store.user_scopes(user.id).await?;
+        Ok(held.iter().any(|s| !scope::covers(&cfg.default_user_scopes, std::slice::from_ref(s))))
+    }
+
+    /// The first admin from an account that already exists, only while no
+    /// active account holds `*`, atomically under the last-admin guard. The
+    /// host decides who may ask (voipc: whoever knows its admin token). False
+    /// when someone holds `*` already, or the account is not active.
+    pub async fn bootstrap_grant(&self, ctx: &Ctx, user: AccountId) -> Result<bool, Error> {
+        let granted = self.store.grant_admin_if_none(user).await?;
+        if granted {
+            self.audit(ctx, Some(user), None, "bootstrap", "grant").await?;
+            tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "bootstrap", user = %user.hex(), "admin granted");
+        }
+        Ok(granted)
+    }
+
     /// The GDPR download: the store's export, plus the app's entries under `app`
     /// so no app key can shadow one of the crate's.
     pub async fn export(&self, user: AccountId) -> Result<serde_json::Value, Error> {
@@ -525,6 +552,13 @@ impl<H: Host> Accounts<H> {
                 break;
             }
         }
+        loop {
+            let n = self.store.delete_expired_invites(now, SWEEP_BATCH).await?;
+            out.invites += n;
+            if n < SWEEP_BATCH {
+                break;
+            }
+        }
         if cfg.audit_retention_days > 0 {
             loop {
                 let n = self.store.delete_audit_before(now - cfg.audit_retention_days * DAY, SWEEP_BATCH).await?;
@@ -535,7 +569,8 @@ impl<H: Host> Accounts<H> {
             }
         }
         if out != Swept::default() {
-            tracing::info!(target: "accounts", sessions = out.sessions, audit = out.audit, devkeys = out.devkeys, "sweep");
+            tracing::info!(target: "accounts", sessions = out.sessions, audit = out.audit, devkeys = out.devkeys,
+                invites = out.invites, "sweep");
         }
         Ok(out)
     }

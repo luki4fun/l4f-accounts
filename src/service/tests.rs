@@ -728,7 +728,7 @@ async fn sweep_removes_dead_sessions_and_old_audit_rows() {
         exec(&a.store, "INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'old', ?)", vec![Arg::B(u.id.0.to_vec()), Arg::I(at)]).await;
     }
     a.store.audit(Some(u.id), None, "recent", "", "").await.unwrap();
-    assert_eq!(a.sweep(now).await.unwrap(), Swept { sessions: 2, audit: 2, devkeys: 0 });
+    assert_eq!(a.sweep(now).await.unwrap(), Swept { sessions: 2, audit: 2, devkeys: 0, invites: 0 });
     let left: Vec<_> = a.store.sessions_of(u.id).await.unwrap().into_iter().map(|s| s.token_hash).collect();
     assert_eq!(left, [live.token_hash]);
     assert_eq!(audit_events(&a, u.id).await, ["recent"]);
@@ -1466,5 +1466,173 @@ async fn a_profile_shows_what_its_owner_chose_behind_a_rotatable_link() {
     assert!(a.public_profile(&new).await.unwrap().is_none());
     a.profile_save(&c, &u, &scopes, false, "", true).await.unwrap();
     assert!(a.profile_settings(u.id).await.unwrap().public_id.is_none());
+    cleanup(&a, &[u.id], &[&role]).await;
+}
+
+async fn invite_signup(a: &Accounts<Stub>, c: &Ctx, code: &str, name: &str) -> Result<NewSession, Error> {
+    a.register_invite(c, InviteForm { code, username: name, password: PW, email: None, display_name: None }).await
+}
+
+fn invite_id(code: &str) -> String {
+    hex::encode(sha2::Sha256::digest(util::b64u_dec(code).unwrap()))
+}
+
+#[tokio::test]
+async fn invites_open_closed_sign_up_once_and_bind_names() {
+    let Some(a) = shared(Config { registration_open: false, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.90");
+    let role = make_role(&a, &["users:admin"]).await;
+    let boss = make_user(&a, &[&role]).await;
+    let scopes = a.effective_scopes(&boss).await.unwrap();
+    let actor = Actor { user: &boss, scopes: &scopes };
+    let nobody = make_user(&a, &[]).await;
+    let none: Vec<String> = Vec::new();
+    assert!(matches!(a.invite_create(&c, Actor { user: &nobody, scopes: &none }, None, 7).await, Err(Error::Forbidden)));
+
+    let code = a.invite_create(&c, actor, None, 7).await.unwrap();
+    assert_eq!(code.len(), 22);
+    assert!(matches!(err(invite_signup(&a, &c, "AAAAAAAAAAAAAAAAAAAAAA", &unique("i")).await), Error::Invalid(_)), "an unknown code");
+    assert!(matches!(err(invite_signup(&a, &c, "short", &unique("i")).await), Error::Invalid(_)));
+    // A taken name refuses and leaves the code for another try.
+    assert!(matches!(err(invite_signup(&a, &c, &code, &nobody.username).await), Error::UsernameTaken));
+    let name = unique("i");
+    let s = invite_signup(&a, &c, &code, &name).await.expect("sign-up is closed, the invite opens it");
+    let (user, _, granted) = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap();
+    assert_eq!(user.username, name);
+    let mut plain = a.host.cfg.default_user_scopes.clone();
+    plain.sort();
+    assert_eq!(granted, plain, "the plain user role");
+    assert!(matches!(err(invite_signup(&a, &c, &code, &unique("i")).await), Error::Invalid(_)), "single use");
+    let listed = a.invites(actor).await.unwrap();
+    let mine = listed.iter().find(|i| i.id == invite_id(&code)).expect("listed");
+    assert_eq!((mine.used_by, mine.created_by), (Some(user.id), Some(boss.id)));
+
+    let bound_name = unique("b");
+    let bound = a.invite_create(&c, actor, Some(&bound_name.to_uppercase()), 7).await.unwrap();
+    assert!(matches!(err(invite_signup(&a, &c, &bound, &unique("x")).await), Error::Invalid(_)), "bound to one name");
+    let b = invite_signup(&a, &c, &bound, &bound_name).await.unwrap();
+    assert!(matches!(a.invite_create(&c, actor, Some(&bound_name), 7).await, Err(Error::UsernameTaken)), "a name in use");
+
+    let revoked = a.invite_create(&c, actor, None, 7).await.unwrap();
+    assert!(a.invite_revoke(&c, actor, &invite_id(&revoked)).await.unwrap());
+    assert!(!a.invite_revoke(&c, actor, &invite_id(&revoked)).await.unwrap());
+    assert!(matches!(err(invite_signup(&a, &c, &revoked, &unique("r")).await), Error::Invalid(_)));
+    let b_id = a.session_from_token(&b.token, util::now()).await.unwrap().unwrap().0.id;
+    cleanup(&a, &[boss.id, nobody.id, user.id, b_id], &[&role]).await;
+}
+
+#[tokio::test]
+async fn the_host_issues_invites_without_an_admin() {
+    let Some(a) = shared(Config { registration_open: false, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.93");
+    let code = a.invite_create_as_host(&c, None, 7).await.unwrap();
+    let name = unique("h");
+    let s = invite_signup(&a, &c, &code, &name).await.expect("a host invite opens sign-up");
+    let user = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap().0;
+    assert!(matches!(err(invite_signup(&a, &c, &code, &unique("h")).await), Error::Invalid(_)), "single use");
+    cleanup(&a, &[user.id], &[]).await;
+}
+
+#[tokio::test]
+async fn invite_codes_expire() {
+    let Some(a) = shared(Config { registration_open: false, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.91");
+    let role = make_role(&a, &["users:admin"]).await;
+    let boss = make_user(&a, &[&role]).await;
+    let scopes = a.effective_scopes(&boss).await.unwrap();
+    let code = a.invite_create(&c, Actor { user: &boss, scopes: &scopes }, None, 1).await.unwrap();
+    exec(&a.store, "UPDATE acct_invites SET expires_at = 1 WHERE code_hash = ?", vec![Arg::B(hex::decode(invite_id(&code)).unwrap())]).await;
+    assert!(matches!(err(invite_signup(&a, &c, &code, &unique("e")).await), Error::Invalid(_)));
+    cleanup(&a, &[boss.id], &[&role]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_grant_makes_one_admin_of_an_empty_site() {
+    let Some(f) = fresh().await else { return };
+    let a = Arc::new(on(f.store.clone(), cfg()).await);
+    let c = ctx("203.0.113.92");
+    let off = make_user(&a, &[]).await;
+    a.store.set_status(off.id, UserStatus::Disabled).await.unwrap();
+    assert!(!a.bootstrap_grant(&c, off.id).await.unwrap(), "a disabled account cannot become the admin");
+    let (u1, u2) = (make_user(&a, &[]).await, make_user(&a, &[]).await);
+    let grant = |id| {
+        let a = a.clone();
+        tokio::spawn(async move { a.bootstrap_grant(&ctx("203.0.113.92"), id).await.unwrap() })
+    };
+    let (r1, r2) = (grant(u1.id), grant(u2.id));
+    let mut got = [r1.await.unwrap(), r2.await.unwrap()];
+    got.sort();
+    assert_eq!(got, [false, true], "racing grants make one admin");
+    assert_eq!(a.store.holders_of_scope_star().await.unwrap(), 1);
+    let third = make_user(&a, &[]).await;
+    assert!(!a.bootstrap_grant(&c, third.id).await.unwrap(), "nothing to do once someone holds *");
+    drop(a);
+    f.done().await;
+}
+
+#[tokio::test]
+async fn reset_2fa_clears_codes_device_keys_and_sessions() {
+    let narrow = Config { require_2fa_for_privileged: true, default_user_scopes: strings(&["t:one"]), ..cfg() };
+    let Some(a) = shared(narrow).await else { return };
+    let c = ctx("203.0.113.93");
+    let role = make_role(&a, &["t:one", "t:two"]).await;
+    let u = make_user(&a, &[&role]).await;
+    assert!(a.needs_2fa(&u).await.unwrap(), "a privileged scope without a second factor");
+    let plain = make_user(&a, &[]).await;
+    assert!(!a.needs_2fa(&plain).await.unwrap());
+
+    let setup = a.totp_setup(&u);
+    let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
+    a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(!a.needs_2fa(&u).await.unwrap());
+    a.store.insert_session(&sess(u.id, util::now(), util::now() + 100)).await.unwrap();
+
+    let admin_role = make_role(&a, &["users:admin", "t:*"]).await;
+    let boss = make_user(&a, &[&admin_role]).await;
+    exec(&a.store, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(vec![0]), Arg::B(boss.id.0.to_vec())]).await;
+    let boss = a.store.user_by_id(boss.id).await.unwrap().unwrap();
+    let scopes = a.effective_scopes(&boss).await.unwrap();
+    let weak: Vec<String> = strings(&["users:admin"]);
+    assert!(matches!(a.reset_2fa(&c, Actor { user: &boss, scopes: &weak }, u.id).await, Err(Error::Forbidden)), "must cover the target");
+    assert!(a.reset_2fa(&c, Actor { user: &boss, scopes: &scopes }, u.id).await.unwrap());
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(!u.totp_enabled && a.needs_2fa(&u).await.unwrap(), "back to needing one");
+    assert_eq!(a.store.recovery_left(u.id).await.unwrap(), 0);
+    assert!(a.store.sessions_of(u.id).await.unwrap().is_empty());
+    assert!(!a.reset_2fa(&c, Actor { user: &boss, scopes: &scopes }, u.id).await.unwrap(), "already off");
+    assert!(audit_events(&a, u.id).await.contains(&"totp_reset".to_string()));
+    cleanup(&a, &[u.id, plain.id, boss.id], &[&role, &admin_role]).await;
+}
+
+#[tokio::test]
+async fn the_host_grants_resets_and_revokes_without_an_admin() {
+    let narrow = Config { require_2fa_for_privileged: true, default_user_scopes: strings(&["t:one"]), ..cfg() };
+    let Some(a) = shared(narrow).await else { return };
+    let c = ctx("203.0.113.94");
+    let role = make_role(&a, &["t:one", "t:two"]).await;
+    let u = make_user(&a, &[]).await;
+    assert!(a.grant_role_as_host(&c, u.id, &role).await.unwrap());
+    assert!(!a.grant_role_as_host(&c, u.id, &role).await.unwrap(), "held already");
+    assert!(a.store.user_scopes(u.id).await.unwrap().contains(&"t:two".to_string()));
+    // Codes on, then off again from the shell: the way back in after a lost phone.
+    let setup = a.totp_setup(&u);
+    let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
+    a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    a.store.insert_session(&sess(u.id, util::now(), util::now() + 100)).await.unwrap();
+    assert!(a.reset_2fa_as_host(&c, u.id).await.unwrap());
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(!u.totp_enabled);
+    assert!(a.store.sessions_of(u.id).await.unwrap().is_empty(), "signed out everywhere");
+    assert!(!a.reset_2fa_as_host(&c, u.id).await.unwrap(), "already off");
+    a.store.insert_session(&sess(u.id, util::now(), util::now() + 100)).await.unwrap();
+    assert!(a.revoke_role_as_host(&c, u.id, &role).await.unwrap());
+    assert!(a.store.sessions_of(u.id).await.unwrap().is_empty(), "the loss counts at once");
+    assert!(!a.revoke_role_as_host(&c, u.id, &role).await.unwrap(), "gone already");
+    let events = audit_events(&a, u.id).await;
+    for e in ["role_grant", "totp_reset", "role_revoke"] {
+        assert!(events.contains(&e.to_string()), "{e}: {events:?}");
+    }
+    assert!(matches!(a.grant_role_as_host(&c, u.id, "no-such-role").await, Err(Error::NotFound)));
     cleanup(&a, &[u.id], &[&role]).await;
 }

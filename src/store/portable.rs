@@ -13,10 +13,10 @@
 use sqlx::{AssertSqlSafe, Connection, Pool, Row, Transaction};
 
 use super::{
-    Blob, CRED_COLS, CreateUserError, EXPORT_AUDIT_ROWS, EmailConfirm, MAX_PENDING, MAX_SESSIONS, Profile,
+    Blob, CRED_COLS, CreateUserError, EXPORT_AUDIT_ROWS, EmailConfirm, InviteSignup, MAX_PENDING, MAX_SESSIONS, Profile,
     PutBlob, ROLE_COLS, SESSION_COLS, TOUCH_SECS, USER_COLS, WriteError, clip, id, is_dup, like_pattern, opt_id,
 };
-use crate::model::{AccountId, AuditEntry, Credential, NewUser, Role, SessionInfo, User, UserStatus};
+use crate::model::{AccountId, AuditEntry, Credential, Invite, NewUser, Role, SessionInfo, User, UserStatus};
 use crate::util;
 
 type Conn = <Db as sqlx::Database>::Connection;
@@ -162,6 +162,18 @@ fn roles_from(rows: Vec<DbRow>) -> sqlx::Result<Vec<Role>> {
         }
     }
     Ok(out)
+}
+
+fn invite(r: &DbRow) -> sqlx::Result<Invite> {
+    Ok(Invite {
+        id: hex::encode(r.try_get::<Vec<u8>, _>(0)?),
+        created_by: opt_id(r.try_get(1)?)?,
+        username: r.try_get(2)?,
+        created_at: r.try_get(3)?,
+        expires_at: r.try_get(4)?,
+        used_at: r.try_get(5)?,
+        used_by: opt_id(r.try_get(6)?)?,
+    })
 }
 
 fn audit_entry(r: &DbRow) -> sqlx::Result<AuditEntry> {
@@ -1067,6 +1079,115 @@ impl Backend {
             .execute(&self.0)
             .await?;
         Ok(r.rows_affected())
+    }
+
+    // ---------------------------------------------------------------- invites
+
+    pub async fn insert_invite(&self, code_hash: &[u8; 32], by: Option<AccountId>, username: Option<&str>, expires_at: i64) -> sqlx::Result<()> {
+        sqlx::query("INSERT INTO acct_invites (code_hash, created_by, username, created_at, expires_at) VALUES ($1, $2, $3, $4, $5)")
+            .bind(&code_hash[..])
+            .bind(by.as_ref().map(|b| &b.0[..]))
+            .bind(username)
+            .bind(util::now())
+            .bind(expires_at)
+            .execute(&self.0)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn invites(&self, now: i64) -> sqlx::Result<Vec<Invite>> {
+        sqlx::query(
+            "SELECT code_hash, created_by, username, created_at, expires_at, used_at, used_by FROM acct_invites
+              WHERE expires_at > $1 ORDER BY created_at DESC, code_hash LIMIT 1000",
+        )
+        .bind(now)
+        .fetch_all(&self.0)
+        .await?
+        .iter()
+        .map(invite)
+        .collect()
+    }
+
+    pub async fn delete_invite(&self, code_hash: &[u8; 32]) -> sqlx::Result<bool> {
+        let r = sqlx::query("DELETE FROM acct_invites WHERE code_hash = $1").bind(&code_hash[..]).execute(&self.0).await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn delete_expired_invites(&self, now: i64, batch: u64) -> sqlx::Result<u64> {
+        let r = sqlx::query("DELETE FROM acct_invites WHERE code_hash IN (SELECT code_hash FROM acct_invites WHERE expires_at < $1 LIMIT $2)")
+            .bind(now)
+            .bind(i64::try_from(batch).unwrap_or(i64::MAX))
+            .execute(&self.0)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// A taken name returns before the commit: dropping the transaction rolls
+    /// the claim back (Postgres has aborted it anyway).
+    pub async fn create_user_with_invite(&self, u: &NewUser, role: &str, code_hash: &[u8; 32], now: i64) -> sqlx::Result<InviteSignup> {
+        let mut tx = begin_write(&self.0).await?;
+        let claimed = sqlx::query(
+            "UPDATE acct_invites SET used_at = $1, used_by = $2
+              WHERE code_hash = $3 AND used_at IS NULL AND expires_at > $1 AND (username IS NULL OR username = $4)",
+        )
+        .bind(now)
+        .bind(&u.id.0[..])
+        .bind(&code_hash[..])
+        .bind(&u.username)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if claimed != 1 {
+            return Ok(InviteSignup::BadInvite);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO acct_users (id, username, display_name, email_pending, password_hash, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&u.id.0[..])
+        .bind(&u.username)
+        .bind(&u.display_name)
+        .bind(&u.email_pending)
+        .bind(&u.password_hash)
+        .bind(u.created_at)
+        .execute(&mut *tx)
+        .await;
+        match inserted {
+            Err(e) if is_dup(&e) => return Ok(InviteSignup::UsernameTaken),
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+        let n = sqlx::query("INSERT INTO acct_user_roles (user_id, role_id, granted_at) SELECT $1, id, $2 FROM acct_roles WHERE name = $3")
+            .bind(&u.id.0[..])
+            .bind(u.created_at)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n != 1 {
+            return Err(sqlx::Error::InvalidArgument(format!("no role named {role:?}")));
+        }
+        tx.commit().await?;
+        Ok(InviteSignup::Done)
+    }
+
+    pub async fn grant_admin_if_none(&self, user: AccountId) -> Result<bool, WriteError> {
+        let mut tx = begin_guarded(&self.0).await?;
+        if star_holders(&mut tx).await? > 0 {
+            return Ok(false);
+        }
+        let n = sqlx::query(
+            "INSERT INTO acct_user_roles (user_id, role_id, granted_at)
+             SELECT u.id, r.id, $1 FROM acct_users u JOIN acct_roles r ON r.name = 'admin' WHERE u.id = $2 AND u.status = $3",
+        )
+        .bind(util::now())
+        .bind(&user.0[..])
+        .bind(UserStatus::Active as i16)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(n == 1)
     }
 
     // ----------------------------------------------------------------- export

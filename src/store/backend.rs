@@ -4,8 +4,8 @@
 
 use sqlx::Transaction;
 
-use super::{Blob, CreateUserError, EmailConfirm, Profile, PutBlob, WriteError};
-use crate::model::{AccountId, AuditEntry, Credential, NewUser, Role, SessionInfo, User, UserStatus};
+use super::{Blob, CreateUserError, EmailConfirm, InviteSignup, Profile, PutBlob, WriteError};
+use crate::model::{AccountId, AuditEntry, Credential, Invite, NewUser, Role, SessionInfo, User, UserStatus};
 
 /// The account store. Clone is cheap (a pool handle).
 #[derive(Clone)]
@@ -244,5 +244,11 @@ forward! {
     fn audit(&self, user: Option<AccountId>, actor: Option<AccountId>, event: &str, detail: &str, ip: &str) -> sqlx::Result<()>;
     fn audit_of(&self, user: AccountId, limit: u32) -> sqlx::Result<Vec<AuditEntry>>;
     fn delete_audit_before(&self, ts: i64, batch: u64) -> sqlx::Result<u64>;
+    fn insert_invite(&self, code_hash: &[u8; 32], by: Option<AccountId>, username: Option<&str>, expires_at: i64) -> sqlx::Result<()>;
+    fn invites(&self, now: i64) -> sqlx::Result<Vec<Invite>>;
+    fn delete_invite(&self, code_hash: &[u8; 32]) -> sqlx::Result<bool>;
+    fn delete_expired_invites(&self, now: i64, batch: u64) -> sqlx::Result<u64>;
+    fn create_user_with_invite(&self, u: &NewUser, role: &str, code_hash: &[u8; 32], now: i64) -> sqlx::Result<InviteSignup>;
+    fn grant_admin_if_none(&self, user: AccountId) -> Result<bool, WriteError>;
     fn export_user(&self, id: AccountId) -> sqlx::Result<Option<serde_json::Value>>;
 }

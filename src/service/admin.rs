@@ -158,12 +158,23 @@ impl<H: Host> Accounts<H> {
         if !scope::covers(actor.scopes, &role.scopes) {
             return Err(Error::Forbidden);
         }
+        self.do_grant_role(ctx, Some(actor.user.id), target, &role).await
+    }
+
+    /// `grant_role` for the host itself (its own shell), where no signed-in
+    /// admin answers for it. The audit row has no actor.
+    pub async fn grant_role_as_host(&self, ctx: &Ctx, target: AccountId, role: &str) -> Result<bool, Error> {
+        let role = self.role(role).await?;
+        self.do_grant_role(ctx, None, target, &role).await
+    }
+
+    async fn do_grant_role(&self, ctx: &Ctx, actor: Option<AccountId>, target: AccountId, role: &Role) -> Result<bool, Error> {
         self.store.user_by_id(target).await?.ok_or(Error::NotFound)?;
-        if !self.store.grant_role(target, role.id, Some(actor.user.id)).await? {
+        if !self.store.grant_role(target, role.id, actor).await? {
             return Ok(false);
         }
-        self.audit(ctx, Some(target), Some(actor.user.id), "role_grant", &role.name).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_grant", actor = %actor.user.id.hex(),
+        self.audit(ctx, Some(target), actor, "role_grant", &role.name).await?;
+        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_grant", actor = %by(actor),
             user = %target.hex(), role = ?role.name);
         Ok(true)
     }
@@ -176,13 +187,56 @@ impl<H: Host> Accounts<H> {
         if !scope::covers(actor.scopes, &role.scopes) {
             return Err(Error::Forbidden);
         }
+        self.do_revoke_role(ctx, Some(actor.user.id), target, &role).await
+    }
+
+    /// `revoke_role` for the host itself. The last holder of `*` still keeps it.
+    pub async fn revoke_role_as_host(&self, ctx: &Ctx, target: AccountId, role: &str) -> Result<bool, Error> {
+        let role = self.role(role).await?;
+        self.do_revoke_role(ctx, None, target, &role).await
+    }
+
+    async fn do_revoke_role(&self, ctx: &Ctx, actor: Option<AccountId>, target: AccountId, role: &Role) -> Result<bool, Error> {
         if !self.store.revoke_role(target, role.id).await? {
             return Ok(false);
         }
         self.store.delete_sessions_of(target, None).await?;
-        self.audit(ctx, Some(target), Some(actor.user.id), "role_revoke", &role.name).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_revoke", actor = %actor.user.id.hex(),
+        self.audit(ctx, Some(target), actor, "role_revoke", &role.name).await?;
+        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_revoke", actor = %by(actor),
             user = %target.hex(), role = ?role.name);
+        Ok(true)
+    }
+
+    /// For someone who lost their authenticator: codes off (recovery codes too,
+    /// unless a passkey is left), device keys and sessions gone. The next
+    /// sign-in is by password, and a role that needs a second factor asks for a
+    /// new one. False when codes were off already.
+    pub async fn reset_2fa(&self, ctx: &Ctx, actor: Actor<'_>, target: AccountId) -> Result<bool, Error> {
+        actor.need("users:admin")?;
+        let user = self.manageable(actor, target).await?;
+        self.do_reset_2fa(ctx, Some(actor.user.id), &user).await
+    }
+
+    /// `reset_2fa` for the host itself: the way back in for a sole admin who
+    /// lost their authenticator. The audit row has no actor.
+    pub async fn reset_2fa_as_host(&self, ctx: &Ctx, target: AccountId) -> Result<bool, Error> {
+        let user = self.store.user_by_id(target).await?.ok_or(Error::NotFound)?;
+        self.do_reset_2fa(ctx, None, &user).await
+    }
+
+    async fn do_reset_2fa(&self, ctx: &Ctx, actor: Option<AccountId>, user: &User) -> Result<bool, Error> {
+        let target = user.id;
+        if !self.store.set_totp(target, None, 0).await? {
+            return Ok(false);
+        }
+        if !user.has_passkey {
+            self.store.delete_recovery(target).await?;
+        }
+        self.revoke_devkeys(ctx, target, "totp_reset").await?;
+        self.store.delete_sessions_of(target, None).await?;
+        self.audit(ctx, Some(target), actor, "totp_reset", "").await?;
+        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "totp_reset", actor = %by(actor),
+            user = %target.hex());
         Ok(true)
     }
 
@@ -216,4 +270,9 @@ impl<H: Host> Accounts<H> {
             user = %target.hex());
         Ok(true)
     }
+}
+
+/// Who did it, for the log line: the admin's account, or the host's own shell.
+pub(super) fn by(actor: Option<AccountId>) -> String {
+    actor.map_or_else(|| "host".to_string(), |a| a.hex())
 }
