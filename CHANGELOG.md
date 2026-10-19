@@ -3,7 +3,7 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
-## Unreleased (v0.9.0)
+## v0.9.0 (2026-10-20)
 
 Postgres and SQLite next to MySQL, for voipc's relays. New migration sets
 `migrations/postgres` and `migrations/sqlite` (versions 0001–0011, the same
