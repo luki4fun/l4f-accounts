@@ -38,7 +38,6 @@ impl PasskeyFor {
 }
 
 const BAD: Error = Error::Invalid("That passkey did not work. Try again, or sign in another way.");
-const EXPIRED: Error = Error::Invalid("That took too long. Try again.");
 
 fn webauthn_error(e: WebauthnError) -> Error {
     tracing::info!(target: "accounts", outcome = "passkey_refused", reason = ?e);
@@ -51,12 +50,15 @@ fn webauthn_error(e: WebauthnError) -> Error {
 impl<H: Host> Accounts<H> {
     /// The options `navigator.credentials.create()` / `.get()` take, as the
     /// JSON the browser's `parse…OptionsFromJSON` reads, and the challenge
-    /// token that comes back with the answer. `user` is required for all but
-    /// `Login`.
+    /// token that comes back with the answer. `user` is `None` for `Login`
+    /// and required for the others.
     pub async fn passkey_options(&self, what: PasskeyFor, user: Option<&User>, browser_nonce: &[u8]) -> Result<(Value, String), Error> {
         let cfg = self.host.config();
         let uid = user.map(|u| &u.id.0[..]);
-        if what != PasskeyFor::Login && uid.is_none() {
+        // `Login` exactly when there is no account: its answer is checked
+        // without one (the authenticator names it), so a token bound to an
+        // account could never verify.
+        if (what == PasskeyFor::Login) != uid.is_none() {
             return Err(Error::Forbidden);
         }
         let token = challenge::issue(&self.keys, what.purpose(), uid, browser_nonce, TTL);
@@ -91,51 +93,45 @@ impl<H: Host> Accounts<H> {
         Ok((options, token))
     }
 
-    /// The challenge checks out for this purpose, account and browser.
-    /// Returns its nonce, to burn once the signature has verified.
-    fn challenge_ok(&self, what: PasskeyFor, user: Option<AccountId>, token: &str, browser_nonce: &[u8]) -> Result<[u8; 16], Error> {
-        let uid = user.as_ref().map(|u| &u.0[..]);
-        challenge::check(&self.keys, token, what.purpose(), uid, browser_nonce, util::now()).map_err(|e| {
-            tracing::info!(target: "accounts", outcome = "challenge_refused", reason = ?e);
-            EXPIRED
-        })
-    }
-
-    fn burn(&self, nonce: &[u8; 16]) -> Result<(), Error> {
-        if challenge::burn(&self.limiter, nonce) { Ok(()) } else { Err(EXPIRED) }
-    }
-
-    pub async fn passkey_add(&self, ctx: &Ctx, user: &User, token: &str, browser_nonce: &[u8], json: &str, name: &str) -> Result<(), Error> {
+    /// As the account's first second factor, a passkey ends every other
+    /// session and gives the caller's a new token, returned here
+    /// (`factor_added`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn passkey_add(
+        &self,
+        ctx: &Ctx,
+        user: &User,
+        session: &SessionInfo,
+        token: &str,
+        browser_nonce: &[u8],
+        json: &str,
+        name: &str,
+    ) -> Result<Option<NewSession>, Error> {
+        if !session.mfa_ok || session.user_id != user.id {
+            return Err(Error::Forbidden);
+        }
         let cfg = self.host.config();
-        let nonce = self.challenge_ok(PasskeyFor::Add, Some(user.id), token, browser_nonce)?;
+        let nonce = self.challenge_ok(PasskeyFor::Add.purpose(), Some(user.id), token, browser_nonce)?;
         let origins = cfg.origins();
         let rp = Rp { id: cfg.rp_id(), origins: &origins };
         let c = webauthn::verify_registration(&rp, &challenge::challenge_bytes(token), json, false).map_err(webauthn_error)?;
         self.burn(&nonce)?;
-        let name = match name.trim() {
-            "" => "Passkey".to_string(),
-            n => scope::clean_display_name(n).map_err(Error::Invalid)?,
-        };
+        // The authenticator holds the key already: a name that cannot be
+        // stored falls back, as an SSH key's comment does, instead of leaving
+        // that key with no record here.
+        let name = scope::clean_display_name(name).unwrap_or_else(|_| "Passkey".to_string());
         let row = Credential {
-            kind: KIND.into(),
-            ext_id: c.id,
-            user_id: user.id,
-            public_key: Some(c.public_key),
             alg: c.alg,
             sign_count: c.sign_count.into(),
             flags: if c.backup_eligible { FLAG_BACKUP_ELIGIBLE } else { 0 },
-            name,
-            created_at: util::now(),
-            last_used_at: None,
-            public: false,
+            ..Credential::new(KIND, c.id, user.id, Some(c.public_key), name)
         };
         if !self.store.insert_credential(&row).await? {
             return Err(Error::Invalid("That passkey is already registered."));
         }
-        self.revoke_devkeys(ctx, user.id, "passkey_add").await?;
-        self.audit(ctx, Some(user.id), Some(user.id), "passkey_add", &row.name).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "passkey_add", user = %user.id.hex());
-        Ok(())
+        let rotated = self.factor_added(ctx, user, session, "passkey_add").await?;
+        self.record_after(ctx, Some(user.id), Some(user.id), "passkey_add", &row.name).await;
+        Ok(rotated)
     }
 
     /// Verifies an assertion against the stored key, which must be `owner`'s
@@ -149,7 +145,7 @@ impl<H: Host> Accounts<H> {
         json: &str,
     ) -> Result<Credential, Error> {
         let cfg = self.host.config();
-        let nonce = self.challenge_ok(what, owner, token, browser_nonce)?;
+        let nonce = self.challenge_ok(what.purpose(), owner, token, browser_nonce)?;
         let (id, handle) = webauthn::parse_assertion_ids(json).map_err(webauthn_error)?;
         let cred = self.store.credential(KIND, &id).await?.ok_or(BAD)?;
         if owner.is_some_and(|o| o != cred.user_id) {
@@ -178,6 +174,10 @@ impl<H: Host> Accounts<H> {
             tracing::warn!(target: "accounts", outcome = "passkey_flags_changed", user = %cred.user_id.hex());
             return Err(BAD);
         }
+        // The other ceremonies need a session of the account already.
+        if what == PasskeyFor::Login {
+            self.key_try(cred.user_id)?;
+        }
         self.burn(&nonce)?;
         if !self.store.used_credential(KIND, &cred.ext_id, a.sign_count.into(), util::now()).await? {
             tracing::warn!(target: "accounts", outcome = "passkey_counter", user = %cred.user_id.hex());
@@ -189,19 +189,9 @@ impl<H: Host> Accounts<H> {
     /// Sign-in with a passkey alone. Counts as a full sign-in with a second
     /// factor, and as recent: user verification is required.
     pub async fn passkey_login(&self, ctx: &Ctx, token: &str, browser_nonce: &[u8], json: &str) -> Result<NewSession, Error> {
-        let cfg = self.host.config();
-        if !cfg.enabled {
-            return Err(Error::Closed);
-        }
-        if ctx.cross_site() {
-            return Err(Error::CrossSite);
-        }
         // Not the password caps: a passkey cannot be guessed. This only keeps
         // one address from making the server verify signatures all day.
-        let w = super::auth::WINDOW;
-        if !self.limiter.check(&format!("acct-pk:{}", util::ip_key(ctx.ip)), w, cfg.login_per_15min * 3) {
-            return Err(Error::RateLimited);
-        }
+        self.door(ctx, "acct-pk", super::auth::WINDOW, self.host.config().login_per_15min * 3)?;
         let r = self.assert_passkey(PasskeyFor::Login, None, token, browser_nonce, json).await;
         let cred = match r {
             Ok(c) => c,
@@ -212,8 +202,7 @@ impl<H: Host> Accounts<H> {
         };
         let user = self.store.user_by_id(cred.user_id).await?.filter(|u| u.status == UserStatus::Active).ok_or(BAD)?;
         let now = util::now();
-        self.audit(ctx, Some(user.id), None, "login_ok", "passkey").await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "login_ok", user = %user.id.hex(), how = "passkey");
+        self.record(ctx, Some(user.id), None, "login_ok", "passkey").await?;
         Ok(self.create_session(user.id, "passkey", true, now, ctx).await?)
     }
 
@@ -227,9 +216,10 @@ impl<H: Host> Accounts<H> {
         browser_nonce: &[u8],
         json: &str,
     ) -> Result<NewSession, Error> {
+        self.pending_ok(user, pending)?;
         self.assert_passkey(PasskeyFor::Mfa, Some(user.id), token, browser_nonce, json).await?;
-        // Password plus a passkey: a recent sign-in.
-        self.finish_mfa(ctx, user, pending, "password+passkey", util::now()).await
+        // The first factor plus a passkey: a recent sign-in.
+        self.finish_mfa(ctx, user, pending, "passkey", util::now()).await
     }
 
     /// Step-up with a passkey that verifies the user.

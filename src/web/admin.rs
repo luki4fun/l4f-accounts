@@ -12,25 +12,13 @@ use serde::Deserialize;
 
 use super::auth::need_fresh;
 use super::flash::{self, Flash};
-use super::{Authed, BASE, St, WebHost, error_page, page, refused, when};
+use super::{Authed, BASE, St, WebHost, done, error_page, page, refused, when};
 use crate::model::{AccountId, Role, User, UserStatus};
 use crate::scope::ScopeDef;
-use crate::service::{Ctx, Error, RoleForm};
+use crate::service::{Ctx, RoleForm};
 use crate::util;
 
 const PAGE: u32 = 50;
-
-/// After a change: back to `back` with what happened, or why not. Refusals a
-/// person can act on become a message; the rest an error page.
-fn done<H: WebHost>(a: &crate::service::Accounts<H>, h: &HeaderMap, back: &str, r: Result<&str, Error>) -> Response {
-    match r {
-        Ok(msg) => flash::to(&a.keys, back, true, msg, &[]),
-        Err(e @ (Error::Invalid(_) | Error::LastAdmin | Error::Builtin | Error::RoleTaken | Error::NotFound)) => {
-            flash::to(&a.keys, back, false, e.message(), &[])
-        }
-        Err(e) => refused(a, h, &e),
-    }
-}
 
 fn parse_id(id: &str) -> Option<AccountId> {
     AccountId::parse_hex(id)

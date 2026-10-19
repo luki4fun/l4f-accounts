@@ -272,3 +272,40 @@ pub(crate) fn armor(raw: &[u8]) -> String {
     let lines: Vec<&str> = b.as_bytes().chunks(70).map(|c| std::str::from_utf8(c).unwrap()).collect();
     format!("{BEGIN}\n{}\n{END}\n", lines.join("\n"))
 }
+
+/// The events `f` logs on this thread, with their fields as the fmt subscriber
+/// writes them: `name=value`, a string quoted, a `%` value as it displays.
+pub(crate) fn logged(f: impl FnOnce()) -> Vec<String> {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+
+    struct Line(String);
+    impl Visit for Line {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let sep = if self.0.is_empty() { "" } else { " " };
+            self.0 += &format!("{sep}{}={value:?}", field.name());
+        }
+    }
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, e: &tracing::Event<'_>) {
+            let mut line = Line(String::new());
+            e.record(&mut line);
+            self.0.lock().unwrap().push(line.0);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    tracing::subscriber::with_default(Capture(lines.clone()), f);
+    lines.lock().unwrap().clone()
+}

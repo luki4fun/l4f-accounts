@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::{Accounts, Ctx, DAY, Error, Host, has_second_factor};
+use super::{Accounts, Config, Ctx, DAY, Error, Host, has_second_factor};
 use crate::model::{AccountId, NewUser, SessionInfo, User, UserStatus};
-use crate::store::{CreateUserError, TOUCH_SECS};
+use crate::store::TOUCH_SECS;
 use crate::{password, pow, scope, util};
 
 pub(super) const WINDOW: Duration = Duration::from_secs(900);
@@ -62,10 +62,30 @@ pub(super) fn clean_email(raw: &str) -> Result<Option<String>, &'static str> {
         }
         None => false,
     };
-    if !shape || e.len() > 254 || e.chars().any(|c| c.is_whitespace() || c.is_control() || scope::invisible(c)) {
+    if !shape || e.len() > 254 || e.chars().any(|c| c.is_whitespace() || scope::breaks_text(c)) {
         return Err("That does not look like an email address.");
     }
     Ok(Some(e))
+}
+
+/// What `register` and `register_invite` both check, in this order: the
+/// username, the password policy, the display name (the username when left
+/// blank) and the address. Returns (username, display name, address).
+pub(super) fn signup_fields(
+    cfg: &Config,
+    username: &str,
+    password: &str,
+    display_name: Option<&str>,
+    email: Option<&str>,
+) -> Result<(String, String, Option<String>), Error> {
+    let username = cfg.username(username)?;
+    password::check_policy(password, cfg.min_password_len).map_err(Error::Invalid)?;
+    let display_name = match display_name.filter(|d| !d.trim().is_empty()) {
+        Some(d) => scope::clean_display_name(d).map_err(Error::Invalid)?,
+        None => username.clone(),
+    };
+    let email = clean_email(email.unwrap_or("")).map_err(Error::Invalid)?;
+    Ok((username, display_name, email))
 }
 
 impl<H: Host> Accounts<H> {
@@ -91,14 +111,7 @@ impl<H: Host> Accounts<H> {
         let reg = self.reg_lock.lock().await;
         let no_js = gate.precheck(pow::Proof { sec_fetch_site: &ctx.sec_fetch_site, ..form.proof }, true).map_err(Error::Gate)?;
 
-        let extra: Vec<&str> = cfg.reserved_usernames.iter().map(String::as_str).collect();
-        let username = scope::normalize_username(form.username, &extra).map_err(Error::Invalid)?;
-        password::check_policy(form.password, cfg.min_password_len).map_err(Error::Invalid)?;
-        let display_name = match form.display_name.filter(|d| !d.trim().is_empty()) {
-            Some(d) => scope::clean_display_name(d).map_err(Error::Invalid)?,
-            None => username.clone(),
-        };
-        let email_pending = clean_email(form.email.unwrap_or("")).map_err(Error::Invalid)?;
+        let (username, display_name, email_pending) = signup_fields(&cfg, form.username, form.password, form.display_name, form.email)?;
         // A taken name costs neither the caps nor a hash; the INSERT still
         // settles a race for it.
         if self.store.user_by_username(&username).await?.is_some() {
@@ -111,15 +124,14 @@ impl<H: Host> Accounts<H> {
         let now = util::now();
         let id = AccountId::new();
         let user = NewUser { id, username, display_name, email_pending, password_hash: Some(hash), created_at: now };
-        match self.store.create_user(&user, Some("user")).await {
-            Ok(()) => {}
-            Err(CreateUserError::UsernameTaken) => return Err(Error::UsernameTaken),
-            Err(CreateUserError::Db(e)) => return Err(e.into()),
-        }
+        // Counted before the INSERT: a client that hangs up drops this future,
+        // maybe after the INSERT committed, and a count after it would never
+        // run. A lost race for the name counts one too many.
         permit.commit(&self.limiter);
+        self.store.create_user(&user, Some("user")).await?;
         drop(reg);
 
-        self.audit(ctx, Some(id), None, "register", "").await?;
+        self.audit_after(ctx, Some(id), None, "register", "").await;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "register", user = %id.hex(),
             username = ?user.username);
         Ok(self.create_session(id, "password", true, now, ctx).await?)
@@ -217,33 +229,38 @@ impl<H: Host> Accounts<H> {
                 // Off the response path: waiting for the INSERT would make a
                 // wrong password on a real account answer slower than a name
                 // nobody has.
-                let (store, ip) = (self.store.clone(), self.shaped_ip(ctx.ip));
-                tokio::spawn(async move {
-                    if let Err(e) = store.audit(Some(u.id), None, "login_fail", "password", &ip).await {
-                        tracing::warn!(target: "accounts", error = %e, "audit write failed");
-                    }
-                });
+                self.audit_detached(ctx, u.id, None, "login_fail", "password");
                 return Err(Error::BadLogin);
             }
             None => return Err(Error::BadLogin),
         };
 
+        // The hash this sign-in proved: the stored one, or the upgrade it wrote.
+        let mut proved = stored.clone();
         if let (Some(new), Some(old)) = (rehash, stored.as_deref()) {
             // Only while the old hash is still stored: a password change that
             // landed meanwhile wins.
             if self.store.rehash_password(user.id, old, &new).await? {
                 tracing::info!(target: "accounts", outcome = "rehash", user = %user.id.hex(), "password hash upgraded");
+                proved = Some(new);
             }
         }
-        let ip = self.shaped_ip(ctx.ip);
-        if has_second_factor(&user) {
+        let step = if has_second_factor(&user) {
             self.audit(ctx, Some(user.id), None, "login_need_mfa", "password").await?;
-            tracing::info!(target: "accounts", %ip, outcome = "need_mfa", user = %user.id.hex());
-            return Ok(LoginStep::NeedMfa(self.create_session(user.id, "password", false, 0, ctx).await?));
+            tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "need_mfa", user = %user.id.hex());
+            LoginStep::NeedMfa(self.create_session(user.id, "password", false, 0, ctx).await?)
+        } else {
+            self.record(ctx, Some(user.id), None, "login_ok", "password").await?;
+            LoginStep::Done(self.create_session(user.id, "password", true, util::now(), ctx).await?)
+        };
+        // A password change writes the new hash, then deletes the sessions. If
+        // that DELETE ran before this session's INSERT, the hash shows it now.
+        let (LoginStep::Done(s) | LoginStep::NeedMfa(s)) = &step;
+        if self.store.password_hash_of(user.id).await? != proved {
+            self.store.delete_session(&s.info.token_hash, user.id).await?;
+            return Err(Error::BadLogin);
         }
-        self.audit(ctx, Some(user.id), None, "login_ok", "password").await?;
-        tracing::info!(target: "accounts", %ip, outcome = "login_ok", user = %user.id.hex());
-        Ok(LoginStep::Done(self.create_session(user.id, "password", true, util::now(), ctx).await?))
+        Ok(step)
     }
 
     /// A session that is waiting for its second factor (`mfa_ok` false) lives
@@ -269,8 +286,9 @@ impl<H: Host> Accounts<H> {
     }
 
     /// The account behind a session cookie, the session, and the scopes it
-    /// grants right now. A session still waiting for its second factor grants
-    /// none, so a handler that forgets to check `mfa_ok` cannot act on it.
+    /// grants right now. A session still waiting for its second factor comes
+    /// back too, with `mfa_ok` false and no scopes: nobody is signed in with
+    /// it, so check `mfa_ok` before treating the account as signed in.
     pub async fn session_from_token(&self, token: &str, now: i64) -> sqlx::Result<Option<(User, SessionInfo, Vec<String>)>> {
         let Some(hash) = token_hash(token) else { return Ok(None) };
         let Some(s) = self.store.session_by_hash(&hash, now).await? else { return Ok(None) };
@@ -311,10 +329,10 @@ impl<H: Host> Accounts<H> {
 
     /// "Sign out everywhere": every session of `user` but `except`.
     pub async fn logout_all(&self, ctx: &Ctx, user: AccountId, except: Option<&[u8; 32]>) -> sqlx::Result<u64> {
+        // Remembered browsers too, and first: they could sign straight back in.
+        self.revoke_devkeys(ctx, user, Some(user), "logout_all").await?;
         let n = self.store.delete_sessions_of(user, except).await?;
-        // Remembered browsers too: they could sign straight back in.
-        self.revoke_devkeys(ctx, user, "logout_all").await?;
-        self.audit(ctx, Some(user), Some(user), "logout_all", &n.to_string()).await?;
+        self.audit_after(ctx, Some(user), Some(user), "logout_all", &n.to_string()).await;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "logout_all", user = %user.hex(), sessions = n);
         Ok(n)
     }

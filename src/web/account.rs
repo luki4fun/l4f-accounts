@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use super::auth::need_fresh;
 use super::flash::{self, Flash};
-use super::{Authed, BASE, St, WebHost, clear_device, clear_session, error_page, page, refused, when};
+use super::{Authed, BASE, LOGIN_PAGE, St, WebHost, clear_device, clear_session, done, error_page, page, refused, when};
 use crate::model::{Role, User};
 use crate::service::{Ctx, Error};
 use crate::util;
@@ -91,7 +91,7 @@ pub(super) async fn revoke<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h:
     };
     match a.revoke_session(&ctx, me.user.id, &hash).await {
         Ok(true) if hash == me.session.token_hash => {
-            flash::to(&a.keys, &format!("{BASE}/login"), true, "Signed out.", &[clear_session(&a.host.config())])
+            flash::to(&a.keys, LOGIN_PAGE, true, "Signed out.", &[clear_session(&a.host.config())])
         }
         Ok(true) => flash::to(&a.keys, BASE, true, "That session is signed out.", &[]),
         Ok(false) => flash::to(&a.keys, BASE, false, "That session was already gone.", &[]),
@@ -106,11 +106,7 @@ pub(super) struct NameForm {
 }
 
 pub(super) async fn display_name<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Form(f): Form<NameForm>) -> Response {
-    match a.set_display_name(&ctx, me.user.id, &f.display_name).await {
-        Ok(_) => flash::to(&a.keys, BASE, true, "Display name saved.", &[]),
-        Err(e @ Error::Invalid(_)) => flash::to(&a.keys, BASE, false, e.message(), &[]),
-        Err(e) => refused(&a, &h, &e),
-    }
+    done(&a, &h, BASE, a.set_display_name(&ctx, me.user.id, &f.display_name).await.map(|_| "Display name saved."))
 }
 
 /// Everything stored about the account, as a JSON download.
@@ -163,7 +159,7 @@ pub(super) async fn delete<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h:
     match a.delete_account(&ctx, me.actor(), me.user.id, f.delete_owned.is_some()).await {
         Ok(()) => {
             let cfg = a.host.config();
-            flash::to(&a.keys, &format!("{BASE}/login"), true, "Your account is deleted.", &[clear_session(&cfg), clear_device(&cfg)])
+            flash::to(&a.keys, LOGIN_PAGE, true, "Your account is deleted.", &[clear_session(&cfg), clear_device(&cfg)])
         }
         Err(e @ (Error::LastAdmin | Error::Invalid(_))) => flash::to(&a.keys, BASE, false, e.message(), &[]),
         Err(e) => refused(&a, &h, &e),

@@ -4,6 +4,14 @@
 //! Every use gets its own subkey, so a value MAC'd for one purpose can never be
 //! replayed as another. An optional old master keeps sealed rows and issued
 //! tokens readable across a rotation; `open` says when a row should be re-sealed.
+//!
+//! To rotate, run with the new master and the old one as `old`. The hourly
+//! `Accounts::sweep` reseals every TOTP secret still under the old one. Drop
+//! it once a sweep reports none resealed and a day has passed (mail links
+//! live that long), unless recovery codes issued before the rotation must
+//! keep working: they match under the old master only, so keep it as long as
+//! they must, or have each account with a second factor make a new set.
+//! Known-device cookies made under it are forgotten, until the next sign-in.
 
 use hmac::{Hmac, Mac};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
@@ -13,7 +21,9 @@ use crate::util::{b64u, ct_eq, ct_eq_bytes, random};
 
 type H = Hmac<Sha256>;
 
-/// Below this a master key is guessable or was mistyped.
+/// Below this a master key is guessable or was mistyped. Length is all this
+/// can check: the master must be CSPRNG output (e.g. `openssl rand -hex 32`
+/// as is), never a passphrase, which 32 characters do not make unguessable.
 pub const MIN_MASTER_LEN: usize = 32;
 
 const LABEL: &str = "l4f-accounts/v1/";

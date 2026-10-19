@@ -234,6 +234,36 @@ async fn register_form_carries_the_pow_markup_when_open() {
     assert!(login.contains("/account/register"), "open sign-up is linked");
 }
 
+#[test]
+fn page_paths_sit_under_base() {
+    for p in [LOGIN_PAGE, SECURITY_PAGE] {
+        assert!(p.strip_prefix(BASE).is_some_and(|rest| rest.starts_with('/')), "{p}");
+    }
+}
+
+/// The `__Host-` prefix and Secure go together, or the browser drops the cookie.
+#[test]
+fn crate_cookies_take_prefix_and_secure_together() {
+    let (on, off) = (cfg(), Config { cookie_secure: false, ..cfg() });
+    assert_eq!(cookie_out(&on, SESSION_COOKIE, "v", 60, true), "__Host-acct=v; Path=/; SameSite=Lax; Max-Age=60; HttpOnly; Secure");
+    assert_eq!(cookie_out(&off, SYNC_COOKIE, "1", 60, false), "acct-sync=1; Path=/; SameSite=Lax; Max-Age=60");
+    let h: HeaderMap = [(header::COOKIE, "acct-ch=plain; __Host-acct-ch=host".parse().unwrap())].into_iter().collect();
+    assert_eq!((cookie_in(&on, &h, CHALLENGE_COOKIE), cookie_in(&off, &h, CHALLENGE_COOKIE)), (Some("host"), Some("plain")));
+}
+
+/// Every refusal shown goes through `status_of` once: a database error is
+/// logged once, also where a handler shows its own form again.
+#[tokio::test]
+async fn a_database_error_is_logged_once() {
+    let (_, a) = app(nowhere(), cfg());
+    let db = || Error::Db(sqlx::Error::PoolTimedOut);
+    let logs = |f: &dyn Fn()| crate::testkit::logged(f).iter().filter(|l| l.contains("database error")).count();
+    assert_eq!(logs(&|| _ = status_of(&db())), 1, "a form shown again");
+    assert_eq!(logs(&|| _ = refused(&a, &HeaderMap::new(), &db())), 1, "the error page");
+    assert_eq!(logs(&|| _ = json_refused(&db())), 1, "a script's refusal");
+    assert_eq!(logs(&|| _ = status_of(&Error::NotFound)), 0);
+}
+
 // ---- against the test database
 
 async fn shared(cfg: Config) -> Option<(Router, Arc<Accounts<T>>)> {
@@ -504,7 +534,12 @@ async fn admin_pages_need_their_scope_and_changes_need_step_up() {
     let page = text(send(&app, get("/account", Some(&c1))).await).await;
     assert!(page.contains("/account/admin/users") && !page.contains("/account/admin/roles\""), "only what it may open");
     let target = format!("/account/admin/users/{}", nobody.id.hex());
-    assert_eq!(send(&app, get(&target, Some(&c1))).await.status(), StatusCode::OK);
+    use crate::store::tests::{Arg, exec};
+    let sql = "INSERT INTO acct_credentials (kind, ext_id, user_id, created_at) VALUES ('passkey', ?, ?, 1)";
+    exec(&a.store, sql, vec![Arg::B(util::random::<16>().to_vec()), Arg::B(nobody.id.0.to_vec())]).await;
+    let r = send(&app, get(&target, Some(&c1))).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(text(r).await.contains("<dt>Two-factor</dt><dd>passkey</dd>"), "a passkey alone is a second factor too");
     let r = send(&app, post(&target, &format!("csrf={t1}&_action=grant&role={reader}"), Some(&c1))).await;
     assert_eq!(r.status(), StatusCode::FORBIDDEN, "reading is not granting");
 
@@ -608,9 +643,14 @@ async fn totp_setup_then_sign_in_through_the_second_step() {
     let r = send(&app, post("/account/totp", &format!("csrf={t}&_action=enable&setup={sealed}&code=000000"), Some(&c))).await;
     assert!(text(r).await.contains("That code is not right."), "a wrong code shows the same setup again");
     let r = send(&app, post("/account/totp", &format!("csrf={t}&_action=enable&setup={sealed}&code={}", code(step)), Some(&c))).await;
+    let rotated = set_cookie(&r, "__Host-acct").expect("the first second factor gives this browser a new token");
+    assert!(rotated != "__Host-acct=" && rotated != c);
     let codes_page = text(r).await;
-    assert!(codes_page.contains("Your recovery codes"));
-    let first_code = codes_page.split("<li>").nth(1).unwrap().split('<').next().unwrap().to_string();
+    assert!(codes_page.contains("Your recovery codes") && codes_page.contains("Every other session"));
+    let code_at = |i: usize| codes_page.split("<li>").nth(i).unwrap().split('<').next().unwrap().to_string();
+    let first_code = code_at(1);
+    assert_eq!(location(&send(&app, get("/account", Some(&c))).await), "/account/login?next=%2Faccount", "the old token is dead");
+    assert_eq!(send(&app, get("/account", Some(&rotated))).await.status(), StatusCode::OK, "the new one signs in");
 
     // Signing in again stops at the second step.
     let body = format!("username={}&password={}&next=%2Faccount%2Fsecurity", u.username, util::urlencode(PW));
@@ -636,6 +676,17 @@ async fn totp_setup_then_sign_in_through_the_second_step() {
     let pt = field(&text(send(&app, get("/account/mfa", Some(&pending))).await).await, "csrf");
     let r = send(&app, post("/account/mfa", &format!("csrf={pt}&_action=recovery&code={first_code}"), Some(&pending))).await;
     assert!(location(&r).starts_with("/account/security?ok=Signed+in+with+a+recovery+code.+9+left"), "{}", location(&r));
+
+    // That sign-in is not recent; another code steps it up (FAC-2).
+    let rec = set_cookie(&r, "__Host-acct").unwrap();
+    assert!(text(send(&app, get("/account/security", Some(&rec))).await).await.contains("Changes here need a recent sign-in"));
+    let page = text(send(&app, get("/account/reauth?next=%2Faccount%2Fsecurity", Some(&rec))).await).await;
+    assert!(page.contains(r#"name="_action" value="recovery""#), "offered while codes are left");
+    let body = format!("csrf={}&_action=recovery&next=%2Faccount%2Fsecurity&code={}", field(&page, "csrf"), code_at(2));
+    let r = send(&app, post("/account/reauth", &body, Some(&rec))).await;
+    assert_eq!((r.status(), location(&r)), (StatusCode::SEE_OTHER, "/account/security"));
+    let up = set_cookie(&r, "__Host-acct").unwrap();
+    assert!(!text(send(&app, get("/account/security", Some(&up))).await).await.contains("Changes here need a recent sign-in"));
     drop_user(&a, u.id).await;
 }
 
@@ -657,9 +708,13 @@ async fn passkeys_are_added_and_used_through_the_json_endpoints() {
     let both = format!("{c}; {nonce}");
     let r = send(&app, post_json("/account/passkey/add", &serde_json::json!({ "token": token, "credential": cred, "name": "Phone" }), Some(&both), Some(&t))).await;
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(json_of(r).await["next"].as_str().unwrap().starts_with("/account/security?ok=Passkey+added."));
-    let page = text(send(&app, get("/account/security", Some(&c))).await).await;
+    let rotated = set_cookie(&r, "__Host-acct").expect("the first second factor gives this browser a new token");
+    assert!(rotated != "__Host-acct=" && rotated != c);
+    assert!(json_of(r).await["next"].as_str().unwrap().starts_with("/account/security?ok=Passkey+added"));
+    assert_eq!(send(&app, get("/account/security", Some(&c))).await.status(), StatusCode::SEE_OTHER, "the old token is dead");
+    let page = text(send(&app, get("/account/security", Some(&rotated))).await).await;
     assert!(page.contains("<td>Phone</td>"));
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
 
     // Signing in with it, no session yet: no CSRF token needed.
     let r = send(&app, post_json("/account/passkey/options/login", &serde_json::json!({}), None, None)).await;

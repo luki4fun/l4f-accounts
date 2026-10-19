@@ -6,7 +6,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::auth::{NewSession, WINDOW, clean_email};
+use super::auth::{NewSession, WINDOW, signup_fields};
 use super::{Accounts, Actor, Ctx, DAY, Error, Host};
 use crate::model::{AccountId, Invite, NewUser};
 use crate::store::InviteSignup;
@@ -14,7 +14,7 @@ use crate::{password, scope, util};
 
 /// Sign-ups with a code per address per window. Codes are 128 random bits, so
 /// this does not guard them; it keeps one address from minting accounts as
-/// fast as it holds codes and caps the hashing a stranger can cause.
+/// fast as it holds codes. A wrong code never reaches the password hash.
 const INVITE_TRIES: usize = 20;
 /// The longest an invite stays valid.
 pub const MAX_INVITE_DAYS: i64 = 30;
@@ -39,9 +39,14 @@ fn code_hash(code: &str) -> Option<[u8; 32]> {
 
 impl<H: Host> Accounts<H> {
     /// A new code, shown once: only its hash is kept. `username` binds it to
-    /// that name (which must be free now); `days` is clamped to 1..=30.
+    /// that name (which must be free now); `days` is clamped to 1..=30. The
+    /// account it makes gets the `user` role, so the actor must cover that
+    /// role, as `grant_role` would ask.
     pub async fn invite_create(&self, ctx: &Ctx, actor: Actor<'_>, username: Option<&str>, days: i64) -> Result<String, Error> {
         actor.need("users:admin")?;
+        if !scope::covers(actor.scopes, &self.role("user").await?.scopes) {
+            return Err(Error::Forbidden);
+        }
         self.issue_invite(ctx, Some(actor.user.id), username, days).await
     }
 
@@ -56,8 +61,7 @@ impl<H: Host> Accounts<H> {
         let cfg = self.host.config();
         let username = match username.map(str::trim).filter(|u| !u.is_empty()) {
             Some(u) => {
-                let extra: Vec<&str> = cfg.reserved_usernames.iter().map(String::as_str).collect();
-                let name = scope::normalize_username(u, &extra).map_err(Error::Invalid)?;
+                let name = cfg.username(u)?;
                 if self.store.user_by_username(&name).await?.is_some() {
                     return Err(Error::UsernameTaken);
                 }
@@ -69,7 +73,7 @@ impl<H: Host> Accounts<H> {
         let hash: [u8; 32] = Sha256::digest(raw).into();
         let expires_at = util::now() + days.clamp(1, MAX_INVITE_DAYS) * DAY;
         self.store.insert_invite(&hash, actor, username.as_deref(), expires_at).await?;
-        self.audit(ctx, None, actor, "invite_create", username.as_deref().unwrap_or("")).await?;
+        self.audit_after(ctx, None, actor, "invite_create", &super::admin::marked(username.as_deref().unwrap_or(""), actor)).await;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "invite_create", actor = %super::admin::by(actor),
             bound = username.is_some());
         Ok(util::b64u(&raw))
@@ -87,7 +91,7 @@ impl<H: Host> Accounts<H> {
         let hash: [u8; 32] = hex::decode(id).ok().and_then(|b| b.try_into().ok()).ok_or(Error::NotFound)?;
         let gone = self.store.delete_invite(&hash).await?;
         if gone {
-            self.audit(ctx, None, Some(actor.user.id), "invite_revoke", "").await?;
+            self.audit_after(ctx, None, Some(actor.user.id), "invite_revoke", "").await;
         }
         Ok(gone)
     }
@@ -105,25 +109,18 @@ impl<H: Host> Accounts<H> {
 
     async fn register_invite_inner(&self, ctx: &Ctx, form: InviteForm<'_>) -> Result<NewSession, Error> {
         let cfg = self.host.config();
-        if !cfg.enabled {
-            return Err(Error::Closed);
-        }
-        if ctx.cross_site() {
-            return Err(Error::CrossSite);
-        }
-        if !self.limiter.check(&format!("acct-inv-{}:x", util::ip_key(ctx.ip)), WINDOW, INVITE_TRIES) {
-            return Err(Error::RateLimited);
-        }
+        self.door(ctx, "acct-inv", WINDOW, INVITE_TRIES)?;
         const BAD: Error = Error::Invalid("That invite is not valid: wrong, used, expired, or meant for another name.");
         let hash = code_hash(form.code.trim()).ok_or(BAD)?;
-        let extra: Vec<&str> = cfg.reserved_usernames.iter().map(String::as_str).collect();
-        let username = scope::normalize_username(form.username, &extra).map_err(Error::Invalid)?;
-        password::check_policy(form.password, cfg.min_password_len).map_err(Error::Invalid)?;
-        let display_name = match form.display_name.filter(|d| !d.trim().is_empty()) {
-            Some(d) => scope::clean_display_name(d).map_err(Error::Invalid)?,
-            None => username.clone(),
-        };
-        let email_pending = clean_email(form.email.unwrap_or("")).map_err(Error::Invalid)?;
+        let (username, display_name, email_pending) = signup_fields(&cfg, form.username, form.password, form.display_name, form.email)?;
+        // A wrong code or a taken name costs no hash: Argon2 has two slots for
+        // the whole process. The claim below still settles a race for either.
+        if !self.store.invite_open(&hash, &username, util::now()).await? {
+            return Err(BAD);
+        }
+        if self.store.user_by_username(&username).await?.is_some() {
+            return Err(Error::UsernameTaken);
+        }
         let pw = form.password.to_owned();
         let password_hash = self.kdf(move || password::hash(&pw)).await?;
         let now = util::now();
@@ -134,7 +131,7 @@ impl<H: Host> Accounts<H> {
             InviteSignup::BadInvite => return Err(BAD),
             InviteSignup::UsernameTaken => return Err(Error::UsernameTaken),
         }
-        self.audit(ctx, Some(id), None, "register", "invite").await?;
+        self.audit_after(ctx, Some(id), None, "register", "invite").await;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "register", user = %id.hex(),
             username = ?user.username, how = "invite");
         Ok(self.create_session(id, "password", true, now, ctx).await?)

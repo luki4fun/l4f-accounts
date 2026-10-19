@@ -11,8 +11,8 @@ use serde::Deserialize;
 
 use super::flash::{self, Flash};
 use super::{
-    Authed, BASE, St, Viewer, WebHost, clear_session, csrf_for_cookie, known_device, page, refused, see_other,
-    session_token, set_session, status_of,
+    Authed, BASE, LOGIN_PAGE, St, Viewer, WebHost, clear_session, csrf_for_cookie, json_refused, known_device, page, refused,
+    see_other, session_token, set_session, status_of,
 };
 use crate::password::MAX_LEN;
 use crate::service::{Accounts, Ctx, Error, LoginStep};
@@ -110,12 +110,7 @@ pub(super) async fn login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, F
             let to = format!("{BASE}/mfa?next={}", util::urlencode(util::safe_next(&f.next, BASE)));
             see_other(&to, &[set_session(&cfg, &s.token)])
         }
-        Err(e) => {
-            if let Error::Db(err) = &e {
-                tracing::error!(target: "accounts", error = %err, "database error");
-            }
-            login_page(&a, &h, status_of(&e), &f.next, &f.username, None, Some(e.message()))
-        }
+        Err(e) => login_page(&a, &h, status_of(&e), &f.next, &f.username, None, Some(e.message())),
     }
 }
 
@@ -126,7 +121,7 @@ pub(super) async fn logout<H: WebHost>(State(a): St<H>, h: HeaderMap) -> Respons
     {
         tracing::warn!(target: "accounts", error = %e, "session row not removed at sign-out");
     }
-    flash::to(&a.keys, &format!("{BASE}/login"), true, "Signed out.", &[clear_session(&cfg), super::sync_hint(&cfg, false)])
+    flash::to(&a.keys, LOGIN_PAGE, true, "Signed out.", &[clear_session(&cfg), super::sync_hint(&cfg, false)])
 }
 
 pub(super) async fn logout_all<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap) -> Response {
@@ -176,7 +171,7 @@ fn register_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode,
     // A fresh challenge every time: the last one may already be burned.
     let (challenge_json, stamp) = match key {
         Some(k) => (
-            serde_json::to_string(&pow::issue(k, cfg.signup.pow_maxnumber, cfg.signup.pow_ttl_minutes * 60)).unwrap_or_default(),
+            serde_json::to_string(&pow::issue(k, cfg.signup.pow_maxnumber, cfg.signup.pow_ttl_minutes.saturating_mul(60))).unwrap_or_default(),
             pow::stamp(k, util::now_secs()),
         ),
         None => (String::new(), String::new()),
@@ -219,12 +214,7 @@ pub(super) async fn register<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap
             let cookies = super::signed_in(&a, &s).await;
             flash::to(&a.keys, BASE, true, "Welcome! Your account is ready.", &cookies)
         }
-        Err(e) => {
-            if let Error::Db(err) = &e {
-                tracing::error!(target: "accounts", error = %err, "database error");
-            }
-            register_page(&a, &h, status_of(&e), &f, Some(e.message()))
-        }
+        Err(e) => register_page(&a, &h, status_of(&e), &f, Some(e.message())),
     }
 }
 
@@ -241,13 +231,20 @@ struct ReauthTpl<'a> {
     totp: bool,
     passkey: bool,
     password: bool,
+    /// Codes are left: whoever lost the factor they stand in for steps up
+    /// with one.
+    recovery: bool,
     /// Providers to confirm with, for accounts with nothing else to offer.
     social: Vec<(&'static str, &'static str)>,
     max_len: usize,
     error: Option<&'a str>,
 }
 
-fn reauth_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, me: &Authed, next: &str, error: Option<&str>) -> Response {
+async fn reauth_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, me: &Authed, next: &str, error: Option<&str>) -> Response {
+    let left = match a.recovery_left(me.user.id).await {
+        Ok(n) => n,
+        Err(e) => return refused(a, h, &Error::Db(e)),
+    };
     let t = ReauthTpl {
         base: BASE,
         next,
@@ -257,6 +254,7 @@ fn reauth_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, m
         totp: me.user.totp_enabled,
         passkey: me.user.has_passkey,
         password: me.user.has_password,
+        recovery: left > 0,
         social: if me.user.totp_enabled || me.user.has_passkey || me.user.has_password { Vec::new() } else { super::providers(a) },
         max_len: MAX_LEN,
         error,
@@ -265,7 +263,7 @@ fn reauth_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, m
 }
 
 pub(super) async fn reauth_form<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderMap, Query(q): Query<NextQuery>) -> Response {
-    reauth_page(&a, &h, StatusCode::OK, &me, &q.next, None)
+    reauth_page(&a, &h, StatusCode::OK, &me, &q.next, None).await
 }
 
 #[derive(Deserialize, Default)]
@@ -279,19 +277,14 @@ pub(super) struct ReauthForm {
 }
 
 pub(super) async fn reauth<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Form(f): Form<ReauthForm>) -> Response {
-    let r = if f.action == "totp" {
-        a.step_up_totp(&ctx, &me.user, &me.session, &f.code).await
-    } else {
-        a.step_up(&ctx, &me.user, &me.session, &f.password).await
+    let r = match f.action.as_str() {
+        "totp" => a.step_up_totp(&ctx, &me.user, &me.session, &f.code).await,
+        "recovery" => a.step_up_recovery(&ctx, &me.user, &me.session, &f.code).await,
+        _ => a.step_up(&ctx, &me.user, &me.session, &f.password).await,
     };
     match r {
         Ok(s) => see_other(util::safe_next(&f.next, BASE), &[set_session(&a.host.config(), &s.token)]),
-        Err(e) => {
-            if let Error::Db(err) = &e {
-                tracing::error!(target: "accounts", error = %err, "database error");
-            }
-            reauth_page(&a, &h, status_of(&e), &me, &f.next, Some(e.message()))
-        }
+        Err(e) => reauth_page(&a, &h, status_of(&e), &me, &f.next, Some(e.message())).await,
     }
 }
 
@@ -302,4 +295,13 @@ pub(super) fn need_fresh<H: WebHost>(a: &Accounts<H>, me: &Authed, back: &str) -
         return None;
     }
     Some(see_other(&format!("{BASE}/reauth?next={}", util::urlencode(back)), &[]))
+}
+
+/// `need_fresh` for the scripts: a refusal they show, since they cannot
+/// follow a redirect to the step-up page.
+pub(super) fn need_fresh_json<H: WebHost>(a: &Accounts<H>, me: &Authed) -> Option<Response> {
+    if a.fresh(&me.session, util::now()) {
+        return None;
+    }
+    Some(json_refused(&Error::Invalid("Confirm it's you first: reload the page.")))
 }

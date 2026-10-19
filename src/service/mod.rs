@@ -35,7 +35,7 @@ pub use social::{Intent, OAuth, SocialOutcome};
 #[cfg(feature = "axum")]
 pub(crate) use auth::token_hash;
 
-use std::{future::Future, net::IpAddr, sync::Arc};
+use std::{future::Future, net::IpAddr, sync::Arc, time::Duration};
 
 use serde::Deserialize;
 use tokio::sync::{Mutex, Semaphore};
@@ -57,10 +57,14 @@ pub trait Host: Send + Sync + 'static {
     fn export(&self, user: AccountId) -> impl Future<Output = Vec<(String, serde_json::Value)>> + Send;
     /// Runs inside the account-deletion transaction: an error here, or a refusal
     /// after it, rolls back the app's part too. `tx` is a connection of
-    /// whichever backend the store runs on.
+    /// whichever backend the store runs on. The transaction holds the
+    /// last-admin guard (`Store::begin`), so every write here goes through
+    /// `tx`: one through a pool, `Accounts` or the store can wait on it, and
+    /// then fails after a timeout.
     fn delete_user(&self, tx: StoreConn<'_>, user: AccountId, delete_owned: bool) -> impl Future<Output = sqlx::Result<()>> + Send;
     /// The host's own public links for a profile, as (label, url): l4f's
-    /// short links marked public, say. None by default.
+    /// short links marked public, say. None by default. A url that does not
+    /// start with `https://`, `http://` or `/` is left out of the page.
     fn profile_links(&self, user: AccountId) -> impl Future<Output = Vec<(String, String)>> + Send {
         let _ = user;
         std::future::ready(Vec::new())
@@ -81,7 +85,10 @@ pub struct Config {
     pub step_up_minutes: i64,
     /// Per address (IPv6: per /64), or per known device.
     pub login_per_15min: usize,
-    /// Everyone without a known-device cookie together.
+    /// Everyone without a known-device cookie together: the operator's switch
+    /// against guessing spread over many addresses. Once it is spent, no new
+    /// browser signs in with a password until the window ends, so the default
+    /// sits far above real sign-ins; lower it while such an attack runs.
     pub login_per_15min_global: usize,
     pub login_per_user_15min: usize,
     pub signup: pow::Limits,
@@ -95,7 +102,8 @@ pub struct Config {
     pub require_2fa_for_privileged: bool,
     /// WebAuthn relying party id. Empty: the host of `base_url`.
     pub rp_id: String,
-    /// Origins a passkey ceremony may run on. Empty: `base_url` alone.
+    /// Origins a passkey ceremony or device key may run on, and forms may post
+    /// from. Empty: the origin of `base_url` alone.
     pub webauthn_origins: Vec<String>,
     /// The name authenticator apps list the account under. Empty: the host of `base_url`.
     pub totp_issuer: String,
@@ -115,6 +123,8 @@ pub struct Config {
     pub egress: Option<std::net::SocketAddr>,
     /// Synced settings, vault and avatar together, per account.
     pub storage_quota_bytes: i64,
+    /// Where the site is, as `https://l4f.cc`: mail links and the OAuth
+    /// redirect add their path to it, so it ends without a slash.
     #[serde(skip)]
     pub base_url: String,
     #[serde(skip)]
@@ -134,7 +144,7 @@ impl Default for Config {
             session_max_days: 30,
             step_up_minutes: 15,
             login_per_15min: 10,
-            login_per_15min_global: 50,
+            login_per_15min_global: 1000,
             login_per_user_15min: 10,
             signup: pow::Limits::default(),
             reserved_usernames: Vec::new(),
@@ -177,8 +187,19 @@ impl Config {
         if self.rp_id.is_empty() { self.host() } else { &self.rp_id }
     }
 
+    /// `webauthn_origins`, or else the origin of `base_url`.
     pub fn origins(&self) -> Vec<String> {
-        if self.webauthn_origins.is_empty() { vec![self.base_url.clone()] } else { self.webauthn_origins.clone() }
+        if self.webauthn_origins.is_empty() { vec![self.origin()] } else { self.webauthn_origins.clone() }
+    }
+
+    /// `base_url`'s scheme and authority, as a browser names its origin in
+    /// `Origin` and `clientDataJSON`: never a path or a trailing slash, so
+    /// `https://l4f.cc/` is `https://l4f.cc`.
+    fn origin(&self) -> String {
+        match self.base_url.split_once("://") {
+            Some((scheme, rest)) => format!("{scheme}://{}", rest.split(['/', '?', '#']).next().unwrap_or("")),
+            None => self.base_url.clone(),
+        }
     }
 
     pub fn issuer(&self) -> &str {
@@ -187,6 +208,12 @@ impl Config {
 
     pub fn ssh_namespace(&self) -> String {
         if self.ssh_namespace.is_empty() { format!("login@{}", self.host()) } else { self.ssh_namespace.clone() }
+    }
+
+    /// `scope::normalize_username`, with the app's reserved words.
+    fn username(&self, raw: &str) -> Result<String, Error> {
+        let extra: Vec<&str> = self.reserved_usernames.iter().map(String::as_str).collect();
+        scope::normalize_username(raw, &extra).map_err(Error::Invalid)
     }
 }
 
@@ -292,6 +319,15 @@ impl From<WriteError> for Error {
     }
 }
 
+impl From<CreateUserError> for Error {
+    fn from(e: CreateUserError) -> Self {
+        match e {
+            CreateUserError::UsernameTaken => Self::UsernameTaken,
+            CreateUserError::Db(e) => Self::Db(e),
+        }
+    }
+}
+
 /// Why the boot-time admin was not created. The caller refuses to start.
 #[derive(Debug)]
 pub enum BootstrapError {
@@ -325,13 +361,16 @@ impl From<sqlx::Error> for BootstrapError {
     }
 }
 
-/// Rows removed by one `sweep`.
+/// Rows removed by one `sweep`, and TOTP secrets it resealed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Swept {
     pub sessions: u64,
     pub audit: u64,
     pub devkeys: u64,
     pub invites: u64,
+    /// Moved off the old master. Once a sweep during a rotation reseals none,
+    /// no TOTP secret needs the old master any more (see `keys`).
+    pub resealed: u64,
 }
 
 const DAY: i64 = 86_400;
@@ -345,7 +384,7 @@ pub struct Accounts<H: Host> {
     pub host: H,
     /// `CRATE_SCOPES` and the app's: what a role may carry.
     pub scopes: Vec<ScopeDef>,
-    /// ALTCHA key; sign-up stays closed without one.
+    /// ALTCHA key, at least `pow::MIN_KEY_LEN` bytes; sign-up stays closed without one.
     pub pow_key: Option<Vec<u8>>,
     /// For `IpMode::Hash`. A secret, so never part of `Config`.
     ip_salt: Vec<u8>,
@@ -369,6 +408,11 @@ pub fn require(scopes: &[String], required: &str) -> bool {
     scope::allowed(scopes, required)
 }
 
+/// `require`, as the `Forbidden` a call answers without the scope.
+fn need(scopes: &[String], required: &str) -> Result<(), Error> {
+    if require(scopes, required) { Ok(()) } else { Err(Error::Forbidden) }
+}
+
 /// TOTP codes or a passkey. Once one exists, a password alone only opens a
 /// session that waits for it.
 pub fn has_second_factor(u: &User) -> bool {
@@ -377,8 +421,10 @@ pub fn has_second_factor(u: &User) -> bool {
 
 impl<H: Host> Accounts<H> {
     /// Seeds the built-in roles, so call it after `migrate::run` and before
-    /// `bootstrap_admin`. Refuses app scopes that are not valid names and
-    /// default user scopes nobody registered.
+    /// `bootstrap_admin`. Refuses app scopes that are not valid names or
+    /// repeat a registered one, and default user scopes nobody registered.
+    /// A `pow_key` under `pow::MIN_KEY_LEN` bytes is logged and dropped, which
+    /// keeps sign-up closed.
     pub async fn build(
         store: Store,
         keys: Keys,
@@ -407,7 +453,27 @@ impl<H: Host> Accounts<H> {
         if let Some(bad) = app_scopes.iter().find(|d| !scope::valid_scope(d.name)) {
             return Err(sqlx::Error::InvalidArgument(format!("not a valid scope name: {:?}", bad.name)));
         }
-        let scopes = scope::CRATE_SCOPES.iter().chain(app_scopes).copied().collect();
+        let mut scopes: Vec<ScopeDef> = scope::CRATE_SCOPES.to_vec();
+        for d in app_scopes {
+            // Grants match by name, so a second entry would hand out the
+            // first one's power under its own description.
+            if scopes.iter().any(|s| s.name == d.name) {
+                return Err(sqlx::Error::InvalidArgument(format!("scope registered twice: {:?}", d.name)));
+            }
+            scopes.push(*d);
+        }
+        // A short key lets anyone forge the proof-of-work. Logged, not fatal:
+        // without a key sign-up is closed, and the rest of the site boots.
+        let pow_key = pow_key.filter(|k| {
+            let ok = k.len() >= pow::MIN_KEY_LEN;
+            if !ok {
+                tracing::error!(target: "accounts", "the ALTCHA key is under {} bytes: sign-up stays closed", pow::MIN_KEY_LEN);
+            }
+            ok
+        });
+        if host.config().ip_mode == IpMode::Hash && ip_salt.len() < ip::MIN_SALT_LEN {
+            tracing::error!(target: "accounts", "ip_mode is \"hash\" but the IP salt is under {} characters: storing no addresses", ip::MIN_SALT_LEN);
+        }
         let a = Self {
             store,
             keys,
@@ -457,8 +523,75 @@ impl<H: Host> Accounts<H> {
         ip::shape_ip(ip, self.host.config().ip_mode, &self.ip_salt)
     }
 
+    /// Anonymous entry: the site is on, the form came from this site, and this
+    /// address is under `max` per `window` for `kind`.
+    fn door(&self, ctx: &Ctx, kind: &str, window: Duration, max: usize) -> Result<(), Error> {
+        if !self.host.config().enabled {
+            return Err(Error::Closed);
+        }
+        if ctx.cross_site() {
+            return Err(Error::CrossSite);
+        }
+        self.per_ip(ctx, kind, window, max)
+    }
+
+    /// A counter per address (IPv6: per /64), keyed `{kind}:{address}`.
+    fn per_ip(&self, ctx: &Ctx, kind: &str, window: Duration, max: usize) -> Result<(), Error> {
+        let ok = self.limiter.check(&format!("{kind}:{}", util::ip_key(ctx.ip)), window, max);
+        if ok { Ok(()) } else { Err(Error::RateLimited) }
+    }
+
+    /// A counter per account, keyed `{kind}-{id}:x`: every account is a
+    /// limiter kind of its own, so a flood of other keys never merges it with
+    /// anyone's. Only for accounts that exist, which bounds how many there are.
+    fn per_account(&self, kind: &str, id: AccountId, window: Duration, max: usize) -> Result<(), Error> {
+        let ok = self.limiter.check(&account_key(kind, id), window, max);
+        if ok { Ok(()) } else { Err(Error::RateLimited) }
+    }
+
+    /// The audit row alone, where it comes before the change it records (or
+    /// with a refusal), so its error stops the call. After a commit: `audit_after`.
     async fn audit(&self, ctx: &Ctx, user: Option<AccountId>, actor: Option<AccountId>, event: &str, detail: &str) -> sqlx::Result<()> {
         self.store.audit(user, actor, event, detail, &self.shaped_ip(ctx.ip)).await
+    }
+
+    /// The audit row of a change already committed. A failed write is logged,
+    /// not returned: an error would say the change did not happen, and a
+    /// retried sign-up would then find its own name taken.
+    async fn audit_after(&self, ctx: &Ctx, user: Option<AccountId>, actor: Option<AccountId>, event: &str, detail: &str) {
+        if let Err(e) = self.audit(ctx, user, actor, event, detail).await {
+            audit_lost(event, &e);
+        }
+    }
+
+    /// The audit row and its log line, the address shaped once. `outcome` is
+    /// the event, so journal greps on `ip=` and `outcome=` keep matching.
+    async fn record(&self, ctx: &Ctx, user: Option<AccountId>, actor: Option<AccountId>, event: &str, detail: &str) -> sqlx::Result<()> {
+        let ip = self.shaped_ip(ctx.ip);
+        self.store.audit(user, actor, event, detail, &ip).await?;
+        event_line(&ip, user, actor, event, detail);
+        Ok(())
+    }
+
+    /// `record` after a commit, as `audit_after` is to `audit`; the line is
+    /// written even when the row is lost.
+    async fn record_after(&self, ctx: &Ctx, user: Option<AccountId>, actor: Option<AccountId>, event: &str, detail: &str) {
+        let ip = self.shaped_ip(ctx.ip);
+        if let Err(e) = self.store.audit(user, actor, event, detail, &ip).await {
+            audit_lost(event, &e);
+        }
+        event_line(&ip, user, actor, event, detail);
+    }
+
+    /// The audit row of a refusal, written by a task of its own so the answer
+    /// does not wait for it.
+    fn audit_detached(&self, ctx: &Ctx, user: AccountId, actor: Option<AccountId>, event: &'static str, detail: &'static str) {
+        let (store, ip) = (self.store.clone(), self.shaped_ip(ctx.ip));
+        tokio::spawn(async move {
+            if let Err(e) = store.audit(Some(user), actor, event, detail, &ip).await {
+                audit_lost(event, &e);
+            }
+        });
     }
 
     /// The account's scopes as they apply now: privileged ones (anything
@@ -491,7 +624,7 @@ impl<H: Host> Accounts<H> {
     pub async fn bootstrap_grant(&self, ctx: &Ctx, user: AccountId) -> Result<bool, Error> {
         let granted = self.store.grant_admin_if_none(user).await?;
         if granted {
-            self.audit(ctx, Some(user), None, "bootstrap", "grant").await?;
+            self.audit_after(ctx, Some(user), None, "bootstrap", "grant").await;
             tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "bootstrap", user = %user.hex(), "admin granted");
         }
         Ok(granted)
@@ -525,54 +658,59 @@ impl<H: Host> Accounts<H> {
         // The account's own audit rows went with it; an admin's deletion is
         // still the admin's action to account for.
         if by_admin {
-            self.audit(ctx, None, Some(actor.user.id), "account_delete", &user.hex()).await?;
+            self.audit_after(ctx, None, Some(actor.user.id), "account_delete", &user.hex()).await;
         }
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "account_delete",
             user = %user.hex(), actor = %actor.user.id.hex(), delete_owned);
         Ok(())
     }
 
-    /// Expired and idle sessions, then audit rows past retention, in batches so
-    /// no lock is held long. The host runs it hourly.
+    /// Expired and idle sessions, device keys unused for 90 days, expired
+    /// invites, then audit rows past retention, in batches so no lock is held
+    /// long. The host runs it hourly. During a key rotation it also reseals the
+    /// TOTP secrets still sealed under the old master: a secret is otherwise
+    /// resealed only when its code is used.
     pub async fn sweep(&self, now: i64) -> sqlx::Result<Swept> {
         let cfg = self.host.config();
-        let mut out = Swept::default();
-        loop {
-            let n = self.store.delete_expired_sessions(now, cfg.session_idle_days * DAY, SWEEP_BATCH).await?;
-            out.sessions += n;
-            if n < SWEEP_BATCH {
-                break;
-            }
-        }
-        loop {
-            let before = now - keylogin::DEVKEY_DAYS * DAY;
-            let n = self.store.delete_stale_credentials(keylogin::DEVKEY, before, SWEEP_BATCH).await?;
-            out.devkeys += n;
-            if n < SWEEP_BATCH {
-                break;
-            }
-        }
-        loop {
-            let n = self.store.delete_expired_invites(now, SWEEP_BATCH).await?;
-            out.invites += n;
-            if n < SWEEP_BATCH {
-                break;
-            }
-        }
+        let before = now - keylogin::DEVKEY_DAYS * DAY;
+        let mut out = Swept {
+            sessions: drain(|| self.store.delete_expired_sessions(now, cfg.session_idle_days * DAY, SWEEP_BATCH)).await?,
+            devkeys: drain(|| self.store.delete_stale_credentials(keylogin::DEVKEY, before, SWEEP_BATCH)).await?,
+            invites: drain(|| self.store.delete_expired_invites(now, SWEEP_BATCH)).await?,
+            ..Swept::default()
+        };
         if cfg.audit_retention_days > 0 {
-            loop {
-                let n = self.store.delete_audit_before(now - cfg.audit_retention_days * DAY, SWEEP_BATCH).await?;
-                out.audit += n;
-                if n < SWEEP_BATCH {
-                    break;
-                }
-            }
+            out.audit = drain(|| self.store.delete_audit_before(now - cfg.audit_retention_days * DAY, SWEEP_BATCH)).await?;
+        }
+        // Only while an old master is set.
+        if self.keys.subkeys("totp").len() > 1 {
+            out.resealed = self.reseal_totp_rows().await?;
         }
         if out != Swept::default() {
             tracing::info!(target: "accounts", sessions = out.sessions, audit = out.audit, devkeys = out.devkeys,
-                invites = out.invites, "sweep");
+                invites = out.invites, resealed = out.resealed, "sweep");
         }
         Ok(out)
+    }
+
+    /// Every TOTP secret the old master opens, sealed again under the current
+    /// one. The compare-and-set skips a row that changed meanwhile.
+    async fn reseal_totp_rows(&self) -> sqlx::Result<u64> {
+        let (mut after, mut n) = (AccountId([0; 16]), 0);
+        loop {
+            let rows = self.store.totp_rows(after, SWEEP_BATCH).await?;
+            for (user, sealed) in &rows {
+                if let Some((secret, true)) = self.keys.open("totp", &user.0, sealed)
+                    && self.store.reseal_totp(*user, sealed, &self.keys.seal("totp", &user.0, &secret)).await?
+                {
+                    n += 1;
+                }
+            }
+            match rows.last() {
+                Some((last, _)) if rows.len() as u64 == SWEEP_BATCH => after = *last,
+                _ => return Ok(n),
+            }
+        }
     }
 
     /// The first admin, from the old single-admin env (`L4F_ADMIN_USER` and
@@ -615,7 +753,9 @@ impl<H: Host> Accounts<H> {
             Err(CreateUserError::UsernameTaken) => return Err(BootstrapError::NameTaken),
             Err(CreateUserError::Db(e)) => return Err(e.into()),
         }
-        self.store.audit(Some(id), None, "bootstrap", "", "").await?;
+        if let Err(e) = self.store.audit(Some(id), None, "bootstrap", "", "").await {
+            audit_lost("bootstrap", &e);
+        }
         tracing::info!(target: "accounts", outcome = "bootstrap", user = %id.hex(), username = ?name, "admin account created");
         Ok(Some(id))
     }
@@ -647,4 +787,36 @@ fn admin_hash(raw: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The journal line of an audited event. `actor` shows only when it is
+/// someone other than `user` (an admin), `detail` only when there is one.
+fn event_line(ip: &str, user: Option<AccountId>, actor: Option<AccountId>, event: &str, detail: &str) {
+    let hex = |id: AccountId| tracing::field::display(id.hex());
+    let actor = actor.filter(|a| Some(*a) != user);
+    tracing::info!(target: "accounts", %ip, outcome = event, actor = actor.map(hex), user = user.map(hex),
+        detail = (!detail.is_empty()).then_some(detail));
+}
+
+/// The limiter key of `per_account`'s counter.
+fn account_key(kind: &str, id: AccountId) -> String {
+    format!("{kind}-{}:x", id.hex())
+}
+
+/// All that is left of an audit row that could not be written.
+fn audit_lost(event: &str, e: &sqlx::Error) {
+    tracing::warn!(target: "accounts", error = %e, event, "audit write failed");
+}
+
+/// Calls `batch` until one comes back short of `SWEEP_BATCH`: the rows
+/// removed in all.
+async fn drain<F: Future<Output = sqlx::Result<u64>>>(mut batch: impl FnMut() -> F) -> sqlx::Result<u64> {
+    let mut total = 0;
+    loop {
+        let n = batch().await?;
+        total += n;
+        if n < SWEEP_BATCH {
+            return Ok(total);
+        }
+    }
 }

@@ -101,6 +101,27 @@ pub struct Credential {
     pub public: bool,
 }
 
+impl Credential {
+    /// A new credential as it is first stored: made now, never used, not
+    /// public, with no algorithm, counter or flags (a passkey sets its own).
+    #[cfg(feature = "_db")]
+    pub(crate) fn new(kind: impl Into<String>, ext_id: Vec<u8>, user_id: AccountId, public_key: Option<Vec<u8>>, name: String) -> Self {
+        Self {
+            kind: kind.into(),
+            ext_id,
+            user_id,
+            public_key,
+            alg: 0,
+            sign_count: 0,
+            flags: 0,
+            name,
+            created_at: util::now(),
+            last_used_at: None,
+            public: false,
+        }
+    }
+}
+
 /// `Credential::flags` bit for a passkey that may be synced (backup eligible).
 pub const FLAG_BACKUP_ELIGIBLE: i64 = 1;
 

@@ -8,7 +8,7 @@
     <dt>Id</dt><dd class="mono small anywhere">{{ u.id.hex() }}</dd>
     <dt>Created</dt><dd>{{ created }}</dd>
     <dt>Status</dt><dd>{% if u.status == crate::model::UserStatus::Disabled %}<span class="tag warn">suspended</span>{% else %}active{% endif %}</dd>
-    <dt>Two-factor</dt><dd>{% if u.totp_enabled %}on{% else %}off{% endif %}</dd>
+    <dt>Two-factor</dt><dd>{% if u.totp_enabled && u.has_passkey %}codes, passkey{% else if u.totp_enabled %}codes{% else if u.has_passkey %}passkey{% else %}off{% endif %}</dd>
     <dt>Email</dt><dd>{% if let Some(e) = u.email %}{{ e }}{% else %}&ndash;{% endif %}</dd>
   </dl>
 

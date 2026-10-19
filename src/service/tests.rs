@@ -9,9 +9,9 @@ use sha2::Digest;
 use super::admin::role_name;
 use super::storage::KV_MAX_BYTES;
 use super::profile::uuid_of;
-use super::auth::{clean_email, new_token, token_hash};
+use super::auth::{WINDOW, clean_email, new_token, token_hash};
 use super::*;
-use crate::model::{SessionInfo, UserStatus};
+use crate::model::{Credential, SessionInfo, UserStatus};
 use crate::store::tests::{Arg, delete, exec, exec_conn, fresh, scalar, shared as shared_store};
 
 const APP: &[ScopeDef] = &[ScopeDef { name: "t:one", description: "test" }, ScopeDef { name: "t:two", description: "test" }];
@@ -63,8 +63,11 @@ fn cfg() -> Config {
 
 /// Own limiter per instance, so tests never spend each other's caps.
 async fn on(store: Store, cfg: Config) -> Accounts<Stub> {
+    on_keys(store, cfg, Keys::new(&[7; 32], None).unwrap()).await
+}
+
+async fn on_keys(store: Store, cfg: Config, keys: Keys) -> Accounts<Stub> {
     let host = Stub { cfg: Arc::new(cfg), deleted: StdMutex::default() };
-    let keys = Keys::new(&[7; 32], None).unwrap();
     Accounts::build(store, keys, Arc::default(), host, APP, Some(POW_KEY.to_vec()), Vec::new()).await.unwrap()
 }
 
@@ -130,6 +133,11 @@ async fn register(a: &Accounts<Stub>, c: &Ctx, name: &str, pw: &str) -> Result<N
     register_with(a, c, name, pw, None).await
 }
 
+/// A full session of `u`: what an enrolment asks of its caller.
+async fn full_session(a: &Accounts<Stub>, c: &Ctx, u: &User) -> SessionInfo {
+    a.create_session(u.id, "password", true, util::now(), c).await.unwrap().info
+}
+
 async fn make_user(a: &Accounts<Stub>, roles: &[&str]) -> User {
     let u = NewUser {
         id: AccountId::new(),
@@ -145,6 +153,11 @@ async fn make_user(a: &Accounts<Stub>, roles: &[&str]) -> User {
         a.store.grant_role(u.id, role.id, None).await.unwrap();
     }
     a.store.user_by_id(u.id).await.unwrap().unwrap()
+}
+
+/// No password, as after a social sign-up: nothing in the crate removes one.
+async fn drop_password(a: &Accounts<Stub>, id: AccountId) {
+    exec(&a.store, "UPDATE acct_users SET password_hash = NULL WHERE id = ?", vec![Arg::B(id.0.to_vec())]).await;
 }
 
 async fn make_role(a: &Accounts<Stub>, scopes: &[&str]) -> String {
@@ -218,7 +231,7 @@ fn defaults_keep_signup_closed_and_privileged_scopes_behind_2fa() {
     let c = Config::default();
     assert!(c.enabled && !c.registration_open && c.require_2fa_for_privileged);
     assert_eq!((c.min_password_len, c.session_idle_days, c.session_max_days, c.step_up_minutes), (10, 7, 30, 15));
-    assert_eq!((c.login_per_15min, c.login_per_15min_global, c.login_per_user_15min), (10, 50, 10));
+    assert_eq!((c.login_per_15min, c.login_per_15min_global, c.login_per_user_15min), (10, 1000, 10));
     assert_eq!(c.audit_retention_days, 180);
     let parsed: Config = serde_json::from_str(r#"{"registration_open": true, "signup": {"max_accounts_per_ip_day": 1}}"#).unwrap();
     assert!(parsed.registration_open);
@@ -228,6 +241,22 @@ fn defaults_keep_signup_closed_and_privileged_scopes_behind_2fa() {
     for bad in [r#"{"ip_salt": [1, 2]}"#, r#"{"registraton_open": true}"#, r#"{"signup": {"max_acounts_per_hour": 1}}"#] {
         assert!(serde_json::from_str::<Config>(bad).is_err(), "{bad}: unknown keys, secrets included, are refused");
     }
+}
+
+/// What a browser sends as its origin: never a path or a trailing slash (FAC-14).
+#[test]
+fn origins_are_the_scheme_and_authority_of_base_url() {
+    let bases = [
+        ("https://l4f.cc", "https://l4f.cc"),
+        ("https://l4f.cc/", "https://l4f.cc"),
+        ("http://127.0.0.1:8080/app/?x#y", "http://127.0.0.1:8080"),
+        ("voipc://00ff", "voipc://00ff"),
+    ];
+    for (base, want) in bases {
+        assert_eq!(Config { base_url: base.into(), ..Config::default() }.origins(), [want], "{base}");
+    }
+    let listed = Config { base_url: "https://l4f.cc/".into(), webauthn_origins: vec!["https://a.example".into()], ..Config::default() };
+    assert_eq!(listed.origins(), ["https://a.example"], "a configured list, as it is");
 }
 
 #[test]
@@ -505,6 +534,31 @@ async fn role_admin_needs_cover_and_known_scopes() {
     cleanup(&a, &[boss.id, target.id], &[&boss_role, &two]).await;
 }
 
+/// A role the actor covers still changes only on an account the actor
+/// covers: a moderator cannot sign a stronger admin out over and over by
+/// taking a role away and handing it back (ADMIN-5). The host's shell can.
+#[tokio::test]
+async fn roles_change_only_on_accounts_the_actor_covers() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.41");
+    let mod_role = make_role(&a, &["users:admin", "t:one"]).await;
+    let one = make_role(&a, &["t:one"]).await;
+    let more = make_role(&a, &["t:two"]).await;
+    let moderator = make_user(&a, &[&mod_role]).await;
+    let scopes = a.effective_scopes(&moderator).await.unwrap();
+    let actor = Actor { user: &moderator, scopes: &scopes };
+    let owner = make_user(&a, &[&one, &more]).await;
+    a.store.insert_session(&sess(owner.id, util::now(), util::now() + 100)).await.unwrap();
+    assert!(matches!(a.revoke_role(&c, actor, owner.id, &one).await, Err(Error::Forbidden)));
+    assert_eq!(a.store.sessions_of(owner.id).await.unwrap().len(), 1, "nobody signed out");
+    assert!(a.revoke_role_as_host(&c, owner.id, &one).await.unwrap());
+    assert!(matches!(a.grant_role(&c, actor, owner.id, &one).await, Err(Error::Forbidden)));
+    assert!(a.grant_role_as_host(&c, owner.id, &one).await.unwrap());
+    let peer = make_user(&a, &[&one]).await;
+    assert!(a.revoke_role(&c, actor, peer.id, &one).await.unwrap(), "an account it covers");
+    cleanup(&a, &[moderator.id, owner.id, peer.id], &[&mod_role, &one, &more]).await;
+}
+
 #[tokio::test]
 async fn revoke_and_disable_end_the_targets_sessions() {
     let Some(a) = shared(cfg()).await else { return };
@@ -728,7 +782,7 @@ async fn sweep_removes_dead_sessions_and_old_audit_rows() {
         exec(&a.store, "INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'old', ?)", vec![Arg::B(u.id.0.to_vec()), Arg::I(at)]).await;
     }
     a.store.audit(Some(u.id), None, "recent", "", "").await.unwrap();
-    assert_eq!(a.sweep(now).await.unwrap(), Swept { sessions: 2, audit: 2, devkeys: 0, invites: 0 });
+    assert_eq!(a.sweep(now).await.unwrap(), Swept { sessions: 2, audit: 2, devkeys: 0, invites: 0, resealed: 0 });
     let left: Vec<_> = a.store.sessions_of(u.id).await.unwrap().into_iter().map(|s| s.token_hash).collect();
     assert_eq!(left, [live.token_hash]);
     assert_eq!(audit_events(&a, u.id).await, ["recent"]);
@@ -741,8 +795,43 @@ async fn sweep_removes_dead_sessions_and_old_audit_rows() {
     f.done().await;
 }
 
+/// A rotation: the sweep moves every TOTP secret off the old master, used or
+/// not, so the old master can go; recovery codes from before match only while
+/// it stays (secrets-1). A database of its own: the sweep reads every row.
 #[tokio::test]
-async fn confirm_password_shares_the_account_bucket() {
+async fn the_sweep_reseals_totp_secrets_for_a_key_rotation() {
+    let Some(f) = fresh().await else { return };
+    let (old, new) = ([0x5a; 32], [0x5b; 32]);
+    let a = on_keys(f.store.clone(), cfg(), Keys::new(&old, None).unwrap()).await;
+    let c = ctx("203.0.113.96");
+    let u = make_user(&a, &[]).await;
+    let setup = a.totp_setup(&u);
+    let secret = totp_secret(&setup);
+    let (codes, _) = a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &format!("{:06}", crate::totp::code_at(&secret, step_now()))).await.unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+
+    let rotating = on_keys(f.store.clone(), cfg(), Keys::new(&new, Some(&old)).unwrap()).await;
+    assert_eq!(rotating.sweep(util::now()).await.unwrap().resealed, 1);
+    assert_eq!(rotating.sweep(util::now()).await.unwrap().resealed, 0, "none left under the old master");
+    let pending = pending_of(rotating.login_password(&c, &u.username, PW, None).await);
+    let (_, left) = rotating.mfa_recovery(&c, &u, &pending.info, &codes[0]).await.unwrap();
+    assert_eq!(left, 9, "a code from before the rotation, while the old master stays");
+
+    let after = on_keys(f.store.clone(), cfg(), Keys::new(&new, None).unwrap()).await;
+    let pending = pending_of(after.login_password(&c, &u.username, PW, None).await);
+    assert!(matches!(after.mfa_recovery(&c, &u, &pending.info, &codes[1]).await, Err(Error::Invalid(_))), "not once it is gone");
+    let next = format!("{:06}", crate::totp::code_at(&secret, step_now() + 1));
+    assert!(after.mfa_totp(&c, &u, &pending.info, &next).await.unwrap().info.mfa_ok, "the code was never used during the rotation");
+    assert_eq!(after.sweep(util::now()).await.unwrap().resealed, 0);
+    drop((a, rotating, after));
+    f.done().await;
+}
+
+/// Step-up with the password counts per account like the login form, in a
+/// bucket of its own: strangers failing to sign in as the owner cannot lock
+/// the signed-in owner out of step-up (AUTH-4).
+#[tokio::test]
+async fn confirm_password_has_its_own_account_bucket() {
     let Some(a) = shared(Config { login_per_user_15min: 3, ..cfg() }).await else { return };
     let c = ctx("203.0.113.60");
     let u = make_user(&a, &[]).await;
@@ -752,10 +841,13 @@ async fn confirm_password_shares_the_account_bucket() {
     assert!(matches!(a.confirm_password(&cross, &u, PW).await, Err(Error::CrossSite)));
     a.confirm_password(&c, &u, PW).await.unwrap();
     assert!(matches!(a.confirm_password(&c, &u, PW).await, Err(Error::RateLimited)), "3 per account, right or wrong");
-    assert!(
-        matches!(a.login_password(&ctx("203.0.113.61"), &u.username, PW, None).await, Err(Error::RateLimited)),
-        "the login form spends the same bucket"
-    );
+    signed_in(a.login_password(&ctx("203.0.113.61"), &u.username, PW, None).await);
+    let v = make_user(&a, &[]).await;
+    for _ in 0..3 {
+        assert!(matches!(a.login_password(&ctx("203.0.113.61"), &v.username, "wrong password", None).await, Err(Error::BadLogin)));
+    }
+    assert!(matches!(a.login_password(&ctx("203.0.113.61"), &v.username, PW, None).await, Err(Error::RateLimited)));
+    a.confirm_password(&c, &v, PW).await.unwrap();
     let mut logged = false;
     for _ in 0..50 {
         if audit_events(&a, u.id).await.contains(&"reauth_fail".to_string()) {
@@ -765,7 +857,7 @@ async fn confirm_password_shares_the_account_bucket() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(logged, "a wrong password is audited");
-    cleanup(&a, &[u.id], &[]).await;
+    cleanup(&a, &[u.id, v.id], &[]).await;
 }
 
 #[tokio::test]
@@ -797,6 +889,27 @@ async fn step_up_refreshes_auth_at_and_rotates_the_token() {
     let u2 = a.store.user_by_id(u.id).await.unwrap().unwrap();
     assert!(matches!(a.step_up(&c, &u2, &fresh, PW).await, Err(Error::Invalid(_))), "a password alone is not enough with 2FA");
     cleanup(&a, &[u.id, other.id], &[]).await;
+}
+
+/// A password change asks for no old password and ends every other session:
+/// only from a recent sign-in (AUTH-10). Each is an Argon2 hash, so they are
+/// capped per account once the policy passed (AUTH-3).
+#[tokio::test]
+async fn a_password_change_needs_a_recent_sign_in_and_is_capped() {
+    let Some(a) = shared(Config { login_per_user_15min: 2, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.64");
+    let u = make_user(&a, &[]).await;
+    let now = util::now();
+    let stale = a.create_session(u.id, "password", true, now - 3600, &c).await.unwrap();
+    assert!(matches!(a.password_change(&c, &u, &stale.info, "a brand new password").await, Err(Error::Forbidden)), "an hour-old sign-in");
+    let here = a.create_session(u.id, "password", true, now, &c).await.unwrap();
+    for _ in 0..3 {
+        assert!(matches!(a.password_change(&c, &u, &here.info, "tiny").await, Err(Error::Invalid(_))), "the policy spends nothing");
+    }
+    a.password_change(&c, &u, &here.info, "a brand new password").await.unwrap();
+    a.password_change(&c, &u, &here.info, "another new password").await.unwrap();
+    assert!(matches!(a.password_change(&c, &u, &here.info, "a third new password").await, Err(Error::RateLimited)), "2 per 15 minutes");
+    cleanup(&a, &[u.id], &[]).await;
 }
 
 #[tokio::test]
@@ -855,15 +968,15 @@ async fn totp_turns_on_gates_sign_in_and_refuses_replays() {
     let setup = a.totp_setup(&u);
     assert!(setup.uri.starts_with("otpauth://totp/") && setup.uri.contains(&u.username));
     let secret = totp_secret(&setup);
-    assert!(matches!(a.totp_enable(&c, &u, &setup.sealed, "000000").await, Err(Error::Invalid(_))), "a wrong code enables nothing");
+    assert!(matches!(a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, "000000").await, Err(Error::Invalid(_))), "a wrong code enables nothing");
     let other = make_user(&a, &[]).await;
     let code = format!("{:06}", crate::totp::code_at(&secret, step_now()));
-    assert!(matches!(a.totp_enable(&c, &other, &setup.sealed, &code).await, Err(Error::Invalid(_))), "sealed to its account");
-    let codes = a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    assert!(matches!(a.totp_enable(&c, &other, &full_session(&a, &c, &other).await, &setup.sealed, &code).await, Err(Error::Invalid(_))), "sealed to its account");
+    let (codes, _) = a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &code).await.unwrap();
     assert_eq!(codes.len(), 10, "recovery codes come with it");
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
     assert!(u.totp_enabled && has_second_factor(&u));
-    assert!(matches!(a.totp_enable(&c, &u, &setup.sealed, &code).await, Err(Error::Invalid(_))), "already on");
+    assert!(matches!(a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &code).await, Err(Error::Invalid(_))), "already on");
 
     // A password alone now opens a pending session that grants nothing.
     let pending = pending_of(a.login_password(&c, &u.username, PW, None).await);
@@ -876,18 +989,27 @@ async fn totp_turns_on_gates_sign_in_and_refuses_replays() {
     assert!(a.session_from_token(&pending.token, util::now()).await.unwrap().is_none(), "the pending token is dead");
     assert!(matches!(a.mfa_totp(&c, &u, &done.info, &next).await, Err(Error::Invalid(_)) | Err(Error::Forbidden)));
 
-    // Step-up takes a code, not the password. Its own limiter: this account
-    // spent its five tries above, which every code counts against.
-    let Some(b) = shared(cfg()).await else { return };
-    assert!(matches!(b.step_up(&c, &u, &done.info, PW).await, Err(Error::Invalid(_))));
+    // Step-up takes a code, not the password, and counts apart from the
+    // second step: whoever has the password and spends that bucket cannot
+    // lock the owner out of step-up (FAC-1). Each takes 5 codes per 15
+    // minutes, right or wrong; two of each went above.
+    assert!(matches!(a.step_up(&c, &u, &done.info, PW).await, Err(Error::Invalid(_))));
+    let stranger = pending_of(a.login_password(&c, &u.username, PW, None).await);
+    for _ in 0..3 {
+        assert!(matches!(a.mfa_totp(&c, &u, &stranger.info, "000000").await, Err(Error::Invalid(_))));
+    }
+    assert!(matches!(a.mfa_totp(&c, &u, &stranger.info, &next).await, Err(Error::RateLimited)), "the second step");
     exec(&a.store, "UPDATE acct_users SET totp_last_step = 0 WHERE id = ?", vec![Arg::B(u.id.0.to_vec())]).await;
-    let up = b.step_up_totp(&c, &u, &done.info, &code).await.unwrap();
-    assert!(b.fresh(&up.info, util::now()));
-    assert!(matches!(a.step_up_totp(&c, &u, &up.info, &code).await, Err(Error::RateLimited)), "5 codes per 15 minutes");
+    let up = a.step_up_totp(&c, &u, &done.info, &code).await.unwrap();
+    assert!(a.fresh(&up.info, util::now()));
+    for _ in 0..2 {
+        assert!(matches!(a.step_up_totp(&c, &u, &up.info, "000000").await, Err(Error::Invalid(_))));
+    }
+    assert!(matches!(a.step_up_totp(&c, &u, &up.info, &code).await, Err(Error::RateLimited)), "step-up and setup");
 
-    b.totp_disable(&c, &u).await.unwrap();
-    assert_eq!(b.recovery_left(u.id).await.unwrap(), 0, "no second factor left, no recovery codes");
-    signed_in(b.login_password(&c, &u.username, PW, None).await);
+    a.totp_disable(&c, &u).await.unwrap();
+    assert_eq!(a.recovery_left(u.id).await.unwrap(), 0, "no second factor left, no recovery codes");
+    signed_in(a.login_password(&c, &u.username, PW, None).await);
     cleanup(&a, &[u.id, other.id], &[]).await;
 }
 
@@ -898,7 +1020,7 @@ async fn recovery_codes_work_once_and_wrong_codes_are_capped() {
     let u = make_user(&a, &[]).await;
     let setup = a.totp_setup(&u);
     let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
-    let codes = a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    let (codes, _) = a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &code).await.unwrap();
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
     let pending = pending_of(a.login_password(&c, &u.username, PW, None).await);
     let typed = codes[0].to_uppercase().replace('-', " ");
@@ -916,6 +1038,60 @@ async fn recovery_codes_work_once_and_wrong_codes_are_capped() {
     cleanup(&a, &[u.id], &[]).await;
 }
 
+/// Signed in with a recovery code after losing the phone, the session is not
+/// recent; a second code steps it up, so the owner can set up a new factor
+/// and make a new set (FAC-2). It counts in the step-up bucket.
+#[tokio::test]
+async fn a_recovery_code_steps_up() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.76");
+    let u = make_user(&a, &[]).await;
+    let setup = a.totp_setup(&u);
+    let (codes, _) = a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()))).await.unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let pending = pending_of(a.login_password(&c, &u.username, PW, None).await);
+    let (s, _) = a.mfa_recovery(&c, &u, &pending.info, &codes[0]).await.unwrap();
+    assert!(!a.fresh(&s.info, util::now()));
+    assert!(matches!(a.step_up_recovery(&c, &u, &pending.info, &codes[1]).await, Err(Error::Forbidden)), "a pending session");
+    assert!(matches!(a.step_up_recovery(&c, &u, &s.info, &codes[0]).await, Err(Error::Invalid(_))), "spent");
+    let up = a.step_up_recovery(&c, &u, &s.info, &codes[1]).await.unwrap();
+    assert!(a.fresh(&up.info, util::now()) && up.info.created_at == s.info.created_at);
+    assert!(a.session_from_token(&s.token, util::now()).await.unwrap().is_none(), "a new token");
+    assert_eq!(a.recovery_left(u.id).await.unwrap(), 8);
+    let ev = a.store.audit_of(u.id, 50).await.unwrap();
+    assert!(ev.iter().any(|e| e.event == "step_up" && e.detail == "recovery"));
+    // Setup took one, the spent code one, the step-up one.
+    for _ in 0..2 {
+        assert!(matches!(a.step_up_recovery(&c, &u, &up.info, "nope").await, Err(Error::Invalid(_))));
+    }
+    assert!(matches!(a.step_up_recovery(&c, &u, &up.info, &codes[2]).await, Err(Error::RateLimited)));
+    assert_eq!(a.recovery_left(u.id).await.unwrap(), 8, "refused before the code is spent");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+/// A second step that may not finish is refused before its factor is spent:
+/// a session of someone else, an expired one, or any while accounts are off
+/// (FAC-8).
+#[tokio::test]
+async fn the_second_step_checks_its_session_before_the_code() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.77");
+    let u = make_user(&a, &[]).await;
+    let setup = a.totp_setup(&u);
+    let (codes, _) = a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()))).await.unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let pending = pending_of(a.login_password(&c, &u.username, PW, None).await);
+    let others = SessionInfo { user_id: AccountId::new(), ..pending.info.clone() };
+    assert!(matches!(a.mfa_recovery(&c, &u, &others, &codes[0]).await, Err(Error::Forbidden)));
+    let expired = SessionInfo { expires_at: util::now() - 1, ..pending.info.clone() };
+    assert!(matches!(a.mfa_recovery(&c, &u, &expired, &codes[0]).await, Err(Error::Forbidden)));
+    let off = on(a.store.clone(), Config { enabled: false, ..cfg() }).await;
+    assert!(matches!(off.mfa_recovery(&c, &u, &pending.info, &codes[0]).await, Err(Error::Closed)));
+    assert_eq!(a.recovery_left(u.id).await.unwrap(), 10, "no code was spent");
+    a.mfa_recovery(&c, &u, &pending.info, &codes[0]).await.unwrap();
+    cleanup(&a, &[u.id], &[]).await;
+}
+
 fn pk_cfg() -> Config {
     Config { base_url: "https://l4f.cc".into(), ..cfg() }
 }
@@ -928,8 +1104,8 @@ async fn add_passkey(a: &Accounts<Stub>, c: &Ctx, u: &User) -> crate::testkit::A
     let (opts, token) = a.passkey_options(PasskeyFor::Add, Some(u), NONCE).await.unwrap();
     assert_eq!(opts["rp"]["id"], "l4f.cc");
     let json = auth.create(&crate::challenge::challenge_bytes(&token), ORIGIN, "l4f.cc");
-    a.passkey_add(c, u, &token, NONCE, &json, "Laptop").await.unwrap();
-    assert!(matches!(a.passkey_add(c, u, &token, NONCE, &json, "Laptop").await, Err(Error::Invalid(_))), "a token works once");
+    a.passkey_add(c, u, &full_session(a, c, u).await, &token, NONCE, &json, "Laptop").await.unwrap();
+    assert!(matches!(a.passkey_add(c, u, &full_session(a, c, u).await, &token, NONCE, &json, "Laptop").await, Err(Error::Invalid(_))), "a token works once");
     auth
 }
 
@@ -946,6 +1122,8 @@ async fn a_passkey_signs_in_alone_with_user_verification() {
 
     let (opts, token) = a.passkey_options(PasskeyFor::Login, None, NONCE).await.unwrap();
     assert_eq!(opts["userVerification"], "required");
+    let named = a.passkey_options(PasskeyFor::Login, Some(&u), NONCE).await;
+    assert!(matches!(named, Err(Error::Forbidden)), "a sign-in token names no account: one that did could never verify");
     let ch = crate::challenge::challenge_bytes(&token);
     let no_uv = auth.get(&ch, ORIGIN, "l4f.cc", Some(&u.id.0), false);
     assert!(matches!(a.passkey_login(&c, &token, NONCE, &no_uv).await, Err(Error::Invalid(_))), "alone, it must verify the user");
@@ -977,7 +1155,9 @@ async fn a_passkey_is_a_second_factor_and_a_step_up() {
     assert_eq!(opts["allowCredentials"][0]["id"], util::b64u(&auth.id));
     let json = auth.get(&crate::challenge::challenge_bytes(&token), ORIGIN, "l4f.cc", None, false);
     let other = make_user(&a, &[]).await;
-    assert!(matches!(a.passkey_mfa(&c, &other, &pending.info, &token, NONCE, &json).await, Err(Error::Invalid(_))), "bound to its account");
+    let others = SessionInfo { user_id: other.id, ..pending.info.clone() };
+    assert!(matches!(a.passkey_mfa(&c, &other, &others, &token, NONCE, &json).await, Err(Error::Invalid(_))), "bound to its account");
+    assert!(matches!(a.passkey_mfa(&c, &other, &pending.info, &token, NONCE, &json).await, Err(Error::Forbidden)), "someone else's session");
     let s = a.passkey_mfa(&c, &u, &pending.info, &token, NONCE, &json).await.unwrap();
     assert!(s.info.mfa_ok && a.fresh(&s.info, util::now()));
 
@@ -1008,14 +1188,71 @@ async fn removing_passkeys_keeps_a_way_in() {
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
     let codes = a.recovery_regenerate(&c, &u).await.unwrap();
     assert_eq!(codes.len(), 10);
-    let mut nopw = u.clone();
-    nopw.has_password = false;
-    assert!(matches!(a.passkey_remove(&c, &nopw, &auth.id).await, Err(Error::Invalid(_))), "the only way in stays");
+    drop_password(&a, u.id).await;
+    assert!(matches!(a.passkey_remove(&c, &u, &auth.id).await, Err(Error::Invalid(_))), "the only way in stays");
     assert!(matches!(a.passkey_remove(&c, &u, &[1, 2, 3]).await, Err(Error::NotFound)));
+    assert!(a.store.set_password_hash(u.id, pw_hash()).await.unwrap());
     a.passkey_remove(&c, &u, &auth.id).await.unwrap();
     assert!(!a.store.user_by_id(u.id).await.unwrap().unwrap().has_passkey);
     assert_eq!(a.recovery_left(u.id).await.unwrap(), 0, "recovery codes went with the last second factor");
     cleanup(&a, &[u.id], &[]).await;
+}
+
+/// The name comes after the authenticator stored the key: one the site
+/// cannot keep falls back instead of leaving that key unknown here (FAC-5).
+#[tokio::test]
+async fn a_passkey_with_a_name_that_cannot_be_kept_is_still_added() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.78");
+    let u = make_user(&a, &[]).await;
+    let auth = crate::testkit::Authenticator::new();
+    let (_, token) = a.passkey_options(PasskeyFor::Add, Some(&u), NONCE).await.unwrap();
+    let json = auth.create(&crate::challenge::challenge_bytes(&token), ORIGIN, "l4f.cc");
+    a.passkey_add(&c, &u, &full_session(&a, &c, &u).await, &token, NONCE, &json, "\u{200f}Phone").await.unwrap();
+    assert_eq!(a.passkeys(u.id).await.unwrap()[0].name, "Passkey");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+/// A session opened before the account's first second factor never showed
+/// one, yet would get the privileged scopes that wait for it: the first one
+/// ends every other session and gives the enrolling one a new token, so a
+/// copied cookie of it dies too. Another one ends none (AUTH-1).
+#[tokio::test]
+async fn the_first_second_factor_keeps_only_the_enrolling_session() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.75");
+    let u = make_user(&a, &[]).await;
+    let before = signed_in(a.login_password(&c, &u.username, PW, None).await);
+    let mine = a.create_session(u.id, "password", true, util::now(), &c).await.unwrap();
+    let setup = a.totp_setup(&u);
+    let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
+    let (_, new) = a.totp_enable(&c, &u, &mine.info, &setup.sealed, &code).await.unwrap();
+    let new = new.expect("the first second factor gives the caller a new token");
+    assert!(a.session_from_token(&before.token, util::now()).await.unwrap().is_none(), "codes first: the others end");
+    assert!(a.session_from_token(&mine.token, util::now()).await.unwrap().is_none(), "and the caller's old token");
+    assert!(a.session_from_token(&new.token, util::now()).await.unwrap().is_some(), "the caller stays signed in");
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let after = a.create_session(u.id, "password", true, util::now(), &c).await.unwrap();
+    add_passkey(&a, &c, &u).await;
+    assert!(a.session_from_token(&after.token, util::now()).await.unwrap().is_some(), "a passkey next to codes ends none");
+
+    let v = make_user(&a, &[]).await;
+    let before = signed_in(a.login_password(&c, &v.username, PW, None).await);
+    add_passkey(&a, &c, &v).await;
+    assert!(a.session_from_token(&before.token, util::now()).await.unwrap().is_none(), "a passkey first");
+    let w = make_user(&a, &[]).await;
+    let theirs = a.create_session(v.id, "password", true, util::now(), &c).await.unwrap();
+    let setup = a.totp_setup(&w);
+    let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
+    assert!(matches!(a.totp_enable(&c, &w, &theirs.info, &setup.sealed, &code).await, Err(Error::Forbidden)), "only with one's own session");
+    let x = make_user(&a, &[]).await;
+    let gone = a.create_session(x.id, "password", true, util::now(), &c).await.unwrap();
+    a.logout(&gone.token).await.unwrap();
+    let setup = a.totp_setup(&x);
+    let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
+    let (codes, new) = a.totp_enable(&c, &x, &gone.info, &setup.sealed, &code).await.unwrap();
+    assert!(!codes.is_empty() && new.is_none(), "signed out meanwhile: the codes still come back, with no session to keep");
+    cleanup(&a, &[u.id, v.id, w.id, x.id], &[]).await;
 }
 
 // ---- key sign-in
@@ -1048,11 +1285,17 @@ async fn an_ssh_key_signs_in_once_it_signed_its_own_enrolment() {
     let stranger = a.ssh_challenge(None, NONCE);
     assert!(a.ssh_login(&c, &stranger, NONCE, &other.ssh_sign(&ns, stranger.as_bytes())).await.is_err(), "an unknown key");
 
-    // With a second factor, an SSH key is only the first one.
+    // With a second factor, an SSH key is only the first one, and the audit
+    // says so: not "password+recovery" (FAC-9).
     exec(&a.store, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(vec![0]), Arg::B(u.id.0.to_vec())]).await;
     let login = a.ssh_challenge(None, NONCE);
     let pending = pending_of(a.ssh_login(&c, &login, NONCE, &key.ssh_sign(&ns, login.as_bytes())).await);
     assert!(!pending.info.mfa_ok);
+    let v = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let codes = a.recovery_regenerate(&c, &v).await.unwrap();
+    a.mfa_recovery(&c, &v, &pending.info, &codes[0]).await.unwrap();
+    let audit = a.store.audit_of(u.id, 50).await.unwrap();
+    assert!(audit.iter().any(|e| e.event == "login_ok" && e.detail == "ssh+recovery"));
     cleanup(&a, &[u.id], &[]).await;
 }
 
@@ -1097,6 +1340,114 @@ async fn a_device_key_signs_in_this_browser_until_it_is_revoked() {
     cleanup(&a, &[u.id], &[]).await;
 }
 
+/// A refused device-key sign-in leaves its journal line, as an SSH one does
+/// (FAC-10). Refused at the door, before any query: one poll runs it.
+#[tokio::test]
+async fn a_refused_device_key_sign_in_is_logged() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let cross = Ctx { sec_fetch_site: "cross-site".into(), ..ctx("203.0.113.79") };
+    let lines = crate::testkit::logged(|| {
+        let mut f = std::pin::pin!(a.devkey_login(&cross, "", NONCE, &[0; 16], &[]));
+        let r = f.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        assert!(matches!(r, std::task::Poll::Ready(Err(Error::CrossSite))));
+    });
+    assert!(lines.iter().any(|l| l.contains("devkey login refused") && l.contains(r#"outcome="cross_site""#)), "{lines:?}");
+}
+
+/// SSH, device-key and passkey sign-ins share one bucket per account, charged
+/// once the signature checked out and before the burn: one account signing
+/// from many addresses cannot fill the burn set (GATES-6).
+#[tokio::test]
+async fn key_sign_ins_count_per_account() {
+    let Some(a) = shared(Config { login_per_user_15min: 1, ..pk_cfg() }).await else { return };
+    let c = ctx("203.0.113.84");
+    let u = make_user(&a, &[]).await;
+    let mut auth = add_passkey(&a, &c, &u).await;
+    let key = crate::testkit::EdKey::new();
+    let ns = a.host.config().ssh_namespace();
+    let t = a.ssh_challenge(Some(&u), NONCE);
+    a.ssh_add(&c, &u, &t, NONCE, &key.ssh_public(""), &key.ssh_sign(&ns, t.as_bytes())).await.unwrap();
+    let device = util::random::<16>();
+    let t = a.devkey_challenge(Some(&u), NONCE);
+    let ch = crate::challenge::challenge_bytes(&t);
+    a.devkey_add(&c, &u, &t, NONCE, NewDeviceKey { device_id: &device, public_key: &key.raw_public(), signature: &key.devkey_sign(ORIGIN, &device, &ch) }).await.unwrap();
+    let dk = |t: &str| key.devkey_sign(ORIGIN, &device, &crate::challenge::challenge_bytes(t));
+
+    for _ in 0..3 {
+        let (t, other) = (a.devkey_challenge(None, NONCE), a.devkey_challenge(None, NONCE));
+        assert!(a.devkey_login(&c, &t, NONCE, &device, &dk(&other)).await.is_err(), "unverified: not charged");
+    }
+    let t = a.ssh_challenge(None, NONCE);
+    pending_of(a.ssh_login(&ctx("198.51.100.31"), &t, NONCE, &key.ssh_sign(&ns, t.as_bytes())).await);
+    let t = a.devkey_challenge(None, NONCE);
+    a.devkey_login(&ctx("198.51.100.32"), &t, NONCE, &device, &dk(&t)).await.unwrap();
+    let (_, t) = a.passkey_options(PasskeyFor::Login, None, NONCE).await.unwrap();
+    let json = auth.get(&crate::challenge::challenge_bytes(&t), ORIGIN, "l4f.cc", Some(&u.id.0), true);
+    a.passkey_login(&ctx("198.51.100.33"), &t, NONCE, &json).await.unwrap();
+    let t = a.devkey_challenge(None, NONCE);
+    assert!(matches!(a.devkey_login(&ctx("198.51.100.34"), &t, NONCE, &device, &dk(&t)).await, Err(Error::RateLimited)), "3 per 15 minutes");
+    let n = crate::challenge::check(&a.keys, &t, crate::challenge::Purpose::Login, None, NONCE, util::now()).unwrap();
+    assert!(crate::challenge::burn(&a.limiter, &n), "refused before its burn");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+/// A key removed while its sign-in was under way signs nobody in: the use is
+/// recorded on no row then (FAC-7). A counter these kinds never have stands
+/// in for the missing row, as the UPDATE misses it the same way.
+#[tokio::test]
+async fn a_key_gone_mid_sign_in_signs_nobody_in() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.85");
+    let u = make_user(&a, &[]).await;
+    let key = crate::testkit::EdKey::new();
+    let ns = a.host.config().ssh_namespace();
+    let t = a.ssh_challenge(Some(&u), NONCE);
+    a.ssh_add(&c, &u, &t, NONCE, &key.ssh_public(""), &key.ssh_sign(&ns, t.as_bytes())).await.unwrap();
+    let device = util::random::<16>();
+    let t = a.devkey_challenge(Some(&u), NONCE);
+    let ch = crate::challenge::challenge_bytes(&t);
+    a.devkey_add(&c, &u, &t, NONCE, NewDeviceKey { device_id: &device, public_key: &key.raw_public(), signature: &key.devkey_sign(ORIGIN, &device, &ch) }).await.unwrap();
+    exec(&a.store, "UPDATE acct_credentials SET sign_count = 1 WHERE user_id = ?", vec![Arg::B(u.id.0.to_vec())]).await;
+    let t = a.ssh_challenge(None, NONCE);
+    assert!(matches!(a.ssh_login(&c, &t, NONCE, &key.ssh_sign(&ns, t.as_bytes())).await, Err(Error::Invalid(_))), "ssh");
+    let t = a.devkey_challenge(None, NONCE);
+    let sig = key.devkey_sign(ORIGIN, &device, &crate::challenge::challenge_bytes(&t));
+    assert!(matches!(a.devkey_login(&c, &t, NONCE, &device, &sig).await, Err(Error::Invalid(_))), "device key");
+    assert!(a.sessions(u.id, util::now()).await.unwrap().is_empty());
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+/// A sign-in racing a revocation keeps no session, whichever runs first: the
+/// revocation removes the credential before the sessions, and the sign-in
+/// checks its device key or password hash again once its session is in
+/// (store-data-1).
+#[tokio::test]
+async fn a_sign_in_racing_a_revocation_keeps_no_session() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.86");
+    let u = make_user(&a, &[]).await;
+    let key = crate::testkit::EdKey::new();
+    let device = util::random::<16>();
+    let t = a.devkey_challenge(Some(&u), NONCE);
+    let ch = crate::challenge::challenge_bytes(&t);
+    a.devkey_add(&c, &u, &t, NONCE, NewDeviceKey { device_id: &device, public_key: &key.raw_public(), signature: &key.devkey_sign(ORIGIN, &device, &ch) }).await.unwrap();
+    let t = a.devkey_challenge(None, NONCE);
+    let sig = key.devkey_sign(ORIGIN, &device, &crate::challenge::challenge_bytes(&t));
+    let (login, out) = tokio::join!(a.devkey_login(&c, &t, NONCE, &device, &sig), a.logout_all(&c, u.id, None));
+    out.unwrap();
+    if let Ok(s) = login {
+        assert!(a.session_from_token(&s.token, util::now()).await.unwrap().is_none(), "sign-out everywhere");
+    }
+
+    let here = a.create_session(u.id, "password", true, util::now(), &c).await.unwrap();
+    let (login, changed) = tokio::join!(a.login_password(&c, &u.username, PW, None), a.password_change(&c, &u, &here.info, "a brand new password"));
+    changed.unwrap();
+    if let Ok(LoginStep::Done(s)) = login {
+        assert!(a.session_from_token(&s.token, util::now()).await.unwrap().is_none(), "a password change");
+    }
+    cleanup(&a, &[u.id], &[]).await;
+}
+
 #[tokio::test]
 async fn an_account_without_a_password_keeps_one_way_in() {
     let Some(a) = shared(pk_cfg()).await else { return };
@@ -1107,14 +1458,61 @@ async fn an_account_without_a_password_keeps_one_way_in() {
     let token = a.ssh_challenge(Some(&u), NONCE);
     a.ssh_add(&c, &u, &token, NONCE, &key.ssh_public(""), &key.ssh_sign(&ns, token.as_bytes())).await.unwrap();
     let fp = a.ssh_keys(u.id).await.unwrap()[0].ext_id.clone();
-    let mut nopw = a.store.user_by_id(u.id).await.unwrap().unwrap();
-    nopw.has_password = false;
-    assert!(matches!(a.remove_credential(&c, &nopw, "ssh", &fp).await, Err(Error::Invalid(_))));
+    drop_password(&a, u.id).await;
+    assert!(matches!(a.remove_credential(&c, &u, "ssh", &fp).await, Err(Error::Invalid(_))));
     let other = make_user(&a, &[]).await;
     assert!(matches!(a.remove_credential(&c, &other, "ssh", &fp).await, Err(Error::NotFound)), "someone else's key");
+    assert!(a.store.set_password_hash(u.id, pw_hash()).await.unwrap());
     a.remove_credential(&c, &u, "ssh", &fp).await.unwrap();
     assert!(a.ssh_keys(u.id).await.unwrap().is_empty());
     cleanup(&a, &[u.id, other.id], &[]).await;
+}
+
+/// An SSH sign-in is never recent, so an account without a password keeps a
+/// passkey or a linked account: with SSH keys alone it could sign in but
+/// never confirm it's you again. Turning codes off keeps to it too (FAC-4).
+#[tokio::test]
+async fn an_account_without_a_password_keeps_a_way_to_step_up() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.83");
+    let u = make_user(&a, &[]).await;
+    let key = crate::testkit::EdKey::new();
+    let ns = a.host.config().ssh_namespace();
+    let token = a.ssh_challenge(Some(&u), NONCE);
+    a.ssh_add(&c, &u, &token, NONCE, &key.ssh_public(""), &key.ssh_sign(&ns, token.as_bytes())).await.unwrap();
+    let ssh = a.ssh_keys(u.id).await.unwrap()[0].ext_id.clone();
+    // As if it signed up through Google.
+    let google = || Credential {
+        kind: "oauth:google".into(),
+        ext_id: unique("g").into_bytes(),
+        user_id: u.id,
+        public_key: None,
+        alg: 0,
+        sign_count: 0,
+        flags: 0,
+        name: "Dee G".into(),
+        created_at: util::now(),
+        last_used_at: None,
+        public: false,
+    };
+    let g = google();
+    assert!(a.store.insert_credential(&g).await.unwrap());
+    drop_password(&a, u.id).await;
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(matches!(a.remove_credential(&c, &u, &g.kind, &g.ext_id).await, Err(Error::Invalid(_))), "SSH alone would be left");
+
+    // With codes on, an older account could get to SSH alone: the codes stay.
+    assert!(a.store.delete_credential(u.id, &g.kind, &g.ext_id).await.unwrap());
+    exec(&a.store, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(vec![0]), Arg::B(u.id.0.to_vec())]).await;
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(matches!(a.totp_disable(&c, &u).await, Err(Error::Invalid(_))));
+    assert!(matches!(a.remove_credential(&c, &u, "ssh", &ssh).await, Err(Error::Invalid(_))), "nor its only way in");
+    let g = google();
+    assert!(a.store.insert_credential(&g).await.unwrap());
+    a.totp_disable(&c, &u).await.unwrap();
+    a.remove_credential(&c, &u, "ssh", &ssh).await.unwrap();
+    assert!(matches!(a.remove_credential(&c, &u, &g.kind, &g.ext_id).await, Err(Error::Invalid(_))), "the last way in");
+    cleanup(&a, &[u.id], &[]).await;
 }
 
 // ---- mail
@@ -1482,12 +1880,16 @@ async fn invites_open_closed_sign_up_once_and_bind_names() {
     let Some(a) = shared(Config { registration_open: false, ..cfg() }).await else { return };
     let c = ctx("203.0.113.90");
     let role = make_role(&a, &["users:admin"]).await;
-    let boss = make_user(&a, &[&role]).await;
+    let boss = make_user(&a, &[&role, "user"]).await;
     let scopes = a.effective_scopes(&boss).await.unwrap();
     let actor = Actor { user: &boss, scopes: &scopes };
     let nobody = make_user(&a, &[]).await;
     let none: Vec<String> = Vec::new();
     assert!(matches!(a.invite_create(&c, Actor { user: &nobody, scopes: &none }, None, 7).await, Err(Error::Forbidden)));
+    // Each invite makes an account with the `user` role: the inviter covers
+    // it, as `grant_role` would ask (ADMIN-7).
+    let admin_only = strings(&["users:admin"]);
+    assert!(matches!(a.invite_create(&c, Actor { user: &boss, scopes: &admin_only }, None, 7).await, Err(Error::Forbidden)));
 
     let code = a.invite_create(&c, actor, None, 7).await.unwrap();
     assert_eq!(code.len(), 22);
@@ -1525,11 +1927,13 @@ async fn invites_open_closed_sign_up_once_and_bind_names() {
 async fn the_host_issues_invites_without_an_admin() {
     let Some(a) = shared(Config { registration_open: false, ..cfg() }).await else { return };
     let c = ctx("203.0.113.93");
-    let code = a.invite_create_as_host(&c, None, 7).await.unwrap();
     let name = unique("h");
+    let code = a.invite_create_as_host(&c, Some(&name), 7).await.unwrap();
     let s = invite_signup(&a, &c, &code, &name).await.expect("a host invite opens sign-up");
     let user = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap().0;
-    assert!(matches!(err(invite_signup(&a, &c, &code, &unique("h")).await), Error::Invalid(_)), "single use");
+    assert!(matches!(err(invite_signup(&a, &c, &code, &name).await), Error::Invalid(_)), "single use");
+    let sql = "SELECT COUNT(*) FROM acct_audit WHERE event = 'invite_create' AND actor_id IS NULL AND detail = ?";
+    assert_eq!(scalar(&a.store, sql, vec![Arg::S(format!("{name} (host)"))]).await, 1, "marked as the host's (ADMIN-12)");
     cleanup(&a, &[user.id], &[]).await;
 }
 
@@ -1538,12 +1942,31 @@ async fn invite_codes_expire() {
     let Some(a) = shared(Config { registration_open: false, ..cfg() }).await else { return };
     let c = ctx("203.0.113.91");
     let role = make_role(&a, &["users:admin"]).await;
-    let boss = make_user(&a, &[&role]).await;
+    let boss = make_user(&a, &[&role, "user"]).await;
     let scopes = a.effective_scopes(&boss).await.unwrap();
     let code = a.invite_create(&c, Actor { user: &boss, scopes: &scopes }, None, 1).await.unwrap();
     exec(&a.store, "UPDATE acct_invites SET expires_at = 1 WHERE code_hash = ?", vec![Arg::B(hex::decode(invite_id(&code)).unwrap())]).await;
     assert!(matches!(err(invite_signup(&a, &c, &code, &unique("e")).await), Error::Invalid(_)));
     cleanup(&a, &[boss.id], &[&role]).await;
+}
+
+/// A wrong code or a taken name is refused before the password is hashed:
+/// with both Argon2 slots held they still get their own answer, and only a
+/// good code for a free name gets as far as the hash (ADMIN-4, AUTH-6).
+#[tokio::test]
+async fn an_invite_is_checked_before_its_password_is_hashed() {
+    let Some(a) = shared(Config { registration_open: false, ..cfg() }).await else { return };
+    let c = ctx("203.0.113.98");
+    let taken = make_user(&a, &[]).await;
+    let code = a.invite_create_as_host(&c, None, 7).await.unwrap();
+    let held = a.hash_permits.clone().try_acquire_many_owned(2).unwrap();
+    assert!(matches!(err(invite_signup(&a, &c, "AAAAAAAAAAAAAAAAAAAAAA", &unique("i")).await), Error::Invalid(_)), "a wrong code");
+    assert!(matches!(err(invite_signup(&a, &c, &code, &taken.username).await), Error::UsernameTaken), "a taken name");
+    assert!(matches!(err(invite_signup(&a, &c, &code, &unique("i")).await), Error::Busy), "a good one reaches the hash");
+    drop(held);
+    let s = invite_signup(&a, &c, &code, &unique("i")).await.expect("none of that spent the code");
+    let user = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap().0;
+    cleanup(&a, &[taken.id, user.id], &[]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1583,7 +2006,7 @@ async fn reset_2fa_clears_codes_device_keys_and_sessions() {
 
     let setup = a.totp_setup(&u);
     let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
-    a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &code).await.unwrap();
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
     assert!(!a.needs_2fa(&u).await.unwrap());
     a.store.insert_session(&sess(u.id, util::now(), util::now() + 100)).await.unwrap();
@@ -1595,14 +2018,44 @@ async fn reset_2fa_clears_codes_device_keys_and_sessions() {
     let scopes = a.effective_scopes(&boss).await.unwrap();
     let weak: Vec<String> = strings(&["users:admin"]);
     assert!(matches!(a.reset_2fa(&c, Actor { user: &boss, scopes: &weak }, u.id).await, Err(Error::Forbidden)), "must cover the target");
+    let sql = "INSERT INTO acct_credentials (kind, ext_id, user_id, created_at) VALUES ('devkey', ?, ?, 1)";
+    exec(&a.store, sql, vec![Arg::B(util::random::<16>().to_vec()), Arg::B(u.id.0.to_vec())]).await;
     assert!(a.reset_2fa(&c, Actor { user: &boss, scopes: &scopes }, u.id).await.unwrap());
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
     assert!(!u.totp_enabled && a.needs_2fa(&u).await.unwrap(), "back to needing one");
     assert_eq!(a.store.recovery_left(u.id).await.unwrap(), 0);
-    assert!(a.store.sessions_of(u.id).await.unwrap().is_empty());
+    assert!(a.store.sessions_of(u.id).await.unwrap().is_empty() && a.devkeys(u.id).await.unwrap().is_empty());
     assert!(!a.reset_2fa(&c, Actor { user: &boss, scopes: &scopes }, u.id).await.unwrap(), "already off");
-    assert!(audit_events(&a, u.id).await.contains(&"totp_reset".to_string()));
+    let log = a.store.audit_of(u.id, 50).await.unwrap();
+    assert!(log.iter().any(|e| e.event == "totp_reset" && e.actor_id == Some(boss.id)));
+    // The admin forgot the device keys, not the account: its history shows
+    // no address of the admin's (ADMIN-6).
+    let forgot = log.iter().find(|e| e.event == "devkey_revoke").expect("the device key went");
+    assert_eq!((forgot.actor_id, forgot.ip.as_str()), (Some(boss.id), ""));
     cleanup(&a, &[u.id, plain.id, boss.id], &[&role, &admin_role]).await;
+}
+
+/// The lost second factor may be a passkey alone: the reset goes on with
+/// codes off, takes the passkey and the recovery codes, and the next
+/// sign-in is by password (ADMIN-11).
+#[tokio::test]
+async fn reset_2fa_takes_a_passkey_too() {
+    let Some(a) = shared(pk_cfg()).await else { return };
+    let c = ctx("203.0.113.99");
+    let u = make_user(&a, &[]).await;
+    add_passkey(&a, &c, &u).await;
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    a.recovery_regenerate(&c, &u).await.unwrap();
+    assert!(!u.totp_enabled && u.has_passkey);
+    assert!(matches!(a.login_password(&c, &u.username, PW, None).await, Ok(LoginStep::NeedMfa(_))));
+    assert!(a.reset_2fa_as_host(&c, u.id).await.unwrap(), "codes were off, a passkey was there");
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(!has_second_factor(&u) && a.passkeys(u.id).await.unwrap().is_empty());
+    assert_eq!(a.recovery_left(u.id).await.unwrap(), 0);
+    assert!(a.store.sessions_of(u.id).await.unwrap().is_empty(), "the pending sign-in went too");
+    assert!(!a.reset_2fa_as_host(&c, u.id).await.unwrap(), "nothing left to remove");
+    signed_in(a.login_password(&c, &u.username, PW, None).await);
+    cleanup(&a, &[u.id], &[]).await;
 }
 
 #[tokio::test]
@@ -1618,7 +2071,7 @@ async fn the_host_grants_resets_and_revokes_without_an_admin() {
     // Codes on, then off again from the shell: the way back in after a lost phone.
     let setup = a.totp_setup(&u);
     let code = format!("{:06}", crate::totp::code_at(&totp_secret(&setup), step_now()));
-    a.totp_enable(&c, &u, &setup.sealed, &code).await.unwrap();
+    a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &code).await.unwrap();
     a.store.insert_session(&sess(u.id, util::now(), util::now() + 100)).await.unwrap();
     assert!(a.reset_2fa_as_host(&c, u.id).await.unwrap());
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
@@ -1629,10 +2082,95 @@ async fn the_host_grants_resets_and_revokes_without_an_admin() {
     assert!(a.revoke_role_as_host(&c, u.id, &role).await.unwrap());
     assert!(a.store.sessions_of(u.id).await.unwrap().is_empty(), "the loss counts at once");
     assert!(!a.revoke_role_as_host(&c, u.id, &role).await.unwrap(), "gone already");
-    let events = audit_events(&a, u.id).await;
+    // No actor, and the detail says who instead (ADMIN-12).
+    let log = a.store.audit_of(u.id, 50).await.unwrap();
     for e in ["role_grant", "totp_reset", "role_revoke"] {
-        assert!(events.contains(&e.to_string()), "{e}: {events:?}");
+        let row = log.iter().find(|r| r.event == e).unwrap_or_else(|| panic!("no {e}: {log:?}"));
+        assert!(row.actor_id.is_none() && row.detail.ends_with("(host)"), "{e}: {:?}", row.detail);
     }
     assert!(matches!(a.grant_role_as_host(&c, u.id, "no-such-role").await, Err(Error::NotFound)));
     cleanup(&a, &[u.id], &[&role]).await;
+}
+
+/// What fail2ban and journal greps read: `ip=` bare, `outcome=` the event.
+/// The actor shows only when it is someone else, the detail only when set.
+#[test]
+fn the_journal_line_keeps_ip_and_outcome() {
+    let (u, boss) = (AccountId([1; 16]), AccountId([2; 16]));
+    let lines = crate::testkit::logged(|| {
+        event_line("203.0.113.9", Some(u), Some(u), "session_revoke", "");
+        event_line("203.0.113.9", Some(u), Some(boss), "role_grant", "mod");
+    });
+    let (u, boss) = (u.hex(), boss.hex());
+    assert_eq!(lines, [
+        format!(r#"ip=203.0.113.9 outcome="session_revoke" user={u}"#),
+        format!(r#"ip=203.0.113.9 outcome="role_grant" actor={boss} user={u} detail="mod""#),
+    ]);
+}
+
+/// Per address the key is `kind:address`, per account `kind-id:x`. An invite
+/// try counts under the one kind `acct-inv`, not under a kind of its own per
+/// address that no per-kind cap ever reaches (GATES-2).
+#[tokio::test]
+async fn gates_count_per_address_or_per_account() {
+    let Some(a) = shared(cfg()).await else { return };
+    assert!(matches!(err(invite_signup(&a, &ctx("198.51.100.17"), "short", &unique("i")).await), Error::Invalid(_)));
+    assert!(!a.limiter.peek("acct-inv:198.51.100.17", WINDOW, 1), "counted per address");
+    assert!(a.limiter.peek("acct-inv-198.51.100.17:x", WINDOW, 1));
+    let id = AccountId::new();
+    assert!(a.per_account("acct-t", id, WINDOW, 1).is_ok());
+    assert!(matches!(a.per_account("acct-t", id, WINDOW, 1), Err(Error::RateLimited)));
+    assert!(!a.limiter.peek(&format!("acct-t-{}:x", id.hex()), WINDOW, 1));
+}
+
+fn built(store: Store, app: &[ScopeDef], pow_key: &[u8]) -> sqlx::Result<Accounts<Stub>> {
+    let host = Stub { cfg: Arc::new(cfg()), deleted: StdMutex::default() };
+    Accounts::new(store, Keys::new(&[7; 32], None).unwrap(), Arc::default(), host, app, Some(pow_key.to_vec()), Vec::new())
+}
+
+/// A short ALTCHA key boots, with sign-up closed: under it anyone could forge
+/// the proof-of-work (GATES-4).
+#[tokio::test]
+async fn a_short_pow_key_keeps_sign_up_closed() {
+    let Some(store) = shared_store().await else { return };
+    let short = &POW_KEY[..31];
+    let a = built(store, APP, short).unwrap();
+    assert!(a.pow_key.is_none());
+    let ts = pow::stamp(short, util::now_secs() - 5);
+    let altcha = solve(&pow::issue(short, 1000, 600));
+    let proof = pow::Proof { altcha: &altcha, ts: &ts, ..pow::Proof::default() };
+    let form = RegisterForm { username: &unique("s"), password: PW, email: None, display_name: None, proof };
+    assert!(matches!(a.register(&ctx("203.0.113.97"), form).await, Err(Error::SignupClosed)));
+}
+
+/// Grants match by name, so a second entry for a name would grant the first
+/// one's power under its own description (GATES-10).
+#[tokio::test]
+async fn a_scope_registered_twice_is_refused() {
+    let Some(store) = shared_store().await else { return };
+    let crate_dup = [ScopeDef { name: "users:admin", description: "Manage the app's user list" }];
+    let app_dup = [APP[0], APP[0]];
+    for app in [&crate_dup[..], &app_dup[..]] {
+        let e = built(store.clone(), app, POW_KEY).err().expect("refused");
+        assert!(matches!(&e, sqlx::Error::InvalidArgument(m) if m.contains("registered twice")), "{e}");
+    }
+    assert!(built(store, APP, POW_KEY).is_ok());
+}
+
+/// A lost audit row after a commit is logged, not returned: the change
+/// happened (AUTH-13). Before the change, as for a sign-in, it still refuses.
+#[tokio::test]
+async fn a_lost_audit_row_does_not_undo_a_committed_change() {
+    let Some(f) = fresh().await else { return };
+    let a = on(f.store.clone(), cfg()).await;
+    let c = ctx("203.0.113.95");
+    let u = make_user(&a, &[]).await;
+    exec(&a.store, "DROP TABLE acct_audit", vec![]).await;
+    assert!(a.bootstrap_grant(&c, u.id).await.unwrap(), "granted, and it says so");
+    let name = unique("l");
+    let s = register(&a, &c, &name, PW).await.expect("the account exists, so its session comes with it");
+    assert!(a.session_from_token(&s.token, util::now()).await.unwrap().is_some());
+    assert!(matches!(a.login_password(&c, &name, PW, None).await, Err(Error::Db(_))), "a sign-in still needs its row");
+    drop(a);
+    f.done().await;
 }

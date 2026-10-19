@@ -71,8 +71,8 @@ pub struct ScopeDef {
 /// carry a registered scope, so a typo cannot become a silent no-op grant.
 pub const CRATE_SCOPES: &[ScopeDef] = &[
     ScopeDef { name: "users:read", description: "See the user list and account details" },
-    ScopeDef { name: "users:admin", description: "Suspend users, reset their credentials and delete accounts" },
-    ScopeDef { name: "roles:admin", description: "Create roles, edit their scopes and assign them" },
+    ScopeDef { name: "users:admin", description: "Suspend users, assign roles, invite, reset credentials and delete accounts" },
+    ScopeDef { name: "roles:admin", description: "Create roles and edit their scopes" },
     ScopeDef { name: "storage:sync", description: "Sync settings and saved data to the server" },
     ScopeDef { name: "vault:use", description: "Keep an end-to-end encrypted vault" },
     ScopeDef { name: "profile:public", description: "Publish a public profile page" },
@@ -144,13 +144,34 @@ fn skeleton(name: &str) -> String {
 }
 
 /// Bidi controls and marks reorder the text and whatever the page prints after
-/// it; the zero-width space, word joiner and BOM only make look-alikes differ.
-/// ZWJ and ZWNJ are not here: emoji and Persian or Indic spelling need them.
+/// it. The rest render as nothing and only make look-alikes differ: the
+/// zero-width space, the word joiner and the invisible operators, the
+/// deprecated format controls U+206A-206F, the interlinear annotation and
+/// musical format controls, and the BOM. ZWJ, ZWNJ, variation selectors and
+/// tags are not here: emoji and Persian or Indic spelling need them.
 pub(crate) fn invisible(c: char) -> bool {
     matches!(
         c,
-        '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+        '\u{061c}'
+            | '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{206a}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{1d173}'..='\u{1d17a}'
     )
+}
+
+/// What no free text here may hold: control characters and the line and
+/// paragraph separators U+2028/U+2029, which break a log line or a layout,
+/// and the `invisible` set. `clean_display_name` refuses the same, under two
+/// messages.
+#[cfg(feature = "_db")]
+pub(crate) fn breaks_text(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || invisible(c)
 }
 
 /// Renders as nothing on its own: whitespace, the `invisible` set, joiners,
@@ -169,16 +190,13 @@ fn blank(c: char) -> bool {
                 | '\u{180b}'..='\u{180f}'
                 | '\u{200c}'
                 | '\u{200d}'
-                | '\u{2061}'..='\u{2065}'
-                | '\u{206a}'..='\u{206f}'
                 | '\u{2800}'
                 | '\u{3164}'
                 | '\u{fe00}'..='\u{fe0f}'
                 | '\u{ffa0}'
-                | '\u{fff0}'..='\u{fffb}'
+                | '\u{fff0}'..='\u{fff8}'
                 | '\u{13430}'..='\u{1343f}'
                 | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
                 | '\u{e0000}'..='\u{e0fff}'
         )
 }
@@ -603,14 +621,15 @@ mod tests {
 
     #[test]
     fn display_name_refuses_bidi_marks_and_zero_width_characters() {
-        for c in ['\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{2060}', '\u{FEFF}'] {
+        let format_controls = ('\u{2061}'..='\u{2065}').chain('\u{206A}'..='\u{206F}').chain('\u{FFF9}'..='\u{FFFB}').chain('\u{1D173}'..='\u{1D17A}');
+        for c in ['\u{200E}', '\u{200F}', '\u{061C}', '\u{200B}', '\u{2060}', '\u{FEFF}'].into_iter().chain(format_controls) {
             assert_err(clean_display_name(&format!("ad{c}min")), "invisible", &format!("U+{:04X}", c as u32));
         }
     }
 
     #[test]
     fn display_name_needs_a_visible_character() {
-        for bad in ["\u{3164}", "\u{200D}", "\u{200C}\u{200D}", "\u{2800}", "\u{00AD}", "\u{FE0F}", "\u{E0041}", "\u{3164} \u{3164}", "\u{2065}", "\u{FFF0}", "\u{13430}", "\u{1BCA0}"] {
+        for bad in ["\u{3164}", "\u{200D}", "\u{200C}\u{200D}", "\u{2800}", "\u{00AD}", "\u{FE0F}", "\u{E0041}", "\u{3164} \u{3164}", "\u{FFF0}", "\u{13430}", "\u{1BCA0}"] {
             assert_err(clean_display_name(bad), "visible", &format!("{bad:?}"));
         }
         assert!(clean_display_name("👨\u{200D}👩\u{200D}👧").is_ok(), "ZWJ inside an emoji sequence stays allowed");

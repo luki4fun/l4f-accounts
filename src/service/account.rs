@@ -4,20 +4,19 @@
 use super::auth::WINDOW;
 use super::{Accounts, Ctx, DAY, Error, Host, NewSession, has_second_factor};
 use crate::model::{AccountId, SessionInfo, User};
-use crate::{password, scope};
+use crate::{password, scope, util};
 
 impl<H: Host> Accounts<H> {
-    /// The signed-in account's password, again. Shares the per-account sign-in
-    /// bucket, so a stolen session cookie guesses no faster than a login form.
-    /// An account without a password runs the dummy and is refused.
+    /// The signed-in account's password, again. A per-account bucket of its
+    /// own, the size of the sign-in one: a stolen session cookie guesses no
+    /// faster than a login form, and strangers spending the login form's
+    /// bucket cannot lock the signed-in owner out of step-up. An account
+    /// without a password runs the dummy and is refused.
     pub async fn confirm_password(&self, ctx: &Ctx, user: &User, password: &str) -> Result<(), Error> {
         if ctx.cross_site() {
             return Err(Error::CrossSite);
         }
-        let cfg = self.host.config();
-        if !self.limiter.check(&format!("acct-login-user-{}:x", user.id.hex()), WINDOW, cfg.login_per_user_15min) {
-            return Err(Error::RateLimited);
-        }
+        self.per_account("acct-reauth", user.id, WINDOW, self.host.config().login_per_user_15min)?;
         let stored = self.store.password_hash_of(user.id).await?;
         let pw = password.to_owned();
         let ok = self
@@ -30,12 +29,7 @@ impl<H: Host> Accounts<H> {
             })
             .await?;
         if !ok {
-            let (store, ip, id) = (self.store.clone(), self.shaped_ip(ctx.ip), user.id);
-            tokio::spawn(async move {
-                if let Err(e) = store.audit(Some(id), Some(id), "reauth_fail", "password", &ip).await {
-                    tracing::warn!(target: "accounts", error = %e, "audit write failed");
-                }
-            });
+            self.audit_detached(ctx, user.id, Some(user.id), "reauth_fail", "password");
             tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "reauth_fail", user = %user.id.hex());
             return Err(Error::Invalid("Wrong password."));
         }
@@ -66,20 +60,22 @@ impl<H: Host> Accounts<H> {
         s.mfa_ok && s.auth_at > 0 && now - s.auth_at < self.host.config().step_up_minutes * 60
     }
 
-    /// Changes the password of a signed-in account; the caller checks for a
-    /// recent sign-in. This session stays, every other one goes.
+    /// Changes the password of a signed-in account. No old password is asked,
+    /// so only from a session with a recent sign-in (`Forbidden` otherwise).
+    /// This session stays, every other one goes.
     pub async fn password_change(&self, ctx: &Ctx, user: &User, session: &SessionInfo, new: &str) -> Result<(), Error> {
-        if !session.mfa_ok || session.user_id != user.id {
+        if !session.mfa_ok || session.user_id != user.id || !self.fresh(session, util::now()) {
             return Err(Error::Forbidden);
         }
         let old = self.store.password_hash_of(user.id).await?;
         self.set_password(ctx, user, new, old.as_deref(), Some(&session.token_hash), "change").await
     }
 
-    /// The one way a password changes: the policy, Argon2, written only over
-    /// `old` (the hash the caller saw, `None` for an account without one), then
-    /// every session but `keep` and every remembered browser go, and the
-    /// owner is told. `NotFound` when the hash changed meanwhile.
+    /// The one way a password changes: the policy, a per-account cap, Argon2,
+    /// written only over `old` (the hash the caller saw, `None` for an account
+    /// without one), then every remembered browser and every session but
+    /// `keep` go, and the owner is told. `NotFound` when the hash changed
+    /// meanwhile.
     pub(super) async fn set_password(
         &self,
         ctx: &Ctx,
@@ -89,7 +85,10 @@ impl<H: Host> Accounts<H> {
         keep: Option<&[u8; 32]>,
         how: &str,
     ) -> Result<(), Error> {
-        password::check_policy(new, self.host.config().min_password_len).map_err(Error::Invalid)?;
+        let cfg = self.host.config();
+        password::check_policy(new, cfg.min_password_len).map_err(Error::Invalid)?;
+        // Each change is an Argon2 hash: one account must not keep both slots busy.
+        self.per_account("acct-pw", user.id, WINDOW, cfg.login_per_user_15min)?;
         let pw = new.to_owned();
         let hash = self.kdf(move || password::hash(&pw)).await?;
         let written = match old {
@@ -99,10 +98,9 @@ impl<H: Host> Accounts<H> {
         if !written {
             return Err(Error::NotFound);
         }
+        self.revoke_devkeys(ctx, user.id, Some(user.id), "password").await?;
         self.store.delete_sessions_of(user.id, keep).await?;
-        self.revoke_devkeys(ctx, user.id, "password").await?;
-        self.audit(ctx, Some(user.id), Some(user.id), "password_change", how).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "password_change", how, user = %user.id.hex());
+        self.record_after(ctx, Some(user.id), Some(user.id), "password_change", how).await;
         #[cfg(feature = "email")]
         self.password_notice(user, if how == "reset" { " with a reset link" } else { "" });
         Ok(())
@@ -114,7 +112,7 @@ impl<H: Host> Accounts<H> {
         if !self.store.set_display_name(user, &name).await? {
             return Err(Error::NotFound);
         }
-        self.audit(ctx, Some(user), Some(user), "display_name", &name).await?;
+        self.audit_after(ctx, Some(user), Some(user), "display_name", &name).await;
         Ok(name)
     }
 
@@ -133,8 +131,7 @@ impl<H: Host> Accounts<H> {
         if !self.store.delete_session(hash, user).await? {
             return Ok(false);
         }
-        self.audit(ctx, Some(user), Some(user), "session_revoke", "").await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "session_revoke", user = %user.hex());
+        self.record_after(ctx, Some(user), Some(user), "session_revoke", "").await;
         Ok(true)
     }
 }

@@ -12,7 +12,10 @@ use serde::Deserialize;
 
 use super::auth::{NextQuery, need_fresh};
 use super::flash::{self, Flash};
-use super::{Authed, BASE, PendingMfa, St, WebHost, error_page, page, refused, see_other, status_of, when};
+use super::{
+    Authed, BASE, PendingMfa, SECURITY_PAGE, St, WebHost, done, error_page, page, refused, see_other, set_session,
+    status_of, when, with_cookies,
+};
 use crate::qr::qr_svg;
 use crate::service::{Accounts, Ctx, Error, TotpSetup};
 use crate::util;
@@ -61,17 +64,12 @@ pub(super) async fn mfa<H: WebHost>(State(a): St<H>, p: PendingMfa, ctx: Ctx, h:
                 // Straight to where a new set is made, saying how many are left.
                 Some(left) => {
                     let msg = format!("Signed in with a recovery code. {left} left: make a new set if that is few.");
-                    flash::to(&a.keys, &format!("{BASE}/security"), true, &msg, &cookies)
+                    flash::to(&a.keys, SECURITY_PAGE, true, &msg, &cookies)
                 }
                 None => see_other(util::safe_next(&f.next, BASE), &cookies),
             }
         }
-        Err(e) => {
-            if let Error::Db(err) = &e {
-                tracing::error!(target: "accounts", error = %err, "database error");
-            }
-            mfa_page(&a, &h, status_of(&e), &p, &f.next, Some(e.message()))
-        }
+        Err(e) => mfa_page(&a, &h, status_of(&e), &p, &f.next, Some(e.message())),
     }
 }
 
@@ -89,6 +87,9 @@ struct KeyRow {
 pub(super) struct LinkRow {
     pub slug: &'static str,
     pub label: &'static str,
+    /// base64url of the provider's subject: names it in its unlink form, as
+    /// one account may link several of a provider.
+    pub id: String,
     pub name: String,
 }
 
@@ -130,7 +131,8 @@ pub(super) async fn security<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderM
     #[cfg(feature = "oauth")]
     let (linked, linkable) = match a.oauth_linked(id).await {
         Ok(l) => {
-            let rows: Vec<LinkRow> = l.into_iter().map(|(k, c)| LinkRow { slug: k.slug(), label: k.label(), name: c.name }).collect();
+            let rows: Vec<LinkRow> =
+                l.into_iter().map(|(k, c)| LinkRow { slug: k.slug(), label: k.label(), id: util::b64u(&c.ext_id), name: c.name }).collect();
             let free = a.oauth_kinds().into_iter().filter(|k| !rows.iter().any(|r| r.slug == k.slug())).map(|k| (k.slug(), k.label())).collect();
             (rows, free)
         }
@@ -176,7 +178,6 @@ fn totp_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, me:
 }
 
 const TOTP_PAGE: &str = "/account/totp";
-const SECURITY_PAGE: &str = "/account/security";
 
 pub(super) async fn totp_form<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderMap) -> Response {
     if let Some(r) = need_fresh(&a, &me, TOTP_PAGE) {
@@ -194,10 +195,12 @@ pub(super) async fn totp_form<H: WebHost>(State(a): St<H>, me: Authed, h: Header
 struct CodesTpl<'a> {
     base: &'static str,
     codes: &'a [String],
+    /// Every session ended with them, this one too.
+    signed_out: bool,
 }
 
-fn codes_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, codes: &[String]) -> Response {
-    page(a, h, "Recovery codes", StatusCode::OK, &CodesTpl { base: BASE, codes })
+fn codes_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, codes: &[String], signed_out: bool) -> Response {
+    page(a, h, "Recovery codes", StatusCode::OK, &CodesTpl { base: BASE, codes, signed_out })
 }
 
 #[derive(Deserialize, Default)]
@@ -214,20 +217,26 @@ pub(super) async fn totp<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: H
         return r;
     }
     match f.action.as_str() {
-        "enable" => match a.totp_enable(&ctx, &me.user, &f.setup, &f.code).await {
-            Ok(codes) if codes.is_empty() => flash::to(&a.keys, SECURITY_PAGE, true, "Two-factor codes are on.", &[]),
-            Ok(codes) => codes_page(&a, &h, &codes),
+        "enable" => match a.totp_enable(&ctx, &me.user, &me.session, &f.setup, &f.code).await {
+            // As the account's first second factor, they ended every other
+            // session and gave this one a new token.
+            Ok((codes, new)) => {
+                let out: Vec<String> = new.iter().map(|s| set_session(&a.host.config(), &s.token)).collect();
+                if !codes.is_empty() {
+                    with_cookies(codes_page(&a, &h, &codes, new.is_some()), &out)
+                } else if new.is_some() {
+                    flash::to(&a.keys, SECURITY_PAGE, true, "Two-factor codes are on, and every other session is signed out.", &out)
+                } else {
+                    flash::to(&a.keys, SECURITY_PAGE, true, "Two-factor codes are on.", &[])
+                }
+            }
             Err(e @ (Error::Invalid(_) | Error::RateLimited)) => match a.totp_setup_again(&me.user, &f.setup) {
                 Some(s) => totp_page(&a, &h, status_of(&e), &me, &s, Some(e.message())),
                 None => flash::to(&a.keys, SECURITY_PAGE, false, e.message(), &[]),
             },
             Err(e) => refused(&a, &h, &e),
         },
-        "disable" => match a.totp_disable(&ctx, &me.user).await {
-            Ok(()) => flash::to(&a.keys, SECURITY_PAGE, true, "Two-factor codes are off.", &[]),
-            Err(e @ Error::Invalid(_)) => flash::to(&a.keys, SECURITY_PAGE, false, e.message(), &[]),
-            Err(e) => refused(&a, &h, &e),
-        },
+        "disable" => done(&a, &h, SECURITY_PAGE, a.totp_disable(&ctx, &me.user).await.map(|()| "Two-factor codes are off.")),
         _ => error_page(&a, &h, StatusCode::BAD_REQUEST, "Unknown action."),
     }
 }
@@ -237,7 +246,7 @@ pub(super) async fn recovery<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, 
         return r;
     }
     match a.recovery_regenerate(&ctx, &me.user).await {
-        Ok(codes) => codes_page(&a, &h, &codes),
+        Ok(codes) => codes_page(&a, &h, &codes, false),
         Err(e @ Error::Invalid(_)) => flash::to(&a.keys, SECURITY_PAGE, false, e.message(), &[]),
         Err(e) => refused(&a, &h, &e),
     }

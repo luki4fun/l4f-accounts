@@ -2,23 +2,18 @@
 //! the browser nonce cookie the challenge is bound to; the finishing call
 //! reads it back. With a session cookie the CSRF layer wants `X-CSRF`.
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, header},
-    response::{IntoResponse, Response},
-};
+use axum::{Json, extract::State, http::HeaderMap, response::Response};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::auth::need_fresh_json;
 use super::flash;
 use super::{
-    Authed, BASE, PendingMfa, St, WebHost, json_ok, json_refused, new_nonce, nonce_of, set_session,
+    Authed, BASE, PendingMfa, SECURITY_PAGE, St, WebHost, json_ok, json_refused, json_signed_in, new_nonce, nonce_of,
+    set_session,
 };
 use crate::service::{Ctx, Error, PasskeyFor};
 use crate::util;
-
-const RECENT: Error = Error::Invalid("Confirm it's you first: reload the page.");
 
 fn options_response(r: Result<(serde_json::Value, String), Error>, cookie: String) -> Response {
     match r {
@@ -33,8 +28,8 @@ pub(super) async fn options_login<H: WebHost>(State(a): St<H>) -> Response {
 }
 
 pub(super) async fn options_add<H: WebHost>(State(a): St<H>, me: Authed) -> Response {
-    if !a.fresh(&me.session, util::now()) {
-        return json_refused(&RECENT);
+    if let Some(r) = need_fresh_json(&a, &me) {
+        return r;
     }
     let (nonce, cookie) = new_nonce(&a.host.config());
     options_response(a.passkey_options(PasskeyFor::Add, Some(&me.user), &nonce).await, cookie)
@@ -62,38 +57,33 @@ pub(super) struct Finish {
 }
 
 pub(super) async fn add<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Json(f): Json<Finish>) -> Response {
-    if !a.fresh(&me.session, util::now()) {
-        return json_refused(&RECENT);
+    if let Some(r) = need_fresh_json(&a, &me) {
+        return r;
     }
-    let nonce = nonce_of(&a.host.config(), &h);
-    match a.passkey_add(&ctx, &me.user, &f.token, &nonce, &f.credential.to_string(), &f.name).await {
-        Ok(()) => json_ok(json!({ "next": flash::url(&a.keys, &format!("{BASE}/security"), true, "Passkey added.") }), &[]),
+    let cfg = a.host.config();
+    let nonce = nonce_of(&cfg, &h);
+    match a.passkey_add(&ctx, &me.user, &me.session, &f.token, &nonce, &f.credential.to_string(), &f.name).await {
+        // As the account's first second factor, it ended every other session
+        // and gave this one a new token.
+        Ok(Some(new)) => {
+            let next = flash::url(&a.keys, SECURITY_PAGE, true, "Passkey added, and every other session is signed out.");
+            json_ok(json!({ "next": next }), &[set_session(&cfg, &new.token)])
+        }
+        Ok(None) => json_ok(json!({ "next": flash::url(&a.keys, SECURITY_PAGE, true, "Passkey added.") }), &[]),
         Err(e) => json_refused(&e),
     }
 }
 
 pub(super) async fn login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, Json(f): Json<Finish>) -> Response {
-    let cfg = a.host.config();
-    let nonce = nonce_of(&cfg, &h);
-    match a.passkey_login(&ctx, &f.token, &nonce, &f.credential.to_string()).await {
-        Ok(s) => {
-            let cookies = super::signed_in(&a, &s).await;
-            json_ok(json!({ "next": util::safe_next(&f.next, BASE) }), &cookies)
-        }
-        Err(e) => json_refused(&e),
-    }
+    let nonce = nonce_of(&a.host.config(), &h);
+    let r = a.passkey_login(&ctx, &f.token, &nonce, &f.credential.to_string()).await;
+    json_signed_in(&a, r, &f.next).await
 }
 
 pub(super) async fn mfa<H: WebHost>(State(a): St<H>, p: PendingMfa, ctx: Ctx, h: HeaderMap, Json(f): Json<Finish>) -> Response {
-    let cfg = a.host.config();
-    let nonce = nonce_of(&cfg, &h);
-    match a.passkey_mfa(&ctx, &p.user, &p.session, &f.token, &nonce, &f.credential.to_string()).await {
-        Ok(s) => {
-            let cookies = super::signed_in(&a, &s).await;
-            json_ok(json!({ "next": util::safe_next(&f.next, BASE) }), &cookies)
-        }
-        Err(e) => json_refused(&e),
-    }
+    let nonce = nonce_of(&a.host.config(), &h);
+    let r = a.passkey_mfa(&ctx, &p.user, &p.session, &f.token, &nonce, &f.credential.to_string()).await;
+    json_signed_in(&a, r, &f.next).await
 }
 
 pub(super) async fn step_up<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Json(f): Json<Finish>) -> Response {
@@ -105,12 +95,6 @@ pub(super) async fn step_up<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h
     }
 }
 
-/// Served from the binary, like the templates. `no-cache`: the browser asks
-/// every time and keeps nothing stale after an upgrade.
 pub(super) async fn script() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
-        include_str!("../../assets/passkey.js"),
-    )
-        .into_response()
+    super::script(include_str!("../../assets/passkey.js"))
 }

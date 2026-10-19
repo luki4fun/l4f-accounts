@@ -10,7 +10,7 @@
     <div class="field">
       <label for="key">Public key</label>
       <textarea id="key" name="key" rows="3" class="mono" spellcheck="false" required placeholder="ssh-ed25519 AAAA... you@laptop">{{ key }}</textarea>
-      <p class="hint">The contents of <code>~/.ssh/id_ed25519.pub</code>: ssh-ed25519, ssh-rsa (2048 bits or more) or ecdsa-sha2-nistp256.</p>
+      <p class="hint">The contents of <code>~/.ssh/id_ed25519.pub</code>: ssh-ed25519, ssh-rsa (2048 to 8192 bits) or ecdsa-sha2-nistp256.</p>
     </div>
     <p>Then run:</p>
     <pre class="code-out anywhere">{{ command }}</pre>

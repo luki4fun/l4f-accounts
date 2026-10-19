@@ -4,17 +4,17 @@ use askama::Template;
 use axum::{
     Form, Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode},
+    response::Response,
 };
 use serde::Deserialize;
 use serde_json::json;
 
-use super::auth::{NextQuery, need_fresh};
+use super::auth::{NextQuery, need_fresh, need_fresh_json};
 use super::flash;
 use super::{
-    Authed, BASE, St, WebHost, error_page, json_ok, json_refused, new_nonce, nonce_of, page, refused, see_other, set_session,
-    status_of,
+    Authed, BASE, SECURITY_PAGE, St, WebHost, done, error_page, json_ok, json_refused, json_signed_in, new_nonce, nonce_of, page,
+    refused, see_other, set_session, status_of, with_cookies,
 };
 use crate::service::{Accounts, Ctx, Error, LoginStep, NewDeviceKey};
 use crate::util;
@@ -44,11 +44,7 @@ fn ssh_login_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode
     let token = a.ssh_challenge(None, &nonce);
     let cmd = command(&token, &cfg.ssh_namespace());
     let t = SshLoginTpl { base: BASE, token: &token, command: &cmd, next, csrf: super::csrf_for_cookie(a, h), error };
-    let mut r = page(a, h, "Sign in with an SSH key", status, &t);
-    if let Ok(v) = cookie.parse() {
-        r.headers_mut().append(header::SET_COOKIE, v);
-    }
-    r
+    with_cookies(page(a, h, "Sign in with an SSH key", status, &t), &[cookie])
 }
 
 pub(super) async fn ssh_login_form<H: WebHost>(State(a): St<H>, h: HeaderMap, Query(q): Query<NextQuery>) -> Response {
@@ -93,7 +89,6 @@ struct SshAddTpl<'a> {
 }
 
 const SSH_PAGE: &str = "/account/ssh";
-const SECURITY_PAGE: &str = "/account/security";
 
 fn ssh_add_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, me: &Authed, key: &str, error: Option<&str>) -> Response {
     let cfg = a.host.config();
@@ -101,11 +96,7 @@ fn ssh_add_page<H: WebHost>(a: &Accounts<H>, h: &HeaderMap, status: StatusCode, 
     let token = a.ssh_challenge(Some(&me.user), &nonce);
     let cmd = command(&token, &cfg.ssh_namespace());
     let t = SshAddTpl { base: BASE, csrf: me.csrf(), token: &token, command: &cmd, key, error };
-    let mut r = page(a, h, "Add an SSH key", status, &t);
-    if let Ok(v) = cookie.parse() {
-        r.headers_mut().append(header::SET_COOKIE, v);
-    }
-    r
+    with_cookies(page(a, h, "Add an SSH key", status, &t), &[cookie])
 }
 
 pub(super) async fn ssh_add_form<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderMap) -> Response {
@@ -141,8 +132,8 @@ fn b64(s: &str) -> Vec<u8> {
 }
 
 pub(super) async fn devkey_options_add<H: WebHost>(State(a): St<H>, me: Authed) -> Response {
-    if !a.fresh(&me.session, util::now()) {
-        return json_refused(&Error::Invalid("Confirm it's you first: reload the page."));
+    if let Some(r) = need_fresh_json(&a, &me) {
+        return r;
     }
     let (nonce, cookie) = new_nonce(&a.host.config());
     json_ok(json!({ "token": a.devkey_challenge(Some(&me.user), &nonce) }), &[cookie])
@@ -165,8 +156,8 @@ pub(super) struct DevkeyFinish {
 }
 
 pub(super) async fn devkey_add<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Json(f): Json<DevkeyFinish>) -> Response {
-    if !a.fresh(&me.session, util::now()) {
-        return json_refused(&Error::Invalid("Confirm it's you first: reload the page."));
+    if let Some(r) = need_fresh_json(&a, &me) {
+        return r;
     }
     let (id, pk, sig) = (b64(&f.device_id), b64(&f.public_key), b64(&f.signature));
     let key = NewDeviceKey { device_id: &id, public_key: &pk, signature: &sig };
@@ -177,22 +168,12 @@ pub(super) async fn devkey_add<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx
 }
 
 pub(super) async fn devkey_login<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, Json(f): Json<DevkeyFinish>) -> Response {
-    let cfg = a.host.config();
-    match a.devkey_login(&ctx, &f.token, &nonce_of(&cfg, &h), &b64(&f.device_id), &b64(&f.signature)).await {
-        Ok(s) => {
-            let cookies = super::signed_in(&a, &s).await;
-            json_ok(json!({ "next": util::safe_next(&f.next, BASE) }), &cookies)
-        }
-        Err(e) => json_refused(&e),
-    }
+    let r = a.devkey_login(&ctx, &f.token, &nonce_of(&a.host.config(), &h), &b64(&f.device_id), &b64(&f.signature)).await;
+    json_signed_in(&a, r, &f.next).await
 }
 
 pub(super) async fn devkey_script() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
-        include_str!("../../assets/devkey.js"),
-    )
-        .into_response()
+    super::script(include_str!("../../assets/devkey.js"))
 }
 
 // ---- removing a credential
@@ -212,16 +193,12 @@ pub(super) async fn remove<H: WebHost>(
     if let Some(r) = need_fresh(&a, &me, SECURITY_PAGE) {
         return r;
     }
-    let (kind, done) = match kind.as_str() {
+    let (kind, msg) = match kind.as_str() {
         "passkey" => ("passkey", "Passkey removed."),
         "ssh" => ("ssh", "SSH key removed."),
         "devkey" => ("devkey", "That browser is forgotten."),
         _ => return error_page(&a, &h, StatusCode::NOT_FOUND, "Not found."),
     };
     let Some(ext_id) = util::b64u_dec(&id) else { return error_page(&a, &h, StatusCode::NOT_FOUND, "Not found.") };
-    match a.remove_credential(&ctx, &me.user, kind, &ext_id).await {
-        Ok(()) => flash::to(&a.keys, SECURITY_PAGE, true, done, &[]),
-        Err(e @ (Error::Invalid(_) | Error::NotFound)) => flash::to(&a.keys, SECURITY_PAGE, false, e.message(), &[]),
-        Err(e) => refused(&a, &h, &e),
-    }
+    done(&a, &h, SECURITY_PAGE, a.remove_credential(&ctx, &me.user, kind, &ext_id).await.map(|()| msg))
 }

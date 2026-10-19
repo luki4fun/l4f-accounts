@@ -1,5 +1,8 @@
-//! Roles and user administration. Every call checks its scope here, so a
-//! handler that forgets to cannot hand out more than its caller holds.
+//! Roles and user administration. Every call that takes an `Actor` checks its
+//! scope here, so a handler that forgets to cannot hand out more than its
+//! caller holds. The `*_as_host` calls are for the host's own shell, where no
+//! signed-in admin answers for them: they check nothing, and their audit rows
+//! have no actor and say "(host)".
 
 use serde::Serialize;
 
@@ -17,7 +20,7 @@ pub struct Actor<'a> {
 
 impl Actor<'_> {
     pub(super) fn need(&self, required: &str) -> Result<(), Error> {
-        if scope::allowed(self.scopes, required) { Ok(()) } else { Err(Error::Forbidden) }
+        super::need(self.scopes, required)
     }
 }
 
@@ -54,7 +57,7 @@ fn role_text(form: &RoleForm<'_>) -> Result<(String, Option<String>), &'static s
     if d.chars().nth(255).is_some() {
         return Err("Keep the description to 255 characters or fewer.");
     }
-    if d.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || scope::invisible(c)) {
+    if d.chars().any(scope::breaks_text) {
         return Err("The description cannot contain control, line-break or invisible characters.");
     }
     let badge = match form.badge.trim() {
@@ -82,7 +85,7 @@ impl<H: Host> Accounts<H> {
         Ok(out)
     }
 
-    async fn role(&self, name: &str) -> Result<Role, Error> {
+    pub(super) async fn role(&self, name: &str) -> Result<Role, Error> {
         let name = role_name(name).map_err(|_| Error::NotFound)?;
         self.store.role_by_name(&name).await?.ok_or(Error::NotFound)
     }
@@ -102,15 +105,9 @@ impl<H: Host> Accounts<H> {
         if !scope::covers(actor.scopes, &scopes) {
             return Err(Error::Forbidden);
         }
-        let id = self.store.create_role(&name, &description, badge.as_deref()).await?.ok_or(Error::RoleTaken)?;
-        if let Err(e) = self.store.set_role_scopes(id, &scopes).await {
-            // Without its scopes the role is not what the admin asked for.
-            let _ = self.store.delete_role(id).await;
-            return Err(e.into());
-        }
-        self.audit(ctx, None, Some(actor.user.id), "role_create", &format!("{name}: {}", scopes.join(" "))).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_create", actor = %actor.user.id.hex(),
-            role = ?name);
+        // In one go: meanwhile an empty role would pass `grant_role`'s check.
+        let id = self.store.create_role_with_scopes(&name, &description, badge.as_deref(), &scopes).await?.ok_or(Error::RoleTaken)?;
+        self.record_after(ctx, None, Some(actor.user.id), "role_create", &format!("{name}: {}", scopes.join(" "))).await;
         Ok(id)
     }
 
@@ -130,9 +127,7 @@ impl<H: Host> Accounts<H> {
             self.store.set_role_scopes(role.id, &scopes).await?;
         }
         self.store.update_role(role.id, &description, badge.as_deref()).await?;
-        self.audit(ctx, None, Some(actor.user.id), "role_update", &format!("{}: {}", role.name, scopes.join(" "))).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_update", actor = %actor.user.id.hex(),
-            role = ?role.name);
+        self.record_after(ctx, None, Some(actor.user.id), "role_update", &format!("{}: {}", role.name, scopes.join(" "))).await;
         Ok(())
     }
 
@@ -145,19 +140,20 @@ impl<H: Host> Accounts<H> {
         if !self.store.delete_role(role.id).await? {
             return Err(Error::NotFound);
         }
-        self.audit(ctx, None, Some(actor.user.id), "role_delete", &role.name).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_delete", actor = %actor.user.id.hex(),
-            role = ?role.name);
+        self.record_after(ctx, None, Some(actor.user.id), "role_delete", &role.name).await;
         Ok(())
     }
 
-    /// False when the account already held the role.
+    /// False when the account already held the role. The actor covers the
+    /// role and the target, as for a suspension: a grant and a revoke could
+    /// otherwise be repeated at will on someone with more power.
     pub async fn grant_role(&self, ctx: &Ctx, actor: Actor<'_>, target: AccountId, role: &str) -> Result<bool, Error> {
         actor.need("users:admin")?;
         let role = self.role(role).await?;
         if !scope::covers(actor.scopes, &role.scopes) {
             return Err(Error::Forbidden);
         }
+        self.manageable(actor, target).await?;
         self.do_grant_role(ctx, Some(actor.user.id), target, &role).await
     }
 
@@ -173,20 +169,20 @@ impl<H: Host> Accounts<H> {
         if !self.store.grant_role(target, role.id, actor).await? {
             return Ok(false);
         }
-        self.audit(ctx, Some(target), actor, "role_grant", &role.name).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_grant", actor = %by(actor),
-            user = %target.hex(), role = ?role.name);
+        self.record_after(ctx, Some(target), actor, "role_grant", &marked(&role.name, actor)).await;
         Ok(true)
     }
 
     /// False when the account did not hold the role. Ends every session of the
-    /// account, so the loss counts from now on in every tab.
+    /// account, so the loss counts from now on in every tab. The actor covers
+    /// the role and the target, as for `grant_role`.
     pub async fn revoke_role(&self, ctx: &Ctx, actor: Actor<'_>, target: AccountId, role: &str) -> Result<bool, Error> {
         actor.need("users:admin")?;
         let role = self.role(role).await?;
         if !scope::covers(actor.scopes, &role.scopes) {
             return Err(Error::Forbidden);
         }
+        self.manageable(actor, target).await?;
         self.do_revoke_role(ctx, Some(actor.user.id), target, &role).await
     }
 
@@ -201,42 +197,40 @@ impl<H: Host> Accounts<H> {
             return Ok(false);
         }
         self.store.delete_sessions_of(target, None).await?;
-        self.audit(ctx, Some(target), actor, "role_revoke", &role.name).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "role_revoke", actor = %by(actor),
-            user = %target.hex(), role = ?role.name);
+        self.record_after(ctx, Some(target), actor, "role_revoke", &marked(&role.name, actor)).await;
         Ok(true)
     }
 
-    /// For someone who lost their authenticator: codes off (recovery codes too,
-    /// unless a passkey is left), device keys and sessions gone. The next
-    /// sign-in is by password, and a role that needs a second factor asks for a
-    /// new one. False when codes were off already.
+    /// For someone who lost their second factor: codes, recovery codes,
+    /// passkeys, device keys and sessions all go, whichever of them there
+    /// were. The next sign-in is by password, a linked account or an SSH key,
+    /// and a role that needs a second factor asks for a new one. False when
+    /// there was nothing to remove.
     pub async fn reset_2fa(&self, ctx: &Ctx, actor: Actor<'_>, target: AccountId) -> Result<bool, Error> {
         actor.need("users:admin")?;
-        let user = self.manageable(actor, target).await?;
-        self.do_reset_2fa(ctx, Some(actor.user.id), &user).await
+        self.manageable(actor, target).await?;
+        self.do_reset_2fa(ctx, Some(actor.user.id), target).await
     }
 
     /// `reset_2fa` for the host itself: the way back in for a sole admin who
     /// lost their authenticator. The audit row has no actor.
     pub async fn reset_2fa_as_host(&self, ctx: &Ctx, target: AccountId) -> Result<bool, Error> {
-        let user = self.store.user_by_id(target).await?.ok_or(Error::NotFound)?;
-        self.do_reset_2fa(ctx, None, &user).await
+        self.store.user_by_id(target).await?.ok_or(Error::NotFound)?;
+        self.do_reset_2fa(ctx, None, target).await
     }
 
-    async fn do_reset_2fa(&self, ctx: &Ctx, actor: Option<AccountId>, user: &User) -> Result<bool, Error> {
-        let target = user.id;
-        if !self.store.set_totp(target, None, 0).await? {
+    async fn do_reset_2fa(&self, ctx: &Ctx, actor: Option<AccountId>, target: AccountId) -> Result<bool, Error> {
+        let codes = self.store.set_totp(target, None, 0).await?;
+        let passkeys = self.store.delete_credentials_of(target, super::passkey::KIND).await?;
+        let recovery = self.store.recovery_left(target).await?;
+        self.store.delete_recovery(target).await?;
+        // Device keys before sessions, as everywhere (`revoke_devkeys`).
+        let devkeys = self.revoke_devkeys(ctx, target, actor, "totp_reset").await?;
+        let sessions = self.store.delete_sessions_of(target, None).await?;
+        if !codes && passkeys == 0 && recovery == 0 && devkeys == 0 && sessions == 0 {
             return Ok(false);
         }
-        if !user.has_passkey {
-            self.store.delete_recovery(target).await?;
-        }
-        self.revoke_devkeys(ctx, target, "totp_reset").await?;
-        self.store.delete_sessions_of(target, None).await?;
-        self.audit(ctx, Some(target), actor, "totp_reset", "").await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "totp_reset", actor = %by(actor),
-            user = %target.hex());
+        self.record_after(ctx, Some(target), actor, "totp_reset", &marked("", actor)).await;
         Ok(true)
     }
 
@@ -265,9 +259,7 @@ impl<H: Host> Accounts<H> {
             self.store.delete_sessions_of(target, None).await?;
         }
         let event = if status == UserStatus::Disabled { "disable" } else { "enable" };
-        self.audit(ctx, Some(target), Some(actor.user.id), event, "").await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = event, actor = %actor.user.id.hex(),
-            user = %target.hex());
+        self.record_after(ctx, Some(target), Some(actor.user.id), event, "").await;
         Ok(true)
     }
 }
@@ -275,4 +267,14 @@ impl<H: Host> Accounts<H> {
 /// Who did it, for the log line: the admin's account, or the host's own shell.
 pub(super) fn by(actor: Option<AccountId>) -> String {
     actor.map_or_else(|| "host".to_string(), |a| a.hex())
+}
+
+/// An audit detail, with " (host)" when the host's own shell acted: the row
+/// has no actor then, which the History shows as blank, like the account's
+/// own doing.
+pub(super) fn marked(detail: &str, actor: Option<AccountId>) -> String {
+    match actor {
+        Some(_) => detail.to_string(),
+        None => format!("{detail} (host)").trim_start().to_string(),
+    }
 }
