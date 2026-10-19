@@ -6,9 +6,9 @@ use serde::{Serialize, Serializer};
 
 use crate::util;
 
-/// 16 random bytes, stored as `BINARY(16)`. Random rather than AUTO_INCREMENT so
-/// an id says nothing about how many accounts exist or which came first. Roles
-/// reuse it.
+/// 16 random bytes, stored as `BINARY(16)` (Postgres `BYTEA`, SQLite `BLOB`).
+/// Random rather than AUTO_INCREMENT so an id says nothing about how many
+/// accounts exist or which came first. Roles reuse it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct AccountId(pub [u8; 16]);
 

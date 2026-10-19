@@ -422,7 +422,7 @@ async fn a_bcrypt_hash_becomes_argon2_at_the_first_login() {
     let c = ctx("203.0.113.30");
     let u = make_user(&a, &[]).await;
     let bc = bcrypt::hash(PW, 4).unwrap();
-    a.store.set_password_hash(u.id, &bc).await.unwrap();
+    assert!(a.store.rehash_password(u.id, pw_hash(), &bc).await.unwrap());
     assert!(matches!(a.login_password(&c, &u.username, "wrong password", None).await, Err(Error::BadLogin)));
     assert_eq!(a.store.password_hash_of(u.id).await.unwrap().as_deref(), Some(bc.as_str()), "no rehash on failure");
     signed_in(a.login_password(&c, &u.username, PW, None).await);

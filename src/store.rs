@@ -1,28 +1,35 @@
 //! Every SQL statement on the `acct_*` tables. Methods take and return crate
-//! types only, so each backend is the same set of methods: `MySqlStore` here,
-//! and `store/portable.rs` once for Postgres (`pg`) and once for SQLite
-//! (`lite`). `Store` (`store/backend.rs`) is whichever of them runs.
+//! types only, so each backend is the same set of methods: `store/portable.rs`,
+//! compiled once for MySQL (`my`, also `MySqlStore`), once for Postgres (`pg`)
+//! and once for SQLite (`lite`). `Store` (`store/backend.rs`) is whichever of
+//! them runs.
 //!
 //! Writes that could take `*` away from the last account holding it refuse
 //! here, inside their own transaction, rather than in the service: a check
 //! before the write would let two admins revoking each other both pass.
 
-#[cfg(feature = "mysql")]
-use sqlx::{AssertSqlSafe, Connection, MySql, MySqlConnection, MySqlPool, Row, Transaction, mysql::MySqlRow};
-
 use crate::model::AccountId;
-#[cfg(feature = "mysql")]
-use crate::model::{AuditEntry, Credential, Invite, NewUser, Role, SessionInfo, User, UserStatus};
-#[cfg(feature = "mysql")]
-use crate::util;
 
 mod backend;
 pub use backend::{Store, StoreConn, StoreTx};
+
+#[cfg(feature = "mysql")]
+pub mod my {
+    pub(super) type Db = sqlx::MySql;
+    const PG: bool = false;
+    const MY: bool = true;
+    include!("store/portable.rs");
+}
+
+/// The MySQL backend under its name from before there were others.
+#[cfg(feature = "mysql")]
+pub use my::Backend as MySqlStore;
 
 #[cfg(feature = "postgres")]
 pub mod pg {
     pub(super) type Db = sqlx::Postgres;
     const PG: bool = true;
+    const MY: bool = false;
     include!("store/portable.rs");
 }
 
@@ -30,12 +37,9 @@ pub mod pg {
 pub mod lite {
     pub(super) type Db = sqlx::Sqlite;
     const PG: bool = false;
+    const MY: bool = false;
     include!("store/portable.rs");
 }
-
-#[cfg(feature = "mysql")]
-#[derive(Clone)]
-pub struct MySqlStore(pub MySqlPool);
 
 #[derive(Debug)]
 pub enum CreateUserError {
@@ -86,6 +90,17 @@ pub enum PutBlob {
     Quota,
 }
 
+/// How `Store::put_blob_limited` went: `put_blob`'s answer, or one of the two
+/// refusals only it has. Nothing changed unless `Put(PutBlob::Done(_))`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PutLimited {
+    Put(PutBlob),
+    /// A new key, and the namespace holds `max_keys` already.
+    Full,
+    /// `need_sync`, and the account has sync off.
+    SyncOff,
+}
+
 /// An account's profile settings. `public_id` `None`: the profile is off.
 #[derive(Clone, Debug, Default)]
 pub struct Profile {
@@ -101,6 +116,17 @@ pub enum InviteSignup {
     /// Unknown, used, expired, or bound to another name.
     BadInvite,
     UsernameTaken,
+}
+
+/// How `Store::delete_credential_if_not_last` went. Nothing changed unless `Done`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteCredential {
+    Done,
+    /// The account has no such credential.
+    NotFound,
+    /// It would leave no password, passkey or social identity: nothing that
+    /// both signs in and makes a session recent.
+    LastWayIn,
 }
 
 /// How `Store::confirm_email` went.
@@ -136,17 +162,6 @@ const EXPORT_AUDIT_ROWS: u32 = 10_000;
 /// gets one row (NULL scope) from the LEFT JOIN.
 const ROLE_COLS: &str = "r.id, r.name, r.description, r.badge, r.builtin, s.scope";
 
-#[cfg(feature = "mysql")]
-/// Active accounts holding `*` through any role. STRAIGHT_JOIN and FORCE INDEX
-/// pin the plan to start from the `*` rows through the `scope` key: as a
-/// locking read, a plan that began with acct_users would lock every account,
-/// and a scan of acct_role_scopes (the cheapest plan on a tiny table) locks
-/// other roles' rows in id order and deadlocks two guarded writes.
-const STAR_HOLDERS: &str = "SELECT STRAIGHT_JOIN COUNT(DISTINCT ur.user_id) FROM acct_role_scopes s FORCE INDEX (scope) \
-     JOIN acct_user_roles ur ON ur.role_id = s.role_id \
-     JOIN acct_users u ON u.id = ur.user_id AND u.status = 0 \
-     WHERE s.scope = '*'";
-
 fn is_dup(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(d) if d.is_unique_violation())
 }
@@ -179,1323 +194,34 @@ fn like_pattern(q: &str) -> String {
     p
 }
 
-#[cfg(feature = "mysql")]
-fn user(r: &MySqlRow) -> sqlx::Result<User> {
-    Ok(User {
-        id: id(r.try_get(0)?)?,
-        username: r.try_get(1)?,
-        display_name: r.try_get(2)?,
-        email: r.try_get(3)?,
-        email_pending: r.try_get(4)?,
-        has_password: r.try_get(5)?,
-        totp_enabled: r.try_get(6)?,
-        status: UserStatus::from_db(r.try_get(7)?),
-        sync_enabled: r.try_get(8)?,
-        created_at: r.try_get(9)?,
-        has_passkey: r.try_get(10)?,
-    })
+/// A LIMIT or OFFSET as every backend binds it.
+fn lim(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-#[cfg(feature = "mysql")]
-fn credential(r: &MySqlRow) -> sqlx::Result<Credential> {
-    Ok(Credential {
-        kind: r.try_get(0)?,
-        ext_id: r.try_get(1)?,
-        user_id: id(r.try_get(2)?)?,
-        public_key: r.try_get(3)?,
-        alg: r.try_get::<i32, _>(4)?.into(),
-        sign_count: r.try_get(5)?,
-        flags: r.try_get::<i32, _>(6)?.into(),
-        name: r.try_get(7)?,
-        created_at: r.try_get(8)?,
-        last_used_at: r.try_get(9)?,
-        public: r.try_get(10)?,
-    })
-}
-
-#[cfg(feature = "mysql")]
-fn session(r: &MySqlRow) -> sqlx::Result<SessionInfo> {
-    let hash: Vec<u8> = r.try_get(0)?;
-    Ok(SessionInfo {
-        token_hash: hash.try_into().map_err(|_| sqlx::Error::Decode("token hash is not 32 bytes".into()))?,
-        user_id: id(r.try_get(1)?)?,
-        created_at: r.try_get(2)?,
-        seen_at: r.try_get(3)?,
-        expires_at: r.try_get(4)?,
-        auth_at: r.try_get(5)?,
-        mfa_ok: r.try_get(6)?,
-        method: r.try_get(7)?,
-        ip: r.try_get(8)?,
-        ua: r.try_get(9)?,
-    })
-}
-
-#[cfg(feature = "mysql")]
-fn roles_from(rows: Vec<MySqlRow>) -> sqlx::Result<Vec<Role>> {
-    let mut out: Vec<Role> = Vec::new();
-    for r in rows {
-        let rid = id(r.try_get(0)?)?;
-        if out.last().is_none_or(|l| l.id != rid) {
-            out.push(Role {
-                id: rid,
-                name: r.try_get(1)?,
-                description: r.try_get(2)?,
-                badge: r.try_get(3)?,
-                builtin: r.try_get(4)?,
-                scopes: Vec::new(),
-            });
-        }
-        if let (Some(scope), Some(role)) = (r.try_get::<Option<String>, _>(5)?, out.last_mut()) {
-            role.scopes.push(scope);
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(feature = "mysql")]
-fn invite(r: &MySqlRow) -> sqlx::Result<Invite> {
-    Ok(Invite {
-        id: hex::encode(r.try_get::<Vec<u8>, _>(0)?),
-        created_by: opt_id(r.try_get(1)?)?,
-        username: r.try_get(2)?,
-        created_at: r.try_get(3)?,
-        expires_at: r.try_get(4)?,
-        used_at: r.try_get(5)?,
-        used_by: opt_id(r.try_get(6)?)?,
-    })
-}
-
-#[cfg(feature = "mysql")]
-fn audit_entry(r: &MySqlRow) -> sqlx::Result<AuditEntry> {
-    Ok(AuditEntry {
-        id: r.try_get(0)?,
-        user_id: opt_id(r.try_get(1)?)?,
-        actor_id: opt_id(r.try_get(2)?)?,
-        event: r.try_get(3)?,
-        detail: r.try_get(4)?,
-        ip: r.try_get(5)?,
-        at: r.try_get(6)?,
-    })
-}
-
-#[cfg(feature = "mysql")]
-/// How every write in `WriteError::LastAdmin`'s reach starts. Under READ
-/// COMMITTED the locking count holds record locks only on what it counts: the
-/// `*` scope rows, those roles' grants and the holders' user rows. Under
-/// REPEATABLE READ it would also take gap locks, which never
-/// conflict with each other: two guarded writes on a table without `*` rows
-/// both pass the count and then deadlock on each other's inserts. RC also
-/// keeps MariaDB's snapshot isolation (an RR check) out of the way.
-const BEGIN_GUARDED: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; START TRANSACTION";
-
-#[cfg(feature = "mysql")]
-/// The locking count every guarded write runs first: two of them queue on the
-/// first `*` row of the `scope` key, so the second one counts after the first
-/// has committed.
-async fn star_holders_locked(c: &mut MySqlConnection) -> sqlx::Result<i64> {
-    sqlx::query_scalar(AssertSqlSafe(format!("{STAR_HOLDERS} FOR UPDATE"))).fetch_one(c).await
-}
-
-#[cfg(feature = "mysql")]
-/// Runs after the change, in its transaction; an error drops (rolls back) it.
-/// `before == 0` is a database nobody administers yet (before bootstrap), where
-/// there is nothing to protect.
-async fn keep_an_admin(c: &mut MySqlConnection, before: i64) -> Result<(), WriteError> {
-    if before > 0 && star_holders_locked(c).await? == 0 {
-        return Err(WriteError::LastAdmin);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "mysql")]
-/// Refuses anything `scope::valid_grant` does not accept. Beyond keeping junk
-/// out: the column is PAD SPACE, so a stored `* ` would count as `*` in the
-/// last-admin guard while granting nothing.
-async fn insert_scopes(c: &mut MySqlConnection, role: AccountId, scopes: &[String]) -> sqlx::Result<()> {
-    if let Some(bad) = scopes.iter().find(|s| !crate::scope::valid_grant(s)) {
-        return Err(sqlx::Error::InvalidArgument(format!("not a valid scope grant: {bad:?}")));
-    }
-    let mut scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    scopes.sort_unstable();
-    scopes.dedup();
-    if scopes.is_empty() {
-        return Ok(());
-    }
-    let values = vec!["(?, ?)"; scopes.len()].join(", ");
-    let mut q = sqlx::query(AssertSqlSafe(format!("INSERT INTO acct_role_scopes (role_id, scope) VALUES {values}")));
-    for s in scopes {
-        q = q.bind(&role.0[..]).bind(s);
-    }
-    q.execute(c).await.map(|_| ())
-}
-
-#[cfg(feature = "mysql")]
-impl MySqlStore {
-    /// A transaction for composing with `delete_user`, isolated the way the
-    /// last-admin guard needs (see `BEGIN_GUARDED`), and holding the guard's
-    /// locks from the start. The caller's own writes come before
-    /// `delete_user`'s count; had they locked an admin's row first, two admins
-    /// deleting each other would each hold a row the other's count waits on.
-    pub async fn begin(&self) -> sqlx::Result<Transaction<'static, MySql>> {
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        star_holders_locked(&mut tx).await?;
-        Ok(tx)
-    }
-
-    // ------------------------------------------------------------------ users
-
-    /// Plain INSERT: the unique key settles a race for a name, not a SELECT
-    /// first. `role`, when given, is granted in the same transaction, so an
-    /// account never exists without the role it was made for. For bootstrap's
-    /// admin that matters: a half-made one would hold the name and refuse the
-    /// next boot.
-    pub async fn create_user(&self, u: &NewUser, role: Option<&str>) -> Result<(), CreateUserError> {
-        let mut tx = self.0.begin().await?;
-        let inserted = sqlx::query(
-            "INSERT INTO acct_users (id, username, display_name, email_pending, password_hash, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&u.id.0[..])
-        .bind(&u.username)
-        .bind(&u.display_name)
-        .bind(&u.email_pending)
-        .bind(&u.password_hash)
-        .bind(u.created_at)
-        .execute(&mut *tx)
-        .await;
-        match inserted {
-            Err(e) if is_dup(&e) => return Err(CreateUserError::UsernameTaken),
-            Err(e) => return Err(e.into()),
-            Ok(_) => {}
-        }
-        if let Some(role) = role {
-            let n = sqlx::query(
-                "INSERT INTO acct_user_roles (user_id, role_id, granted_by, granted_at)
-                 SELECT ?, id, NULL, ? FROM acct_roles WHERE name = ?",
-            )
-            .bind(&u.id.0[..])
-            .bind(u.created_at)
-            .bind(role)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            if n != 1 {
-                return Err(sqlx::Error::InvalidArgument(format!("no role named {role:?}")).into());
+/// The `?` placeholders numbered `$1`, `$2`… in order, as Postgres takes them.
+/// A `?` inside a '…' literal is text, not a placeholder.
+fn numbered(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 16);
+    let (mut n, mut quoted) = (0, false);
+    for c in sql.chars() {
+        match c {
+            '\'' => quoted = !quoted,
+            '?' if !quoted => {
+                n += 1;
+                out.push_str(&format!("${n}"));
+                continue;
             }
+            _ => {}
         }
-        tx.commit().await?;
-        Ok(())
+        out.push(c);
     }
-
-    pub async fn user_by_id(&self, id: AccountId) -> sqlx::Result<Option<User>> {
-        sqlx::query(AssertSqlSafe(format!("SELECT {USER_COLS} FROM acct_users WHERE id = ?")))
-            .bind(&id.0[..])
-            .fetch_optional(&self.0)
-            .await?
-            .as_ref()
-            .map(user)
-            .transpose()
-    }
-
-    /// `username` as `scope::normalize_username` returns it. The column is
-    /// `_bin`, so case is not folded, but it is PAD SPACE: `"name "` finds
-    /// `name`. Never pass a raw string here.
-    pub async fn user_by_username(&self, username: &str) -> sqlx::Result<Option<User>> {
-        sqlx::query(AssertSqlSafe(format!("SELECT {USER_COLS} FROM acct_users WHERE username = ?")))
-            .bind(username)
-            .fetch_optional(&self.0)
-            .await?
-            .as_ref()
-            .map(user)
-            .transpose()
-    }
-
-    /// A verified address only: a pending one belongs to nobody yet.
-    pub async fn user_by_email(&self, email: &str) -> sqlx::Result<Option<User>> {
-        sqlx::query(AssertSqlSafe(format!("SELECT {USER_COLS} FROM acct_users WHERE email = ?")))
-            .bind(email)
-            .fetch_optional(&self.0)
-            .await?
-            .as_ref()
-            .map(user)
-            .transpose()
-    }
-
-    pub async fn set_email_pending(&self, id: AccountId, email: Option<&str>) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_users SET email_pending = ? WHERE id = ?").bind(email).bind(&id.0[..]).execute(&self.0).await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// The pending address becomes the verified one, if it is still the one
-    /// the link was for.
-    pub async fn confirm_email(&self, id: AccountId, email: &str, now: i64) -> sqlx::Result<EmailConfirm> {
-        let r = sqlx::query(
-            "UPDATE acct_users SET email = email_pending, email_pending = NULL, email_verified_at = ?
-              WHERE id = ? AND email_pending = ?",
-        )
-        .bind(now)
-        .bind(&id.0[..])
-        .bind(email)
-        .execute(&self.0)
-        .await;
-        match r {
-            Ok(r) if r.rows_affected() == 1 => Ok(EmailConfirm::Done),
-            Ok(_) => Ok(EmailConfirm::Stale),
-            Err(e) if is_dup(&e) => Ok(EmailConfirm::Taken),
-            Err(e) => Err(e),
-        }
-    }
-
-    pub async fn clear_email(&self, id: AccountId) -> sqlx::Result<()> {
-        sqlx::query("UPDATE acct_users SET email = NULL, email_pending = NULL, email_verified_at = NULL WHERE id = ?")
-            .bind(&id.0[..])
-            .execute(&self.0)
-            .await
-            .map(|_| ())
-    }
-
-    pub async fn password_hash_of(&self, id: AccountId) -> sqlx::Result<Option<String>> {
-        let h: Option<Option<String>> = sqlx::query_scalar("SELECT password_hash FROM acct_users WHERE id = ?")
-            .bind(&id.0[..])
-            .fetch_optional(&self.0)
-            .await?;
-        Ok(h.flatten())
-    }
-
-    pub async fn set_password_hash(&self, id: AccountId, hash: &str) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_users SET password_hash = ? WHERE id = ?")
-            .bind(hash)
-            .bind(&id.0[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// The upgrade after a login whose hash `needs_rehash`: only while `old` is
-    /// still the stored hash. A password change that lands while the login is
-    /// verifying would otherwise be overwritten with the old password.
-    pub async fn rehash_password(&self, id: AccountId, old: &str, new: &str) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_users SET password_hash = ? WHERE id = ? AND password_hash = ?")
-            .bind(new)
-            .bind(&id.0[..])
-            .bind(old)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Refuses to disable the last active holder of `*`. The caller still
-    /// deletes the sessions of an account it disables.
-    pub async fn set_status(&self, id: AccountId, status: UserStatus) -> Result<bool, WriteError> {
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        let before = star_holders_locked(&mut tx).await?;
-        let n = sqlx::query("UPDATE acct_users SET status = ? WHERE id = ?")
-            .bind(status as i8)
-            .bind(&id.0[..])
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        keep_an_admin(&mut tx, before).await?;
-        tx.commit().await?;
-        Ok(n == 1)
-    }
-
-    pub async fn set_display_name(&self, id: AccountId, name: &str) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_users SET display_name = ? WHERE id = ?")
-            .bind(name)
-            .bind(&id.0[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    pub async fn set_sync_enabled(&self, id: AccountId, on: bool) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_users SET sync_enabled = ? WHERE id = ?")
-            .bind(on)
-            .bind(&id.0[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Newest first, with the total for paging. `search` matches username,
-    /// display name and verified email, case-insensitively (the columns are
-    /// `_bin`, so LIKE alone would not be).
-    pub async fn list_users(&self, search: Option<&str>, limit: u32, offset: u32) -> sqlx::Result<(Vec<User>, i64)> {
-        let like = search.map(str::trim).filter(|s| !s.is_empty()).map(like_pattern);
-        let filter = if like.is_some() {
-            "WHERE username LIKE ? ESCAPE '!' OR LOWER(display_name) LIKE ? ESCAPE '!' \
-             OR COALESCE(email, '') LIKE ? ESCAPE '!'"
-        } else {
-            ""
-        };
-        let mut rows = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {USER_COLS} FROM acct_users {filter} ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
-        )));
-        let mut count = sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!("SELECT COUNT(*) FROM acct_users {filter}")));
-        if let Some(l) = &like {
-            rows = rows.bind(l).bind(l).bind(l);
-            count = count.bind(l).bind(l).bind(l);
-        }
-        let users = rows.bind(limit).bind(offset).fetch_all(&self.0).await?.iter().map(user).collect::<sqlx::Result<_>>()?;
-        Ok((users, count.fetch_one(&self.0).await?))
-    }
-
-    /// One DELETE; the foreign keys take sessions, grants, credentials,
-    /// recovery codes, blobs, the profile and the audit rows with it.
-    ///
-    /// Takes a connection, not `&self`: the service runs it inside the
-    /// transaction (from `Store::begin`) that also removes the host's rows for
-    /// the account. Inside one, this nests as a savepoint, so a refusal (last
-    /// `*` holder) rolls back only this part and leaves the rest to the caller.
-    pub async fn delete_user(conn: &mut MySqlConnection, id: AccountId) -> Result<bool, WriteError> {
-        let mut tx = if conn.is_in_transaction() { conn.begin().await? } else { conn.begin_with(BEGIN_GUARDED).await? };
-        let before = star_holders_locked(&mut tx).await?;
-        let n = sqlx::query("DELETE FROM acct_users WHERE id = ?")
-            .bind(&id.0[..])
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        keep_an_admin(&mut tx, before).await?;
-        tx.commit().await?;
-        Ok(n == 1)
-    }
-
-    // --------------------------------------------------------------- sessions
-
-    /// Inserts only for an active account: a login still in flight when the
-    /// account is disabled or deleted gets `RowNotFound`, not a session. Keeps
-    /// the newest `MAX_SESSIONS` signed-in sessions per account (and
-    /// `MAX_PENDING` waiting for a second factor), so a script that logs in in a
-    /// loop cannot grow the table without bound. Pending sessions never push
-    /// out signed-in ones: knowing the password alone must not sign the owner out.
-    pub async fn insert_session(&self, s: &SessionInfo) -> sqlx::Result<()> {
-        let n = sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO acct_sessions ({SESSION_COLS})
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM acct_users WHERE id = ? AND status = ?"
-        )))
-        .bind(&s.token_hash[..])
-        .bind(&s.user_id.0[..])
-        .bind(s.created_at)
-        .bind(s.seen_at)
-        .bind(s.expires_at)
-        .bind(s.auth_at)
-        .bind(s.mfa_ok)
-        .bind(&s.method)
-        .bind(&s.ip)
-        .bind(clip(&s.ua, 256))
-        .bind(&s.user_id.0[..])
-        .bind(UserStatus::Active as i8)
-        .execute(&self.0)
-        .await?
-        .rows_affected();
-        if n == 0 {
-            return Err(sqlx::Error::RowNotFound);
-        }
-        // Found by a plain read and deleted by primary key: a DELETE ranging
-        // over the user_id index takes gap locks that deadlock with other
-        // accounts' logins. Two racing logins may leave one extra row until
-        // the next one.
-        let over: Vec<Vec<u8>> = sqlx::query_scalar(
-            "SELECT token_hash FROM acct_sessions WHERE user_id = ? AND mfa_ok = ?
-              ORDER BY seen_at DESC, created_at DESC LIMIT ?, 1000",
-        )
-        .bind(&s.user_id.0[..])
-        .bind(s.mfa_ok)
-        .bind(if s.mfa_ok { MAX_SESSIONS } else { MAX_PENDING })
-        .fetch_all(&self.0)
-        .await?;
-        for h in over {
-            sqlx::query("DELETE FROM acct_sessions WHERE token_hash = ?").bind(h).execute(&self.0).await?;
-        }
-        Ok(())
-    }
-
-    /// Absolute expiry only; the idle limit is config, so the service checks
-    /// `seen_at` itself.
-    pub async fn session_by_hash(&self, hash: &[u8; 32], now: i64) -> sqlx::Result<Option<SessionInfo>> {
-        sqlx::query(AssertSqlSafe(format!(
-            "SELECT {SESSION_COLS} FROM acct_sessions WHERE token_hash = ? AND expires_at > ?"
-        )))
-        .bind(&hash[..])
-        .bind(now)
-        .fetch_optional(&self.0)
-        .await?
-        .as_ref()
-        .map(session)
-        .transpose()
-    }
-
-    /// True when it wrote, i.e. `seen_at` was more than `TOUCH_SECS` old.
-    pub async fn touch_session(&self, hash: &[u8; 32], now: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_sessions SET seen_at = ? WHERE token_hash = ? AND seen_at < ?")
-            .bind(now)
-            .bind(&hash[..])
-            .bind(now - TOUCH_SECS)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    pub async fn set_session_mfa(&self, hash: &[u8; 32], mfa_ok: bool, auth_at: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_sessions SET mfa_ok = ?, auth_at = ? WHERE token_hash = ?")
-            .bind(mfa_ok)
-            .bind(auth_at)
-            .bind(&hash[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// New token, same session: a token seen before a privilege change (login,
-    /// MFA, step-up, role change) stops working after it.
-    pub async fn rotate_session(&self, old: &[u8; 32], new: &[u8; 32]) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_sessions SET token_hash = ? WHERE token_hash = ?")
-            .bind(&new[..])
-            .bind(&old[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// The second factor is done: a new token, `mfa_ok`, the full lifetime.
-    /// Only a pending session completes, and only once.
-    pub async fn complete_session(&self, old: &[u8; 32], new: &[u8; 32], auth_at: i64, expires_at: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query(
-            "UPDATE acct_sessions SET token_hash = ?, mfa_ok = 1, auth_at = ?, expires_at = ? WHERE token_hash = ? AND mfa_ok = 0",
-        )
-        .bind(&new[..])
-        .bind(auth_at)
-        .bind(expires_at)
-        .bind(&old[..])
-        .execute(&self.0)
-        .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Step-up: a new token and a fresh `auth_at`, on a complete session only.
-    pub async fn refresh_session(&self, old: &[u8; 32], new: &[u8; 32], auth_at: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_sessions SET token_hash = ?, auth_at = ? WHERE token_hash = ? AND mfa_ok = 1")
-            .bind(&new[..])
-            .bind(auth_at)
-            .bind(&old[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Scoped to the owner: the revoke button posts a hash from a URL, and a
-    /// hash belonging to someone else must delete nothing.
-    pub async fn delete_session(&self, hash: &[u8; 32], user: AccountId) -> sqlx::Result<bool> {
-        let r = sqlx::query("DELETE FROM acct_sessions WHERE token_hash = ? AND user_id = ?")
-            .bind(&hash[..])
-            .bind(&user.0[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// "Sign out everywhere" keeps `except`, the session asking.
-    pub async fn delete_sessions_of(&self, user: AccountId, except: Option<&[u8; 32]>) -> sqlx::Result<u64> {
-        let q = match except {
-            Some(h) => sqlx::query("DELETE FROM acct_sessions WHERE user_id = ? AND token_hash <> ?")
-                .bind(&user.0[..])
-                .bind(&h[..]),
-            None => sqlx::query("DELETE FROM acct_sessions WHERE user_id = ?").bind(&user.0[..]),
-        };
-        Ok(q.execute(&self.0).await?.rows_affected())
-    }
-
-    /// Most recently used first. Includes rows the sweep has not reached yet;
-    /// the caller knows the idle limit and filters.
-    pub async fn sessions_of(&self, user: AccountId) -> sqlx::Result<Vec<SessionInfo>> {
-        sqlx::query(AssertSqlSafe(format!(
-            "SELECT {SESSION_COLS} FROM acct_sessions WHERE user_id = ? ORDER BY seen_at DESC, created_at DESC"
-        )))
-        .bind(&user.0[..])
-        .fetch_all(&self.0)
-        .await?
-        .iter()
-        .map(session)
-        .collect()
-    }
-
-    /// One batch; the sweeper loops while a call returns a full one. Small
-    /// batches keep each lock short.
-    pub async fn delete_expired_sessions(&self, now: i64, idle_secs: i64, batch: u64) -> sqlx::Result<u64> {
-        // Two statements, one index each: an OR across both columns scanned and
-        // locked the whole table on every batch.
-        let expired = sqlx::query("DELETE FROM acct_sessions WHERE expires_at < ? LIMIT ?")
-            .bind(now)
-            .bind(batch)
-            .execute(&self.0)
-            .await?
-            .rows_affected();
-        if expired >= batch {
-            return Ok(expired);
-        }
-        let idle = sqlx::query("DELETE FROM acct_sessions WHERE seen_at < ? LIMIT ?")
-            .bind(now - idle_secs)
-            .bind(batch - expired)
-            .execute(&self.0)
-            .await?
-            .rows_affected();
-        Ok(expired + idle)
-    }
-
-    // ------------------------------------------------------- second factors
-
-    /// The sealed TOTP secret and the last step a code was accepted for.
-    pub async fn totp_of(&self, user: AccountId) -> sqlx::Result<Option<(Vec<u8>, i64)>> {
-        let row: Option<(Option<Vec<u8>>, i64)> =
-            sqlx::query_as("SELECT totp_enc, totp_last_step FROM acct_users WHERE id = ?").bind(&user.0[..]).fetch_optional(&self.0).await?;
-        Ok(row.and_then(|(enc, step)| enc.map(|e| (e, step))))
-    }
-
-    /// Turns codes on (only while off, so two setups cannot race) or off.
-    pub async fn set_totp(&self, user: AccountId, sealed: Option<&[u8]>, last_step: i64) -> sqlx::Result<bool> {
-        let q = match sealed {
-            Some(s) => sqlx::query("UPDATE acct_users SET totp_enc = ?, totp_last_step = ? WHERE id = ? AND totp_enc IS NULL").bind(s),
-            None => sqlx::query("UPDATE acct_users SET totp_enc = NULL, totp_last_step = ? WHERE id = ? AND totp_enc IS NOT NULL"),
-        };
-        Ok(q.bind(last_step).bind(&user.0[..]).execute(&self.0).await?.rows_affected() == 1)
-    }
-
-    /// Accepts a code's step once: false when this step or a later one was
-    /// already used, so a code read over a shoulder is worth nothing after.
-    pub async fn advance_totp(&self, user: AccountId, step: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_users SET totp_last_step = ? WHERE id = ? AND totp_enc IS NOT NULL AND totp_last_step < ?")
-            .bind(step)
-            .bind(&user.0[..])
-            .bind(step)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// The same secret under the current key, unless it changed meanwhile.
-    pub async fn reseal_totp(&self, user: AccountId, old: &[u8], new: &[u8]) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_users SET totp_enc = ? WHERE id = ? AND totp_enc = ?")
-            .bind(new)
-            .bind(&user.0[..])
-            .bind(old)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// A fresh set of recovery code hashes in place of the old one. Under READ
-    /// COMMITTED (see `BEGIN_GUARDED`): the DELETE's gap locks under REPEATABLE
-    /// READ deadlock with another account's codes going in next to them.
-    pub async fn replace_recovery(&self, user: AccountId, hashes: &[[u8; 32]]) -> sqlx::Result<()> {
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        sqlx::query("DELETE FROM acct_recovery WHERE user_id = ?").bind(&user.0[..]).execute(&mut *tx).await?;
-        for h in hashes {
-            sqlx::query("INSERT INTO acct_recovery (user_id, code_hash) VALUES (?, ?)")
-                .bind(&user.0[..])
-                .bind(&h[..])
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await
-    }
-
-    /// Spends one code: false when it is unknown or already spent.
-    pub async fn use_recovery(&self, user: AccountId, hash: &[u8; 32], now: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_recovery SET used_at = ? WHERE user_id = ? AND code_hash = ? AND used_at IS NULL")
-            .bind(now)
-            .bind(&user.0[..])
-            .bind(&hash[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    pub async fn recovery_left(&self, user: AccountId) -> sqlx::Result<i64> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM acct_recovery WHERE user_id = ? AND used_at IS NULL")
-            .bind(&user.0[..])
-            .fetch_one(&self.0)
-            .await
-    }
-
-    pub async fn delete_recovery(&self, user: AccountId) -> sqlx::Result<()> {
-        sqlx::query("DELETE FROM acct_recovery WHERE user_id = ?").bind(&user.0[..]).execute(&self.0).await.map(|_| ())
-    }
-
-    // ---------------------------------------------------------------- blobs
-
-    pub async fn blobs(&self, user: AccountId, ns: &str) -> sqlx::Result<Vec<Blob>> {
-        let rows: Vec<(String, Vec<u8>, i64, i64)> =
-            sqlx::query_as("SELECT k, v, version, updated_at FROM acct_blobs WHERE user_id = ? AND ns = ? ORDER BY k")
-                .bind(&user.0[..])
-                .bind(ns)
-                .fetch_all(&self.0)
-                .await?;
-        Ok(rows.into_iter().map(|(k, v, version, updated_at)| Blob { k, v, version, updated_at }).collect())
-    }
-
-    pub async fn blob(&self, user: AccountId, ns: &str, k: &str) -> sqlx::Result<Option<Blob>> {
-        let row: Option<(String, Vec<u8>, i64, i64)> =
-            sqlx::query_as("SELECT k, v, version, updated_at FROM acct_blobs WHERE user_id = ? AND ns = ? AND k = ?")
-                .bind(&user.0[..])
-                .bind(ns)
-                .bind(k)
-                .fetch_optional(&self.0)
-                .await?;
-        Ok(row.map(|(k, v, version, updated_at)| Blob { k, v, version, updated_at }))
-    }
-
-    pub async fn blob_count(&self, user: AccountId, ns: &str) -> sqlx::Result<i64> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM acct_blobs WHERE user_id = ? AND ns = ?")
-            .bind(&user.0[..])
-            .bind(ns)
-            .fetch_one(&self.0)
-            .await
-    }
-
-    /// Compare-and-set: `expect` 0 creates (and finds a conflict if the key
-    /// exists), any other value replaces only that version. The account's row
-    /// is locked first, so two writes cannot both fit under the quota.
-    pub async fn put_blob(&self, user: AccountId, ns: &str, k: &str, v: &[u8], expect: i64, quota: i64) -> sqlx::Result<PutBlob> {
-        let now = util::now();
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        sqlx::query("SELECT id FROM acct_users WHERE id = ? FOR UPDATE").bind(&user.0[..]).execute(&mut *tx).await?;
-        let used: i64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(LENGTH(v)), 0) AS SIGNED) FROM acct_blobs WHERE user_id = ?")
-            .bind(&user.0[..])
-            .fetch_one(&mut *tx)
-            .await?;
-        let current: Option<(i64, i64)> =
-            sqlx::query_as("SELECT version, CAST(LENGTH(v) AS SIGNED) FROM acct_blobs WHERE user_id = ? AND ns = ? AND k = ?")
-                .bind(&user.0[..])
-                .bind(ns)
-                .bind(k)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let (old_len, version) = match current {
-            Some((ver, _)) if ver != expect => return Ok(PutBlob::Conflict),
-            None if expect != 0 => return Ok(PutBlob::Conflict),
-            Some((ver, len)) => (len, ver + 1),
-            None => (0, 1),
-        };
-        if used - old_len + v.len() as i64 > quota {
-            return Ok(PutBlob::Quota);
-        }
-        sqlx::query(
-            "INSERT INTO acct_blobs (user_id, ns, k, v, version, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE v = VALUES(v), version = VALUES(version), updated_at = VALUES(updated_at)",
-        )
-        .bind(&user.0[..])
-        .bind(ns)
-        .bind(k)
-        .bind(v)
-        .bind(version)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(PutBlob::Done(version))
-    }
-
-    /// `expect` 0 deletes whatever version is there.
-    pub async fn delete_blob(&self, user: AccountId, ns: &str, k: &str, expect: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query("DELETE FROM acct_blobs WHERE user_id = ? AND ns = ? AND k = ? AND (? = 0 OR version = ?)")
-            .bind(&user.0[..])
-            .bind(ns)
-            .bind(k)
-            .bind(expect)
-            .bind(expect)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    pub async fn delete_blobs(&self, user: AccountId, ns: &str) -> sqlx::Result<u64> {
-        let r = sqlx::query("DELETE FROM acct_blobs WHERE user_id = ? AND ns = ?").bind(&user.0[..]).bind(ns).execute(&self.0).await?;
-        Ok(r.rows_affected())
-    }
-
-    // -------------------------------------------------------------- profile
-
-    pub async fn profile(&self, user: AccountId) -> sqlx::Result<Profile> {
-        let row: Option<(Option<Vec<u8>>, String, bool)> =
-            sqlx::query_as("SELECT public_id, bio, show_badges FROM acct_profiles WHERE user_id = ?").bind(&user.0[..]).fetch_optional(&self.0).await?;
-        Ok(match row {
-            Some((id, bio, show_badges)) => Profile { public_id: id.and_then(|b| b.try_into().ok()), bio, show_badges },
-            None => Profile { public_id: None, bio: String::new(), show_badges: true },
-        })
-    }
-
-    pub async fn save_profile(&self, user: AccountId, p: &Profile, now: i64) -> sqlx::Result<()> {
-        sqlx::query(
-            "INSERT INTO acct_profiles (user_id, public_id, bio, show_badges, updated_at) VALUES (?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE public_id = VALUES(public_id), bio = VALUES(bio), show_badges = VALUES(show_badges), updated_at = VALUES(updated_at)",
-        )
-        .bind(&user.0[..])
-        .bind(p.public_id.as_ref().map(|b| &b[..]))
-        .bind(clip(&p.bio, 1000))
-        .bind(p.show_badges)
-        .bind(now)
-        .execute(&self.0)
-        .await
-        .map(|_| ())
-    }
-
-    /// The account behind a public profile link, if the profile is on.
-    pub async fn profile_owner(&self, public_id: &[u8; 16]) -> sqlx::Result<Option<AccountId>> {
-        let owner: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT user_id FROM acct_profiles WHERE public_id = ?").bind(&public_id[..]).fetch_optional(&self.0).await?;
-        owner.map(id).transpose()
-    }
-
-    /// Whether a credential (a linked identity) shows on the public profile.
-    pub async fn set_credential_public(&self, user: AccountId, kind: &str, ext_id: &[u8], public: bool) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_credentials SET public = ? WHERE user_id = ? AND kind = ? AND ext_id = ?")
-            .bind(public)
-            .bind(&user.0[..])
-            .bind(kind)
-            .bind(ext_id)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Linked identities shown on the profile: (kind, name).
-    pub async fn public_identities(&self, user: AccountId) -> sqlx::Result<Vec<(String, String)>> {
-        sqlx::query_as("SELECT kind, name FROM acct_credentials WHERE user_id = ? AND public = 1 AND kind LIKE 'oauth:%' ORDER BY kind")
-            .bind(&user.0[..])
-            .fetch_all(&self.0)
-            .await
-    }
-
-    // ---------------------------------------------------------- credentials
-
-    /// A plain INSERT: false when `(kind, ext_id)` already exists, so a key can
-    /// never be moved to a second account by registering it again.
-    pub async fn insert_credential(&self, c: &Credential) -> sqlx::Result<bool> {
-        let r = sqlx::query(
-            "INSERT INTO acct_credentials (kind, ext_id, user_id, public_key, alg, sign_count, flags, name, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&c.kind)
-        .bind(&c.ext_id)
-        .bind(&c.user_id.0[..])
-        .bind(&c.public_key)
-        .bind(c.alg)
-        .bind(c.sign_count)
-        .bind(c.flags)
-        .bind(clip(&c.name, 64))
-        .bind(c.created_at)
-        .execute(&self.0)
-        .await;
-        match r {
-            Ok(_) => Ok(true),
-            Err(e) if is_dup(&e) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    pub async fn credential(&self, kind: &str, ext_id: &[u8]) -> sqlx::Result<Option<Credential>> {
-        sqlx::query(AssertSqlSafe(format!("SELECT {CRED_COLS} FROM acct_credentials WHERE kind = ? AND ext_id = ?")))
-            .bind(kind)
-            .bind(ext_id)
-            .fetch_optional(&self.0)
-            .await?
-            .as_ref()
-            .map(credential)
-            .transpose()
-    }
-
-    /// Oldest first.
-    pub async fn credentials_of(&self, user: AccountId, kind: &str) -> sqlx::Result<Vec<Credential>> {
-        sqlx::query(AssertSqlSafe(format!(
-            "SELECT {CRED_COLS} FROM acct_credentials WHERE user_id = ? AND kind = ? ORDER BY created_at, ext_id"
-        )))
-        .bind(&user.0[..])
-        .bind(kind)
-        .fetch_all(&self.0)
-        .await?
-        .iter()
-        .map(credential)
-        .collect()
-    }
-
-    /// Scoped to the owner, like `delete_session`.
-    pub async fn delete_credential(&self, user: AccountId, kind: &str, ext_id: &[u8]) -> sqlx::Result<bool> {
-        let r = sqlx::query("DELETE FROM acct_credentials WHERE user_id = ? AND kind = ? AND ext_id = ?")
-            .bind(&user.0[..])
-            .bind(kind)
-            .bind(ext_id)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Every credential of one kind an account has, e.g. its device keys when a
-    /// second factor changes.
-    pub async fn delete_credentials_of(&self, user: AccountId, kind: &str) -> sqlx::Result<u64> {
-        let r = sqlx::query("DELETE FROM acct_credentials WHERE user_id = ? AND kind = ?")
-            .bind(&user.0[..])
-            .bind(kind)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected())
-    }
-
-    /// One batch of credentials of `kind` unused since `before`.
-    pub async fn delete_stale_credentials(&self, kind: &str, before: i64, batch: u64) -> sqlx::Result<u64> {
-        let r = sqlx::query("DELETE FROM acct_credentials WHERE kind = ? AND COALESCE(last_used_at, created_at) < ? LIMIT ?")
-            .bind(kind)
-            .bind(before)
-            .bind(batch)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected())
-    }
-
-    /// Credentials that sign in on their own: passkeys, SSH keys, social
-    /// identities. Device keys only stand in for one of these, so they do not
-    /// count as a way in.
-    pub async fn login_credentials(&self, user: AccountId) -> sqlx::Result<i64> {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM acct_credentials WHERE user_id = ? AND (kind IN ('passkey', 'ssh') OR kind LIKE 'oauth:%')",
-        )
-        .bind(&user.0[..])
-        .fetch_one(&self.0)
-        .await
-    }
-
-    /// Records a use. The counter only moves forward (authenticators that keep
-    /// it at 0 aside): false means another use raced this one or the
-    /// authenticator went backwards, and the caller refuses.
-    pub async fn used_credential(&self, kind: &str, ext_id: &[u8], sign_count: i64, now: i64) -> sqlx::Result<bool> {
-        let r = sqlx::query(
-            "UPDATE acct_credentials SET sign_count = ?, last_used_at = ?
-              WHERE kind = ? AND ext_id = ? AND (? = 0 OR sign_count < ?)",
-        )
-        .bind(sign_count)
-        .bind(now)
-        .bind(kind)
-        .bind(ext_id)
-        .bind(sign_count)
-        .bind(sign_count)
-        .execute(&self.0)
-        .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    // ------------------------------------------------------------------ roles
-
-    /// Seeds `admin` (`*`) and `user` (`user_scopes`) on first boot. Scopes are
-    /// written only when the role row is new: an admin who later trimmed the
-    /// `user` role must not see it grow back on every restart.
-    pub async fn ensure_builtin_roles(&self, user_scopes: &[String]) -> sqlx::Result<()> {
-        let star = ["*".to_string()];
-        for (name, description, scopes) in [("admin", "Full access", &star[..]), ("user", "Every account", user_scopes)] {
-            let mut tx = self.0.begin().await?;
-            let role = AccountId::new();
-            // IGNORE only ever meets the name key: every other value is a constant.
-            let fresh = sqlx::query(
-                "INSERT IGNORE INTO acct_roles (id, name, description, builtin, created_at) VALUES (?, ?, ?, 1, ?)",
-            )
-            .bind(&role.0[..])
-            .bind(name)
-            .bind(description)
-            .bind(util::now())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-                == 1;
-            if fresh {
-                insert_scopes(&mut tx, role, scopes).await?;
-            }
-            tx.commit().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn roles(&self) -> sqlx::Result<Vec<Role>> {
-        let rows = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {ROLE_COLS} FROM acct_roles r LEFT JOIN acct_role_scopes s ON s.role_id = r.id ORDER BY r.name, s.scope"
-        )))
-        .fetch_all(&self.0)
-        .await?;
-        roles_from(rows)
-    }
-
-    pub async fn role_by_name(&self, name: &str) -> sqlx::Result<Option<Role>> {
-        let rows = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {ROLE_COLS} FROM acct_roles r LEFT JOIN acct_role_scopes s ON s.role_id = r.id
-              WHERE r.name = ? ORDER BY s.scope"
-        )))
-        .bind(name)
-        .fetch_all(&self.0)
-        .await?;
-        Ok(roles_from(rows)?.into_iter().next())
-    }
-
-    /// `None` when the name is taken. Scopes come after, via `set_role_scopes`.
-    pub async fn create_role(&self, name: &str, description: &str, badge: Option<&str>) -> sqlx::Result<Option<AccountId>> {
-        let role = AccountId::new();
-        let r = sqlx::query("INSERT INTO acct_roles (id, name, description, badge, builtin, created_at) VALUES (?, ?, ?, ?, 0, ?)")
-            .bind(&role.0[..])
-            .bind(name)
-            .bind(description)
-            .bind(badge)
-            .bind(util::now())
-            .execute(&self.0)
-            .await;
-        match r {
-            Ok(_) => Ok(Some(role)),
-            Err(e) if is_dup(&e) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    pub async fn update_role(&self, role: AccountId, description: &str, badge: Option<&str>) -> sqlx::Result<bool> {
-        let r = sqlx::query("UPDATE acct_roles SET description = ?, badge = ? WHERE id = ?")
-            .bind(description)
-            .bind(badge)
-            .bind(&role.0[..])
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Replaces the whole set in one transaction: a failure half-way leaves the
-    /// old set, never an empty or partial one.
-    pub async fn set_role_scopes(&self, role: AccountId, scopes: &[String]) -> Result<(), WriteError> {
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        let before = star_holders_locked(&mut tx).await?;
-        sqlx::query("DELETE FROM acct_role_scopes WHERE role_id = ?")
-            .bind(&role.0[..])
-            .execute(&mut *tx)
-            .await?;
-        insert_scopes(&mut tx, role, scopes).await?;
-        keep_an_admin(&mut tx, before).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// False when there is no such role. Its scopes and grants go with it.
-    pub async fn delete_role(&self, role: AccountId) -> Result<bool, WriteError> {
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        let before = star_holders_locked(&mut tx).await?;
-        let builtin: Option<bool> = sqlx::query_scalar("SELECT builtin FROM acct_roles WHERE id = ? FOR UPDATE")
-            .bind(&role.0[..])
-            .fetch_optional(&mut *tx)
-            .await?;
-        match builtin {
-            None => return Ok(false),
-            Some(true) => return Err(WriteError::Builtin),
-            Some(false) => {}
-        }
-        sqlx::query("DELETE FROM acct_roles WHERE id = ?").bind(&role.0[..]).execute(&mut *tx).await?;
-        keep_an_admin(&mut tx, before).await?;
-        tx.commit().await?;
-        Ok(true)
-    }
-
-    pub async fn user_roles(&self, user: AccountId) -> sqlx::Result<Vec<Role>> {
-        let rows = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {ROLE_COLS} FROM acct_user_roles ur JOIN acct_roles r ON r.id = ur.role_id
-               LEFT JOIN acct_role_scopes s ON s.role_id = r.id
-              WHERE ur.user_id = ? ORDER BY r.name, s.scope"
-        )))
-        .bind(&user.0[..])
-        .fetch_all(&self.0)
-        .await?;
-        roles_from(rows)
-    }
-
-    /// Every scope of every role the account holds, deduplicated and sorted.
-    pub async fn user_scopes(&self, user: AccountId) -> sqlx::Result<Vec<String>> {
-        sqlx::query_scalar(
-            "SELECT DISTINCT s.scope FROM acct_user_roles ur JOIN acct_role_scopes s ON s.role_id = ur.role_id
-              WHERE ur.user_id = ? ORDER BY s.scope",
-        )
-        .bind(&user.0[..])
-        .fetch_all(&self.0)
-        .await
-    }
-
-    /// False when the account already held the role. Plain INSERT, not IGNORE:
-    /// IGNORE would also swallow a missing user or role.
-    pub async fn grant_role(&self, user: AccountId, role: AccountId, by: Option<AccountId>) -> sqlx::Result<bool> {
-        let r = sqlx::query("INSERT INTO acct_user_roles (user_id, role_id, granted_by, granted_at) VALUES (?, ?, ?, ?)")
-            .bind(&user.0[..])
-            .bind(&role.0[..])
-            .bind(by.as_ref().map(|b| &b.0[..]))
-            .bind(util::now())
-            .execute(&self.0)
-            .await;
-        match r {
-            Ok(_) => Ok(true),
-            Err(e) if is_dup(&e) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// False when the account did not hold the role.
-    pub async fn revoke_role(&self, user: AccountId, role: AccountId) -> Result<bool, WriteError> {
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        let before = star_holders_locked(&mut tx).await?;
-        let n = sqlx::query("DELETE FROM acct_user_roles WHERE user_id = ? AND role_id = ?")
-            .bind(&user.0[..])
-            .bind(&role.0[..])
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        keep_an_admin(&mut tx, before).await?;
-        tx.commit().await?;
-        Ok(n == 1)
-    }
-
-    /// Active accounts holding `*`. Zero means nobody can administer the site:
-    /// bootstrap runs then. A disabled admin does not count, since they cannot
-    /// sign in.
-    pub async fn holders_of_scope_star(&self) -> sqlx::Result<i64> {
-        sqlx::query_scalar(STAR_HOLDERS).fetch_one(&self.0).await
-    }
-
-    // ------------------------------------------------------------------ audit
-
-    /// `ip` is already shaped (`ip::shape_ip`); `detail` is cut to the column.
-    pub async fn audit(
-        &self,
-        user: Option<AccountId>,
-        actor: Option<AccountId>,
-        event: &str,
-        detail: &str,
-        ip: &str,
-    ) -> sqlx::Result<()> {
-        sqlx::query("INSERT INTO acct_audit (user_id, actor_id, event, detail, ip, at) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(user.as_ref().map(|u| &u.0[..]))
-            .bind(actor.as_ref().map(|a| &a.0[..]))
-            .bind(event)
-            .bind(clip(detail, 255))
-            .bind(ip)
-            .bind(util::now())
-            .execute(&self.0)
-            .await
-            .map(|_| ())
-    }
-
-    /// Newest first. `ip` is blanked on rows another account acted on (an
-    /// admin's grant or disable): it is the admin's address, not the user's,
-    /// and this is what the user's dashboard and export show.
-    pub async fn audit_of(&self, user: AccountId, limit: u32) -> sqlx::Result<Vec<AuditEntry>> {
-        sqlx::query(
-            "SELECT id, user_id, actor_id, event, detail,
-                    CASE WHEN actor_id IS NULL OR actor_id = user_id THEN ip ELSE '' END, at
-               FROM acct_audit WHERE user_id = ? ORDER BY at DESC, id DESC LIMIT ?",
-        )
-        .bind(&user.0[..])
-        .bind(limit)
-        .fetch_all(&self.0)
-        .await?
-        .iter()
-        .map(audit_entry)
-        .collect()
-    }
-
-    /// One batch of rows older than `ts`; loop like `delete_expired_sessions`.
-    pub async fn delete_audit_before(&self, ts: i64, batch: u64) -> sqlx::Result<u64> {
-        let r = sqlx::query("DELETE FROM acct_audit WHERE at < ? LIMIT ?")
-            .bind(ts)
-            .bind(batch)
-            .execute(&self.0)
-            .await?;
-        Ok(r.rows_affected())
-    }
-
-    // ---------------------------------------------------------------- invites
-
-    pub async fn insert_invite(&self, code_hash: &[u8; 32], by: Option<AccountId>, username: Option<&str>, expires_at: i64) -> sqlx::Result<()> {
-        sqlx::query("INSERT INTO acct_invites (code_hash, created_by, username, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
-            .bind(&code_hash[..])
-            .bind(by.as_ref().map(|b| &b.0[..]))
-            .bind(username)
-            .bind(util::now())
-            .bind(expires_at)
-            .execute(&self.0)
-            .await
-            .map(|_| ())
-    }
-
-    /// Unexpired ones, used or not, newest first.
-    pub async fn invites(&self, now: i64) -> sqlx::Result<Vec<Invite>> {
-        sqlx::query(
-            "SELECT code_hash, created_by, username, created_at, expires_at, used_at, used_by FROM acct_invites
-              WHERE expires_at > ? ORDER BY created_at DESC, code_hash LIMIT 1000",
-        )
-        .bind(now)
-        .fetch_all(&self.0)
-        .await?
-        .iter()
-        .map(invite)
-        .collect()
-    }
-
-    /// False when there was no such invite.
-    pub async fn delete_invite(&self, code_hash: &[u8; 32]) -> sqlx::Result<bool> {
-        let r = sqlx::query("DELETE FROM acct_invites WHERE code_hash = ?").bind(&code_hash[..]).execute(&self.0).await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// One batch of invites past their expiry, used or not.
-    pub async fn delete_expired_invites(&self, now: i64, batch: u64) -> sqlx::Result<u64> {
-        let r = sqlx::query("DELETE FROM acct_invites WHERE expires_at < ? LIMIT ?").bind(now).bind(batch).execute(&self.0).await?;
-        Ok(r.rows_affected())
-    }
-
-    /// Spends the invite and creates the account in one transaction: a name
-    /// that turns out to be taken leaves the code unspent, and two people with
-    /// one code cannot both get in.
-    pub async fn create_user_with_invite(&self, u: &NewUser, role: &str, code_hash: &[u8; 32], now: i64) -> sqlx::Result<InviteSignup> {
-        let mut tx = self.0.begin().await?;
-        let claimed = sqlx::query(
-            "UPDATE acct_invites SET used_at = ?, used_by = ?
-              WHERE code_hash = ? AND used_at IS NULL AND expires_at > ? AND (username IS NULL OR username = ?)",
-        )
-        .bind(now)
-        .bind(&u.id.0[..])
-        .bind(&code_hash[..])
-        .bind(now)
-        .bind(&u.username)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if claimed != 1 {
-            return Ok(InviteSignup::BadInvite);
-        }
-        let inserted = sqlx::query(
-            "INSERT INTO acct_users (id, username, display_name, email_pending, password_hash, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&u.id.0[..])
-        .bind(&u.username)
-        .bind(&u.display_name)
-        .bind(&u.email_pending)
-        .bind(&u.password_hash)
-        .bind(u.created_at)
-        .execute(&mut *tx)
-        .await;
-        match inserted {
-            Err(e) if is_dup(&e) => return Ok(InviteSignup::UsernameTaken),
-            Err(e) => return Err(e),
-            Ok(_) => {}
-        }
-        let n = sqlx::query("INSERT INTO acct_user_roles (user_id, role_id, granted_at) SELECT ?, id, ? FROM acct_roles WHERE name = ?")
-            .bind(&u.id.0[..])
-            .bind(u.created_at)
-            .bind(role)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        if n != 1 {
-            return Err(sqlx::Error::InvalidArgument(format!("no role named {role:?}")));
-        }
-        tx.commit().await?;
-        Ok(InviteSignup::Done)
-    }
-
-    /// Grants `admin` to `user` only while no active account holds `*`, under
-    /// the last-admin guard's locks: two accounts racing for an empty site get
-    /// one admin, not two. False when someone already holds it.
-    pub async fn grant_admin_if_none(&self, user: AccountId) -> Result<bool, WriteError> {
-        let mut tx = self.0.begin_with(BEGIN_GUARDED).await?;
-        if star_holders_locked(&mut tx).await? > 0 {
-            return Ok(false);
-        }
-        let n = sqlx::query(
-            "INSERT INTO acct_user_roles (user_id, role_id, granted_at)
-             SELECT u.id, r.id, ? FROM acct_users u JOIN acct_roles r ON r.name = 'admin' WHERE u.id = ? AND u.status = ?",
-        )
-        .bind(util::now())
-        .bind(&user.0[..])
-        .bind(UserStatus::Active as i8)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
-        Ok(n == 1)
-    }
-
-    // ----------------------------------------------------------------- export
-
-    /// The GDPR download: the account row, roles, sessions, sign-in methods
-    /// and the newest audit rows about the account (as `audit_of` shows them). No
-    /// secrets and nothing that works as a credential: no password hash, TOTP
-    /// secret, session hashes, recovery hashes or public keys. Not in it: audit
-    /// rows where this account acted on another one, which sit in that
-    /// account's log.
-    /// and the profile (phase 7) join this when something writes them. `None`
-    /// when the account does not exist.
-    pub async fn export_user(&self, id: AccountId) -> sqlx::Result<Option<serde_json::Value>> {
-        let Some(user) = self.user_by_id(id).await? else { return Ok(None) };
-        let verified_at: Option<i64> = sqlx::query_scalar("SELECT email_verified_at FROM acct_users WHERE id = ?")
-            .bind(&id.0[..])
-            .fetch_one(&self.0)
-            .await?;
-        let credentials = sqlx::query(
-            "SELECT kind, name, handle, email, public, created_at, last_used_at FROM acct_credentials
-              WHERE user_id = ? ORDER BY created_at",
-        )
-        .bind(&id.0[..])
-        .fetch_all(&self.0)
-        .await?
-        .iter()
-        .map(|r| {
-            Ok(serde_json::json!({
-                "kind": r.try_get::<String, _>(0)?,
-                "name": r.try_get::<String, _>(1)?,
-                "handle": r.try_get::<String, _>(2)?,
-                "email": r.try_get::<Option<String>, _>(3)?,
-                "public": r.try_get::<bool, _>(4)?,
-                "created_at": r.try_get::<i64, _>(5)?,
-                "last_used_at": r.try_get::<Option<i64>, _>(6)?,
-            }))
-        })
-        .collect::<sqlx::Result<Vec<_>>>()?;
-        // Synced settings as they are; vault entries as the ciphertext they
-        // are, which only the owner's keys open.
-        let blobs: Vec<(String, String, Vec<u8>, i64, i64)> =
-            sqlx::query_as("SELECT ns, k, v, version, updated_at FROM acct_blobs WHERE user_id = ? AND ns IN ('kv', 'vault', 'vault_slot') ORDER BY ns, k")
-                .bind(&id.0[..])
-                .fetch_all(&self.0)
-                .await?;
-        let blobs: Vec<serde_json::Value> = blobs
-            .into_iter()
-            .map(|(ns, k, v, version, updated_at)| {
-                let value = match ns.as_str() {
-                    "kv" | "vault_slot" => serde_json::from_slice(&v).unwrap_or(serde_json::Value::Null),
-                    _ => serde_json::Value::String(util::b64u(&v)),
-                };
-                serde_json::json!({ "ns": ns, "k": k, "value": value, "version": version, "updated_at": updated_at })
-            })
-            .collect();
-        // When each recovery code was used; never the hashes.
-        let recovery: Vec<Option<i64>> =
-            sqlx::query_scalar("SELECT used_at FROM acct_recovery WHERE user_id = ? ORDER BY used_at IS NULL, used_at")
-                .bind(&id.0[..])
-                .fetch_all(&self.0)
-                .await?;
-        let mut user = serde_json::json!(user);
-        user["email_verified_at"] = serde_json::json!(verified_at);
-        Ok(Some(serde_json::json!({
-            "user": user,
-            "roles": self.user_roles(id).await?,
-            "sessions": self.sessions_of(id).await?,
-            "credentials": credentials,
-            "recovery_codes": recovery.iter().map(|u| serde_json::json!({ "used_at": u })).collect::<Vec<_>>(),
-            "storage": blobs,
-            "audit": self.audit_of(id, EXPORT_AUDIT_ROWS).await?,
-        })))
-    }
+    out
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::backend::each;
     use super::*;
     use crate::migrate;
     use crate::model::{NewUser, SessionInfo, User, UserStatus};
@@ -1529,11 +255,12 @@ pub(crate) mod tests {
         let store = match url.split_once(':').map_or("", |(s, _)| s) {
             #[cfg(feature = "mysql")]
             "mysql" | "mariadb" => {
+                use sqlx::Connection;
                 let opts: sqlx::mysql::MySqlConnectOptions = url.parse().expect("L4F_TEST_DATABASE_URL does not parse");
-                let mut c = MySqlConnection::connect_with(&opts).await.unwrap();
+                let mut c = sqlx::MySqlConnection::connect_with(&opts).await.unwrap();
                 sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE `{name}`"))).execute(&mut c).await.unwrap();
                 let _ = c.close().await;
-                Store::from(MySqlPool::connect_with(opts.database(&name)).await.unwrap())
+                Store::from(sqlx::MySqlPool::connect_with(opts.database(&name)).await.unwrap())
             }
             #[cfg(feature = "postgres")]
             "postgres" | "postgresql" => {
@@ -1563,8 +290,9 @@ pub(crate) mod tests {
             match &self.store {
                 #[cfg(feature = "mysql")]
                 Store::My(_) => {
+                    use sqlx::Connection;
                     let opts: sqlx::mysql::MySqlConnectOptions = self.url.parse().unwrap();
-                    let mut c = MySqlConnection::connect_with(&opts).await.unwrap();
+                    let mut c = sqlx::MySqlConnection::connect_with(&opts).await.unwrap();
                     sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE `{}`", self.name))).execute(&mut c).await.unwrap();
                     let _ = c.close().await;
                 }
@@ -1593,61 +321,26 @@ pub(crate) mod tests {
         S(String),
     }
 
-    /// `?` placeholders become `$1`, `$2`… on the portable backends. Test SQL
-    /// only: a `?` inside a string literal would be rewritten too.
+    /// Test SQL is written with `?`, like the store's; Postgres numbers them.
     fn dialect(store: &Store, sql: &str) -> String {
         match store {
-            #[cfg(feature = "mysql")]
-            Store::My(_) => sql.to_string(),
+            #[cfg(feature = "postgres")]
+            Store::Pg(_) => numbered(sql),
             #[allow(unreachable_patterns)]
-            _ => numbered(sql),
+            _ => sql.to_string(),
         }
-    }
-
-    #[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
-    fn numbered(sql: &str) -> String {
-        let mut out = String::with_capacity(sql.len() + 8);
-        let mut n = 0;
-        for c in sql.chars() {
-            if c == '?' {
-                n += 1;
-                out.push_str(&format!("${n}"));
-            } else {
-                out.push(c);
-            }
-        }
-        out
     }
 
     macro_rules! run_on {
         ($store:expr, $sql:expr, $args:expr, $make:path, $fetch:ident $(, $post:ident)?) => {{
             let sql = dialect($store, $sql);
-            match $store {
-                #[cfg(feature = "mysql")]
-                Store::My(b) => {
-                    let mut q = $make(AssertSqlSafe(sql));
-                    for a in $args {
-                        q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
-                    }
-                    q.$fetch(&b.0).await.unwrap()$(.$post())?
+            each!($store, Store(b) => {
+                let mut q = $make(AssertSqlSafe(sql));
+                for a in $args {
+                    q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
                 }
-                #[cfg(feature = "postgres")]
-                Store::Pg(b) => {
-                    let mut q = $make(AssertSqlSafe(sql));
-                    for a in $args {
-                        q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
-                    }
-                    q.$fetch(&b.0).await.unwrap()$(.$post())?
-                }
-                #[cfg(feature = "sqlite")]
-                Store::Lite(b) => {
-                    let mut q = $make(AssertSqlSafe(sql));
-                    for a in $args {
-                        q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
-                    }
-                    q.$fetch(&b.0).await.unwrap()$(.$post())?
-                }
-            }
+                q.$fetch(&b.0).await.unwrap()$(.$post())?
+            })
         }};
     }
 
@@ -1678,7 +371,7 @@ pub(crate) mod tests {
             #[cfg(feature = "postgres")]
             StoreConn::Pg(c) => on!(c, numbered(sql)),
             #[cfg(feature = "sqlite")]
-            StoreConn::Lite(c) => on!(c, numbered(sql)),
+            StoreConn::Lite(c) => on!(c, sql.to_string()),
         }
     }
 
@@ -1741,6 +434,19 @@ pub(crate) mod tests {
         }
     }
 
+    /// Ten recovery code hashes, as `replace_recovery` takes them.
+    fn codes() -> Vec<[u8; 32]> {
+        (0..10).map(|_| util::random()).collect()
+    }
+
+    /// A credential of `kind` with a random id: all a removal reads.
+    async fn add_credential(s: &Store, user: AccountId, kind: &str) -> [u8; 16] {
+        let ext = util::random();
+        let sql = "INSERT INTO acct_credentials (kind, ext_id, user_id, created_at) VALUES (?, ?, ?, 1)";
+        exec(s, sql, vec![Arg::S(kind.into()), Arg::B(ext.to_vec()), Arg::B(user.0.to_vec())]).await;
+        ext
+    }
+
     async fn rows_for(s: &Store, table: &str, id: AccountId) -> i64 {
         scalar(s, &format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?"), vec![Arg::B(id.0.to_vec())]).await
     }
@@ -1751,6 +457,18 @@ pub(crate) mod tests {
         assert_eq!(clip("ééé", 2), "éé");
         assert_eq!(clip("", 0), "");
         assert_eq!(like_pattern("A_b%c!"), "%a!_b!%c!!%");
+    }
+
+    #[test]
+    fn numbered_counts_placeholders_in_order_outside_literals() {
+        assert_eq!(numbered("UPDATE t SET a = ?, b = ? WHERE c IN (?, ?)"), "UPDATE t SET a = $1, b = $2 WHERE c IN ($3, $4)");
+        assert_eq!(
+            numbered("SELECT '?', 'it''s ?', '' FROM t WHERE a LIKE ? ESCAPE '!' AND b = ?"),
+            "SELECT '?', 'it''s ?', '' FROM t WHERE a LIKE $1 ESCAPE '!' AND b = $2",
+            "a `?` in a literal is text, and numbering goes on after it"
+        );
+        let plain = "SELECT COUNT(*) FROM t WHERE s = '*'";
+        assert_eq!(numbered(plain), plain, "no placeholder, no `$`");
     }
 
     #[tokio::test]
@@ -1774,7 +492,8 @@ pub(crate) mod tests {
         assert!(s.user_by_id(AccountId::new()).await.unwrap().is_none());
 
         assert_eq!(s.password_hash_of(u.id).await.unwrap().as_deref(), Some("h1"));
-        assert!(s.set_password_hash(u.id, "h2").await.unwrap());
+        assert!(!s.set_password_hash(u.id, "h2").await.unwrap(), "a first password, and this account has one");
+        assert!(s.rehash_password(u.id, "h1", "h2").await.unwrap());
         assert!(!s.rehash_password(u.id, "h1", "h3").await.unwrap(), "a stale rehash must not overwrite a new password");
         assert_eq!(s.password_hash_of(u.id).await.unwrap().as_deref(), Some("h2"));
         assert!(s.rehash_password(u.id, "h2", "h3").await.unwrap());
@@ -1792,6 +511,9 @@ pub(crate) mod tests {
         assert!(!s.user_by_id(nopw).await.unwrap().unwrap().has_password);
         assert_eq!(s.password_hash_of(nopw).await.unwrap(), None);
         assert_eq!(s.password_hash_of(AccountId::new()).await.unwrap(), None);
+        assert!(s.set_password_hash(nopw, "p1").await.unwrap());
+        assert!(!s.set_password_hash(nopw, "p2").await.unwrap(), "two first passwords: only one is written");
+        assert_eq!(s.password_hash_of(nopw).await.unwrap().as_deref(), Some("p1"));
 
         assert!(delete(&s, u.id).await.unwrap());
         assert!(!delete(&s, u.id).await.unwrap(), "second delete finds nothing");
@@ -1893,6 +615,28 @@ pub(crate) mod tests {
         assert!(s.session_by_hash(&late.token_hash, now).await.unwrap().is_none());
     }
 
+    /// Logins with a second factor sign in through a pending session: they
+    /// count against the same cap.
+    #[tokio::test]
+    async fn sessions_completed_by_a_second_factor_are_capped_too() {
+        let Some(s) = shared().await else { return };
+        let u = make_user(&s, None).await;
+        let now = util::now();
+        let mut done = Vec::new();
+        for i in 0..MAX_SESSIONS as i64 + 3 {
+            let pending = sess(u, now - 1000 + i, now - 1000 + i, now + 100);
+            s.insert_session(&pending).await.unwrap();
+            let new: [u8; 32] = util::random();
+            assert!(s.complete_session(&pending.token_hash, &new, now, now + 100).await.unwrap());
+            done.push(new);
+        }
+        let left = s.sessions_of(u).await.unwrap();
+        assert_eq!(left.len(), MAX_SESSIONS as usize, "the oldest went");
+        assert!(left.iter().all(|x| x.mfa_ok));
+        assert!(left.iter().any(|x| x.token_hash == done[done.len() - 1]) && !left.iter().any(|x| x.token_hash == done[0]));
+        delete(&s, u).await.unwrap();
+    }
+
     #[tokio::test]
     async fn sessions_expire_touch_rotate_and_delete() {
         let Some(s) = shared().await else { return };
@@ -1920,16 +664,19 @@ pub(crate) mod tests {
         assert_eq!(s.session_by_hash(&live.token_hash, now).await.unwrap().unwrap().seen_at, now + TOUCH_SECS + 1);
         assert!(!s.touch_session(&live.token_hash, now + TOUCH_SECS + 60).await.unwrap(), "just written");
 
-        assert!(s.set_session_mfa(&live.token_hash, true, now + 5).await.unwrap());
-        let got = s.session_by_hash(&live.token_hash, now).await.unwrap().unwrap();
+        let done: [u8; 32] = util::random();
+        assert!(s.complete_session(&live.token_hash, &done, now + 5, now + 200).await.unwrap());
+        assert!(s.session_by_hash(&live.token_hash, now).await.unwrap().is_none(), "the pending token is dead");
+        let got = s.session_by_hash(&done, now).await.unwrap().unwrap();
         assert!(got.mfa_ok);
-        assert_eq!(got.auth_at, now + 5);
+        assert_eq!((got.auth_at, got.expires_at), (now + 5, now + 200));
+        assert!(!s.complete_session(&done, &util::random(), now + 6, now + 300).await.unwrap(), "only once");
 
         let rotated: [u8; 32] = util::random();
-        assert!(s.rotate_session(&live.token_hash, &rotated).await.unwrap());
-        assert!(s.session_by_hash(&live.token_hash, now).await.unwrap().is_none(), "old token dead after rotation");
+        assert!(s.rotate_session(&done, &rotated).await.unwrap());
+        assert!(s.session_by_hash(&done, now).await.unwrap().is_none(), "old token dead after rotation");
         assert!(s.session_by_hash(&rotated, now).await.unwrap().unwrap().mfa_ok, "rotation keeps the session");
-        assert!(!s.rotate_session(&live.token_hash, &util::random()).await.unwrap());
+        assert!(!s.rotate_session(&done, &util::random()).await.unwrap());
 
         assert!(!s.delete_session(&rotated, other).await.unwrap(), "someone else's hash deletes nothing");
         assert!(s.delete_session(&rotated, u).await.unwrap());
@@ -1986,6 +733,124 @@ pub(crate) mod tests {
         want.sort();
         assert_eq!(left, want, "live and recently seen sessions survive");
         f.done().await;
+    }
+
+    /// New codes asked for twice at once (a double submit): one set stays
+    /// valid, never both.
+    #[tokio::test]
+    async fn racing_recovery_replacements_leave_one_set() {
+        let Some(s) = shared().await else { return };
+        let u = make_user(&s, None).await;
+        for round in 0..3 {
+            let (a, b) = (codes(), codes());
+            let (ra, rb) = tokio::join!(s.replace_recovery(u, &a), s.replace_recovery(u, &b));
+            ra.unwrap();
+            rb.unwrap();
+            assert_eq!(s.recovery_left(u).await.unwrap(), 10, "round {round}");
+        }
+        delete(&s, u).await.unwrap();
+    }
+
+    /// A delete that lands while a write waits for the key's row: the write
+    /// finds the key gone and conflicts, rather than putting it back.
+    #[tokio::test]
+    async fn a_blob_deleted_under_a_waiting_write_stays_deleted() {
+        let Some(s) = shared().await else { return };
+        let u = make_user(&s, None).await;
+        assert_eq!(s.put_blob(u, "kv", "k", b"1", 0, 1000).await.unwrap(), PutBlob::Done(1));
+        let sql = dialect(&s, "DELETE FROM acct_blobs WHERE user_id = ? AND ns = 'kv' AND k = 'k'");
+        each!(&s, Store(b) => {
+            let mut tx = b.0.begin().await.unwrap();
+            sqlx::query(AssertSqlSafe(sql)).bind(&u.0[..]).execute(&mut *tx).await.unwrap();
+            let put = tokio::spawn({
+                let s = s.clone();
+                async move { s.put_blob(u, "kv", "k", b"2", 1, 1000).await }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tx.commit().await.unwrap();
+            assert_eq!(put.await.unwrap().unwrap(), PutBlob::Conflict);
+        });
+        assert!(s.blob(u, "kv", "k").await.unwrap().is_none(), "the delete stands");
+        delete(&s, u).await.unwrap();
+    }
+
+    /// Creates racing at the key cap queue on the account's row and count
+    /// after each other: the cap fills and holds. The sync switch is read
+    /// there too (ADMIN-9, store-data-6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capped_writes_count_under_the_accounts_lock() {
+        let Some(s) = shared().await else { return };
+        let u = make_user(&s, None).await;
+        assert_eq!(s.put_blob_limited(u, "kv", "k0", b"1", 0, 1000, Some(5), true).await.unwrap(), PutLimited::SyncOff);
+        assert!(s.set_sync_enabled(u, true).await.unwrap());
+        let puts: Vec<_> = (0..8)
+            .map(|i| {
+                let s = s.clone();
+                tokio::spawn(async move { s.put_blob_limited(u, "kv", &format!("k{i}"), b"1", 0, 1000, Some(5), true).await.unwrap() })
+            })
+            .collect();
+        let mut got = Vec::new();
+        for p in puts {
+            got.push(p.await.unwrap());
+        }
+        assert_eq!(got.iter().filter(|r| **r == PutLimited::Put(PutBlob::Done(1))).count(), 5, "{got:?}");
+        assert_eq!(got.iter().filter(|r| **r == PutLimited::Full).count(), 3, "{got:?}");
+        assert_eq!(s.blob_count(u, "kv").await.unwrap(), 5);
+        let kept = s.blobs(u, "kv").await.unwrap().remove(0).k;
+        let update = s.put_blob_limited(u, "kv", &kept, b"2", 1, 1000, Some(5), true).await.unwrap();
+        assert_eq!(update, PutLimited::Put(PutBlob::Done(2)), "a full set still updates");
+        assert!(s.set_sync_enabled(u, false).await.unwrap());
+        assert_eq!(s.put_blob_limited(u, "kv", &kept, b"3", 2, 1000, Some(5), true).await.unwrap(), PutLimited::SyncOff);
+        assert_eq!(s.put_blob_limited(u, "vault", "v", b"3", 0, 1000, None, false).await.unwrap(), PutLimited::Put(PutBlob::Done(1)));
+        delete(&s, u).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_used_counter_never_falls_back_to_zero() {
+        let Some(s) = shared().await else { return };
+        let u = make_user(&s, None).await;
+        let (zero, counting): ([u8; 16], [u8; 16]) = (util::random(), util::random());
+        for ext in [zero, counting] {
+            let sql = "INSERT INTO acct_credentials (kind, ext_id, user_id, created_at) VALUES ('passkey', ?, ?, 1)";
+            exec(&s, sql, vec![Arg::B(ext.to_vec()), Arg::B(u.0.to_vec())]).await;
+        }
+        assert!(s.used_credential("passkey", &zero, 0, 10).await.unwrap(), "an authenticator that stays at 0");
+        assert!(s.used_credential("passkey", &zero, 0, 11).await.unwrap());
+        assert!(s.used_credential("passkey", &counting, 7, 10).await.unwrap());
+        assert!(!s.used_credential("passkey", &counting, 7, 11).await.unwrap(), "the same count again");
+        assert!(!s.used_credential("passkey", &counting, 0, 12).await.unwrap(), "a clone reporting 0");
+        assert!(s.used_credential("passkey", &counting, 8, 13).await.unwrap());
+        let c = s.credential("passkey", &counting).await.unwrap().unwrap();
+        assert_eq!((c.sign_count, c.last_used_at), (8, Some(13)));
+        delete(&s, u).await.unwrap();
+    }
+
+    /// Without a password, an account keeps a passkey or a social identity.
+    /// Two removals at once queue on the account's row, so the second counts
+    /// what the first left and they cannot both go; from the second round on
+    /// the pool has a connection for each, so they really overlap. An SSH key
+    /// does not count: it never makes a session recent (store-data-8, FAC-4).
+    #[tokio::test]
+    async fn racing_removals_keep_a_way_to_step_up() {
+        let Some(s) = shared().await else { return };
+        for round in 0..3 {
+            let u = make_user(&s, None).await;
+            let (pk, sub) = (add_credential(&s, u, "passkey").await, add_credential(&s, u, "oauth:google").await);
+            let (a, b) = tokio::join!(s.delete_credential_if_not_last(u, "passkey", &pk), s.delete_credential_if_not_last(u, "oauth:google", &sub));
+            let mut got = [a.unwrap(), b.unwrap()];
+            got.sort_by_key(|r| *r != DeleteCredential::Done);
+            assert_eq!(got, [DeleteCredential::Done, DeleteCredential::LastWayIn], "round {round}");
+            assert_eq!(s.step_up_credentials(u).await.unwrap(), 1, "round {round}: one of them stays");
+            delete(&s, u).await.unwrap();
+        }
+        let u = make_user(&s, None).await;
+        let (pk, ssh) = (add_credential(&s, u, "passkey").await, add_credential(&s, u, "ssh").await);
+        assert_eq!(s.delete_credential_if_not_last(u, "passkey", &pk).await.unwrap(), DeleteCredential::LastWayIn, "SSH alone");
+        assert_eq!(s.delete_credential_if_not_last(u, "ssh", &ssh).await.unwrap(), DeleteCredential::Done);
+        assert_eq!(s.delete_credential_if_not_last(u, "ssh", &ssh).await.unwrap(), DeleteCredential::NotFound);
+        assert!(s.set_password_hash(u, "stand-in").await.unwrap());
+        assert_eq!(s.delete_credential_if_not_last(u, "passkey", &pk).await.unwrap(), DeleteCredential::Done, "a password stays");
+        delete(&s, u).await.unwrap();
     }
 
     #[tokio::test]
@@ -2047,6 +912,22 @@ pub(crate) mod tests {
         assert!(s.role_by_name(&name).await.unwrap().is_none());
         assert!(!s.delete_role(id).await.unwrap(), "already gone");
         assert!(!s.update_role(id, "x", None).await.unwrap());
+    }
+
+    /// The role and its scopes appear together or not at all: an empty one
+    /// would pass a grant's check that the granter covers it (ADMIN-3).
+    #[tokio::test]
+    async fn a_role_is_created_with_its_scopes_in_one_go() {
+        let Some(s) = shared().await else { return };
+        let name = unique("r");
+        assert!(s.create_role_with_scopes(&name, "", None, &strings(&["t:a", "* "])).await.is_err());
+        assert!(s.role_by_name(&name).await.unwrap().is_none(), "no role left without its scopes");
+        let id = s.create_role_with_scopes(&name, "d", Some("B"), &strings(&["t:b", "t:a"])).await.unwrap().expect("new name");
+        let r = s.role_by_name(&name).await.unwrap().unwrap();
+        assert_eq!((r.id, r.description.as_str(), r.badge.as_deref(), r.scopes), (id, "d", Some("B"), strings(&["t:a", "t:b"])));
+        assert_eq!(s.create_role_with_scopes(&name, "", None, &strings(&["*"])).await.unwrap(), None, "taken name");
+        assert_eq!(s.role_by_name(&name).await.unwrap().unwrap().scopes, ["t:a", "t:b"], "and the scopes it had");
+        assert!(s.delete_role(id).await.unwrap());
     }
 
     #[tokio::test]
@@ -2171,6 +1052,45 @@ pub(crate) mod tests {
         f.done().await;
     }
 
+    /// A server whose default is REPEATABLE READ, where a statement after a
+    /// lock wait would read a snapshot from before it: the store's own
+    /// transactions name READ COMMITTED (the guarded ones also a bound on the
+    /// wait), and a host's transaction at another level is refused.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_transactions_run_at_read_committed() {
+        let Some(Store::Pg(_)) = shared().await else { return };
+        let opts: sqlx::postgres::PgConnectOptions = std::env::var("L4F_TEST_DATABASE_URL").unwrap().parse().unwrap();
+        let pool = sqlx::PgPool::connect_with(opts.options([("default_transaction_isolation", "repeatable read")])).await.unwrap();
+        let s = Store::from(pool.clone());
+        let u = make_user(&s, None).await;
+        let (a, b) = (codes(), codes());
+        let (ra, rb) = tokio::join!(s.replace_recovery(u, &a), s.replace_recovery(u, &b));
+        ra.unwrap();
+        rb.unwrap();
+        assert_eq!(s.recovery_left(u).await.unwrap(), 10, "the second DELETE saw the first one's codes");
+        assert!(s.set_status(u, UserStatus::Disabled).await.unwrap(), "a guarded write");
+
+        let mut host = pool.begin().await.unwrap();
+        let r = Store::delete_user(StoreConn::Pg(&mut host), u).await;
+        assert!(matches!(r, Err(WriteError::Db(sqlx::Error::InvalidArgument(_)))), "got {r:?}");
+        drop(host);
+
+        let mut tx = s.begin().await.unwrap();
+        let (level, wait): (String, String) = match &mut tx {
+            StoreTx::Pg(t) => sqlx::query_as("SELECT current_setting('transaction_isolation'), current_setting('lock_timeout')")
+                .fetch_one(&mut **t)
+                .await
+                .unwrap(),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        };
+        assert_eq!((level.as_str(), wait.as_str()), ("read committed", "30s"));
+        assert!(Store::delete_user(tx.conn(), u).await.unwrap());
+        tx.commit().await.unwrap();
+        s.close().await;
+    }
+
     #[tokio::test]
     async fn audit_lists_newest_first_and_ages_out_in_batches() {
         let Some(f) = fresh().await else { return };
@@ -2281,8 +1201,15 @@ pub(crate) mod tests {
         let admin = make_user(&s, None).await;
         s.audit(Some(u), Some(admin), "role_revoke", "", "198.51.100.77").await.unwrap();
         s.audit(Some(u), None, "register", "", "203.0.113.0").await.unwrap();
+        let avatar = b"\x89PNG the avatar";
+        assert_eq!(s.put_blob(u, "avatar", "a", avatar, 0, 1000).await.unwrap(), PutBlob::Done(1));
+        let profile = Profile { public_id: Some(util::random()), bio: "Hi, it's me".into(), show_badges: false };
+        s.save_profile(u, &profile, now).await.unwrap();
 
         let v = s.export_user(u).await.unwrap().expect("account exists");
+        assert_eq!(v["profile"], serde_json::json!({ "on": true, "bio": "Hi, it's me", "show_badges": false }));
+        let stored = v["storage"].as_array().unwrap();
+        assert!(stored.iter().any(|b| b["ns"] == "avatar" && b["value"] == util::b64u(avatar).as_str()), "{stored:?}");
         assert_eq!(v["user"]["username"], nu.username.as_str());
         assert_eq!(v["user"]["id"], u.hex().as_str());
         assert_eq!(v["user"]["has_password"], true);
@@ -2314,5 +1241,25 @@ pub(crate) mod tests {
         delete(&s, u).await.unwrap();
         delete(&s, admin).await.unwrap();
         s.delete_role(role).await.unwrap();
+    }
+
+    /// Processes booting at once on a new file: each of them gets its store.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_connects_racing_on_a_new_file_all_succeed() {
+        let path = sqlite_path(&unique("l4f_race_"));
+        let url = format!("sqlite://{}", path.display());
+        let racers: Vec<_> = (0..8)
+            .map(|_| {
+                let url = url.clone();
+                tokio::spawn(async move { Store::connect(&url).await })
+            })
+            .collect();
+        for r in racers {
+            r.await.unwrap().expect("a racing connect gets its store").close().await;
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
