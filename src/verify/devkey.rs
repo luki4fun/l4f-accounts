@@ -6,6 +6,8 @@
 
 use ring::signature::{ED25519, UnparsedPublicKey};
 
+use super::ed25519_small_order;
+
 const PREFIX: &[u8] = b"l4f-devkey-v1\0";
 
 /// `"l4f-devkey-v1\0" || origin || "\0" || device_id || "\0" || challenge`.
@@ -23,45 +25,6 @@ pub fn message(origin: &str, device_id: &[u8], challenge: &[u8]) -> Vec<u8> {
     m
 }
 
-const fn low(b0: u8) -> [u8; 32] {
-    let mut b = [0; 32];
-    b[0] = b0;
-    b
-}
-
-const fn high(b0: u8) -> [u8; 32] {
-    let mut b = [0xff; 32];
-    b[0] = b0;
-    b[31] = 0x7f;
-    b
-}
-
-/// Encodings of the points of order 1, 2, 4 and 8, sign bit cleared, plus the
-/// non-canonical `p` and `p + 1`: libsodium's `has_small_order` list.
-const SMALL_ORDER: [[u8; 32]; 7] = [
-    low(0), // y = 0, order 4
-    low(1), // the identity
-    // order 8, as is the next
-    [
-        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0, //
-        0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
-    ],
-    [
-        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f, //
-        0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
-    ],
-    high(0xec), // p - 1, order 2
-    high(0xed), // p, a non-canonical 0
-    high(0xee), // p + 1, a non-canonical identity
-];
-
-/// A key of small order verifies `R || 0` for a small-order `R` whatever the
-/// message (the identity verifies one fixed signature for every message), so
-/// it binds nothing. The sign bit is ignored: it only picks `x` or `-x`.
-fn small_order(public_key: &[u8; 32]) -> bool {
-    SMALL_ORDER.iter().any(|b| b[..31] == public_key[..31] && b[31] == public_key[31] & 0x7f)
-}
-
 /// Ed25519 over [`message`]. `public_key` is the stored raw 32-byte key and
 /// `challenge` the 32-byte `challenge::challenge_bytes`; other lengths, an origin
 /// containing NUL, a signature that is not 64 bytes, or a small-order key (which
@@ -72,7 +35,7 @@ pub fn verify(public_key: &[u8], origin: &str, device_id: &[u8], challenge: &[u8
     let Ok(pk) = <&[u8; 32]>::try_from(public_key) else {
         return false;
     };
-    !small_order(pk)
+    !ed25519_small_order(pk)
         && challenge.len() == 32
         && signature.len() == 64
         && !origin.contains('\0')
@@ -84,6 +47,7 @@ pub fn verify(public_key: &[u8], origin: &str, device_id: &[u8], challenge: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::ED25519_SMALL_ORDER;
     use ring::{
         rand::SystemRandom,
         signature::{Ed25519KeyPair, KeyPair},
@@ -195,7 +159,8 @@ mod tests {
     /// `S = 0`, the check `[S]B == R + [k]A` holds for every `k`.
     #[test]
     fn the_identity_key_does_not_verify_a_universal_signature() {
-        let identity = low(1);
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
         let sig = [identity, [0; 32]].concat();
         for (origin, dev) in [(ORIGIN, DEV), ("https://evil", &[9u8; 32][..]), (ORIGIN, b"")] {
             for c in [challenge(), [0; 32], [0xff; 32]] {
@@ -213,7 +178,7 @@ mod tests {
     /// seven distinct forgeable entries is also the whole list.
     #[test]
     fn small_order_keys_are_refused() {
-        let candidates: Vec<[u8; 32]> = SMALL_ORDER
+        let candidates: Vec<[u8; 32]> = ED25519_SMALL_ORDER
             .iter()
             .flat_map(|b| {
                 let mut neg = *b;
@@ -223,7 +188,7 @@ mod tests {
             .collect();
         assert_eq!(candidates.iter().collect::<std::collections::HashSet<_>>().len(), 14, "seven distinct entries");
         for pk in &candidates {
-            assert!(small_order(pk), "{}", hex::encode(pk));
+            assert!(ed25519_small_order(pk), "{}", hex::encode(pk));
             let (c, sig) = (0..=255u8)
                 .find_map(|i| {
                     let mut c = challenge();
@@ -239,6 +204,6 @@ mod tests {
             assert!(!verify(pk, ORIGIN, DEV, &c, &sig), "forgery for {}", hex::encode(pk));
         }
         let kp = key();
-        assert!(!small_order(kp.public_key().as_ref().try_into().unwrap()), "a real key is not small-order");
+        assert!(!ed25519_small_order(kp.public_key().as_ref().try_into().unwrap()), "a real key is not small-order");
     }
 }

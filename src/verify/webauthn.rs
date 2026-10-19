@@ -10,16 +10,17 @@ use ring::signature::{self, UnparsedPublicKey, VerificationAlgorithm};
 use serde::{Deserialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
+use super::{positive_int, rsa_bounds};
 use crate::util::{b64u, b64u_dec, ct_eq};
 
 pub const ES256: i64 = -7;
 pub const RS256: i64 = -257;
 
-const UP: u8 = 0x01;
-const UV: u8 = 0x04;
-const BE: u8 = 0x08;
+pub(crate) const UP: u8 = 0x01;
+pub(crate) const UV: u8 = 0x04;
+pub(crate) const BE: u8 = 0x08;
 const BS: u8 = 0x10;
-const AT: u8 = 0x40;
+pub(crate) const AT: u8 = 0x40;
 const ED: u8 = 0x80;
 
 /// A real credential is a few KiB at most (an 8192-bit RSA key, a 1023-byte id).
@@ -33,7 +34,7 @@ const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 pub struct Rp<'a> {
     /// The RP ID, e.g. "l4f.cc". Never an IP address: browsers refuse those.
     pub id: &'a str,
-    /// Exact origins the ceremony may run on, e.g. "https://l4f.cc".
+    /// Exact origins the ceremony may run on, e.g. `https://l4f.cc`.
     pub origins: &'a [String],
 }
 
@@ -395,22 +396,8 @@ fn rsa_key_ok(der: &[u8]) -> Option<bool> {
     let (seq, rest) = tlv(der, 0x30)?;
     let (n, seq) = tlv(seq, 0x02)?;
     let (e, seq) = tlv(seq, 0x02)?;
-    let (n, e) = (positive(n)?, positive(e)?);
-    let n_bits = n.len() * 8 - n[0].leading_zeros() as usize;
-    let e = (e.len() <= 5).then(|| e.iter().fold(0u64, |v, &b| (v << 8) | u64::from(b)))?;
-    let n_odd = n.last().is_some_and(|b| b & 1 == 1);
-    Some(rest.is_empty() && seq.is_empty() && (2048..=8192).contains(&n_bits) && n_odd && (3..1 << 33).contains(&e) && e & 1 == 1)
-}
-
-/// The magnitude of a positive, minimally encoded DER INTEGER.
-fn positive(int: &[u8]) -> Option<&[u8]> {
-    match int {
-        [0, rest @ ..] if rest.first().is_some_and(|b| b & 0x80 != 0) => Some(rest),
-        // zero, a superfluous leading zero, a negative number, or nothing
-        [] | [0, ..] => None,
-        [b, ..] if b & 0x80 != 0 => None,
-        _ => Some(int),
-    }
+    let (n, e) = (positive_int(n)?, positive_int(e)?);
+    Some(rest.is_empty() && seq.is_empty() && rsa_bounds(n, e).is_ok())
 }
 
 /// One DER element with the expected tag: (contents, what follows). Only
@@ -447,165 +434,13 @@ fn p256_point_on_curve(point: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{CHALLENGE, Ceremony, ORIGIN, RP_ID, RSA_SPKI, Signer};
     use ring::rand::SystemRandom;
-    use ring::signature::{
-        ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, KeyPair, RSA_PKCS1_SHA256, RsaKeyPair,
-    };
-    use serde_json::{Value, json};
-
-    const RP_ID: &str = "l4f.cc";
-    const ORIGIN: &str = "https://l4f.cc";
-    const CHALLENGE: [u8; 32] = [7; 32];
-    const P256_SPKI_PREFIX: [u8; 26] = [
-        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01,
-        0x07, 0x03, 0x42, 0x00,
-    ];
-    /// Test-only key from `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER`,
-    /// then `openssl pkcs8 -topk8 -nocrypt`: OpenSSL 3.0 writes PKCS#1 DER, ring only reads PKCS#8.
-    const RSA_PKCS8: &[u8] = include_bytes!("../../tests/fixtures/webauthn/rsa2048.pk8");
-    /// Its public half, from `openssl pkey -pubout -outform DER`: the encoding a real stack emits.
-    const RSA_SPKI: &[u8] = include_bytes!("../../tests/fixtures/webauthn/rsa2048.spki");
-    /// The first bytes of an ES256 COSE key; only ever skipped, never parsed.
-    const COSE_STUB: &[u8] = &[0xa5, 0x01, 0x02, 0x03, 0x26];
+    use ring::signature::{ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+    use serde_json::Value;
 
     fn origins() -> Vec<String> {
         vec![ORIGIN.to_string(), "http://localhost:8099".to_string()]
-    }
-
-    enum Signer {
-        Ec(EcdsaKeyPair),
-        Rsa(RsaKeyPair),
-    }
-
-    impl Signer {
-        fn es256() -> Signer {
-            let rng = SystemRandom::new();
-            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-            Signer::Ec(EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap())
-        }
-
-        fn rs256() -> Signer {
-            Signer::Rsa(RsaKeyPair::from_pkcs8(RSA_PKCS8).unwrap())
-        }
-
-        fn alg(&self) -> i64 {
-            match self {
-                Signer::Ec(_) => ES256,
-                Signer::Rsa(_) => RS256,
-            }
-        }
-
-        fn spki(&self) -> Vec<u8> {
-            match self {
-                Signer::Ec(k) => [&P256_SPKI_PREFIX[..], k.public_key().as_ref()].concat(),
-                Signer::Rsa(_) => RSA_SPKI.to_vec(),
-            }
-        }
-
-        fn sign(&self, msg: &[u8]) -> Vec<u8> {
-            let rng = SystemRandom::new();
-            match self {
-                Signer::Ec(k) => k.sign(&rng, msg).unwrap().as_ref().to_vec(),
-                Signer::Rsa(k) => {
-                    let mut sig = vec![0; k.public().modulus_len()];
-                    k.sign(&RSA_PKCS1_SHA256, &rng, msg, &mut sig).unwrap();
-                    sig
-                }
-            }
-        }
-    }
-
-    /// Everything an authenticator and browser would put into one ceremony;
-    /// tests change one field and expect exactly that check to fire.
-    struct Ceremony {
-        typ: &'static str,
-        challenge: Vec<u8>,
-        origin: String,
-        /// Raw JSON members appended to clientDataJSON, e.g. `,"crossOrigin":true`.
-        client_extra: String,
-        rp_id: &'static str,
-        flags: u8,
-        sign_count: u32,
-        cred_id: Vec<u8>,
-        /// Raw bytes after the attested data (or the counter): extension CBOR.
-        extensions: Vec<u8>,
-    }
-
-    impl Ceremony {
-        fn create() -> Ceremony {
-            Ceremony {
-                typ: "webauthn.create",
-                challenge: CHALLENGE.to_vec(),
-                origin: ORIGIN.to_string(),
-                client_extra: String::new(),
-                rp_id: RP_ID,
-                flags: UP | UV | AT,
-                sign_count: 0,
-                cred_id: (0..32).collect(),
-                extensions: Vec::new(),
-            }
-        }
-
-        fn get() -> Ceremony {
-            Ceremony { typ: "webauthn.get", flags: UP | UV, sign_count: 5, ..Ceremony::create() }
-        }
-
-        fn client_data(&self) -> Vec<u8> {
-            format!(r#"{{"type":"{}","challenge":"{}","origin":"{}"{}}}"#, self.typ, b64u(&self.challenge), self.origin, self.client_extra)
-                .into_bytes()
-        }
-
-        fn auth_data(&self) -> Vec<u8> {
-            let mut ad = Sha256::digest(self.rp_id.as_bytes()).to_vec();
-            ad.push(self.flags);
-            ad.extend(self.sign_count.to_be_bytes());
-            if self.flags & AT != 0 {
-                ad.extend([0xaa; 16]);
-                ad.extend((self.cred_id.len() as u16).to_be_bytes());
-                ad.extend(&self.cred_id);
-                ad.extend(COSE_STUB);
-            }
-            ad.extend(&self.extensions);
-            ad
-        }
-
-        fn create_json(&self, signer: &Signer) -> String {
-            json!({
-                "id": b64u(&self.cred_id),
-                "rawId": b64u(&self.cred_id),
-                "type": "public-key",
-                "response": {
-                    "clientDataJSON": b64u(&self.client_data()),
-                    "authenticatorData": b64u(&self.auth_data()),
-                    "publicKey": b64u(&signer.spki()),
-                    "publicKeyAlgorithm": signer.alg(),
-                    "transports": ["hybrid", "internal"],
-                    "attestationObject": b64u(b"\xa3cfmtdnone"),
-                },
-                "authenticatorAttachment": "platform",
-                "clientExtensionResults": {},
-            })
-            .to_string()
-        }
-
-        fn get_json(&self, signer: &Signer, user_handle: Option<&[u8]>) -> String {
-            let (cd, ad) = (self.client_data(), self.auth_data());
-            let sig = signer.sign(&[&ad[..], &Sha256::digest(&cd)[..]].concat());
-            json!({
-                "id": b64u(&self.cred_id),
-                "rawId": b64u(&self.cred_id),
-                "type": "public-key",
-                "response": {
-                    "clientDataJSON": b64u(&cd),
-                    "authenticatorData": b64u(&ad),
-                    "signature": b64u(&sig),
-                    "userHandle": user_handle.map(b64u),
-                },
-                "authenticatorAttachment": "platform",
-                "clientExtensionResults": {},
-            })
-            .to_string()
-        }
     }
 
     fn register(json: &str, require_uv: bool) -> Result<NewCredential, WebauthnError> {
@@ -711,7 +546,7 @@ mod tests {
     fn registration_rejects_a_wrong_rp_id() {
         let s = Signer::es256();
         for rp_id in ["evil.example", "L4F.cc", "www.l4f.cc", "localhost"] {
-            let c = Ceremony { rp_id, ..Ceremony::create() };
+            let c = Ceremony { rp_id: rp_id.into(), ..Ceremony::create() };
             assert_eq!(register(&c.create_json(&s), false), Err(E::RpId), "rpIdHash of {rp_id:?}");
         }
     }
@@ -1026,7 +861,7 @@ mod tests {
         let s = Signer::es256();
         let cases = [
             (Ceremony { origin: "https://evil.example".into(), ..Ceremony::get() }, E::Origin),
-            (Ceremony { rp_id: "evil.example", ..Ceremony::get() }, E::RpId),
+            (Ceremony { rp_id: "evil.example".into(), ..Ceremony::get() }, E::RpId),
             (Ceremony { challenge: vec![8; 32], ..Ceremony::get() }, E::Challenge),
             (Ceremony { typ: "webauthn.create", ..Ceremony::get() }, E::Type),
             (Ceremony { typ: "payment.get", ..Ceremony::get() }, E::Type),

@@ -11,6 +11,7 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use ring::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey};
 use sha2::{Digest, Sha256, Sha512};
 
+use super::{RsaBounds, ed25519_small_order, positive_int, rsa_bounds};
 use crate::scope::invisible;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,9 +20,9 @@ pub struct SshKey {
     /// Wire-format public key: what `fingerprint` hashes and `verify` returns.
     pub blob: Vec<u8>,
     /// Becomes the key's label: whitespace runs collapsed, cut to 64 chars, and
-    /// empty if it held a bidi control, U+200B, U+2060 or U+FEFF (`invisible`).
-    /// Other invisible format characters such as ZWJ stay, so two labels can
-    /// still look alike; the fingerprint is what tells keys apart.
+    /// empty if it held a bidi control, U+200B, U+2060, U+FEFF or another
+    /// `invisible` char. Other invisible format characters such as ZWJ stay, so
+    /// two labels can still look alike; the fingerprint is what tells keys apart.
     pub comment: String,
 }
 
@@ -47,15 +48,13 @@ pub enum SshError {
 }
 
 const MAGIC: &[u8] = b"SSHSIG";
-const BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
-const END: &str = "-----END SSH SIGNATURE-----";
+pub(crate) const BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+pub(crate) const END: &str = "-----END SSH SIGNATURE-----";
 /// A pasted key or signature is a few KiB at most (RSA-8192 is about 3 KiB of
 /// base64); anything longer is not worth decoding.
 const MAX_INPUT: usize = 16 * 1024;
 const ACCEPTED: [&str; 3] = ["ssh-ed25519", "ssh-rsa", "ecdsa-sha2-nistp256"];
 const MAX_COMMENT: usize = 64;
-/// ring rejects larger RSA exponents at every verify.
-const MAX_RSA_E: u64 = (1 << 33) - 1;
 
 /// Parse an authorized_keys-style line: `type base64 [comment]`.
 ///
@@ -238,7 +237,7 @@ fn parse_blob(blob: &[u8]) -> Result<Key<'_>, SshError> {
         b"ssh-ed25519" => {
             let k = r.string()?;
             let point = <&[u8; 32]>::try_from(k).map_err(|_| SshError::Malformed)?;
-            if small_order(point) {
+            if ed25519_small_order(point) {
                 return Err(SshError::UnsupportedKey);
             }
             Key::Ed25519(k)
@@ -246,22 +245,13 @@ fn parse_blob(blob: &[u8]) -> Result<Key<'_>, SshError> {
         b"ssh-rsa" => {
             let e = mpint(r.string()?)?;
             let n = mpint(r.string()?)?;
-            if !(2048..=8192).contains(&bits(n)) {
-                return Err(SshError::KeySize);
-            }
             // ring refuses these at every verify; refusing them here tells the
-            // user at enrolment instead of failing as a bad signature. The length
-            // check also keeps the u64 fold below from shifting bytes out.
-            if e.len() > 5 {
-                return Err(SshError::UnsupportedKey);
-            }
-            let ev = e.iter().fold(0u64, |a, b| a << 8 | u64::from(*b));
-            if ev > MAX_RSA_E {
-                return Err(SshError::UnsupportedKey);
-            }
-            if ev < 3 || ev & 1 == 0 || n.last().is_some_and(|b| b & 1 == 0) {
-                return Err(SshError::Malformed);
-            }
+            // user at enrolment instead of failing as a bad signature.
+            rsa_bounds(n, e).map_err(|b| match b {
+                RsaBounds::Size => SshError::KeySize,
+                RsaBounds::Exponent => SshError::UnsupportedKey,
+                RsaBounds::NotRsa => SshError::Malformed,
+            })?;
             Key::Rsa { n, e }
         }
         b"ecdsa-sha2-nistp256" => {
@@ -280,41 +270,6 @@ fn parse_blob(blob: &[u8]) -> Result<Key<'_>, SshError> {
     Ok(key)
 }
 
-/// The Ed25519 points of order 1, 2, 4 and 8, plus p and p+1 (0 and 1
-/// unreduced): libsodium's `ge25519_has_small_order` list. ring accepts them.
-/// Against the identity key (1 or p+1), R = identity, S = 0 verifies for any
-/// message; against the others some small-order R with S = 0 does for most
-/// messages, so such a key would let anyone in. Proof of possession at
-/// enrolment is just as forgeable.
-const ED25519_SMALL_ORDER: [[u8; 32]; 7] = [
-    le(0x00, 0x00, 0x00),
-    le(0x01, 0x00, 0x00),
-    [
-        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0, 0xd5, 0xdf,
-        0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
-    ],
-    [
-        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20,
-        0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
-    ],
-    le(0xec, 0xff, 0x7f),
-    le(0xed, 0xff, 0x7f),
-    le(0xee, 0xff, 0x7f),
-];
-
-/// 32 little-endian bytes: `low`, then 30 times `fill`, then `high`.
-const fn le(low: u8, fill: u8, high: u8) -> [u8; 32] {
-    let mut b = [fill; 32];
-    b[0] = low;
-    b[31] = high;
-    b
-}
-
-/// The top bit is the sign of x, which does not change the order.
-fn small_order(k: &[u8; 32]) -> bool {
-    ED25519_SMALL_ORDER.iter().any(|bad| k[..31] == bad[..31] && k[31] & 0x7f == bad[31])
-}
-
 fn dearmor(armored: &str) -> Result<Vec<u8>, SshError> {
     if armored.len() > MAX_INPUT {
         return Err(SshError::Malformed);
@@ -328,12 +283,7 @@ fn dearmor(armored: &str) -> Result<Vec<u8>, SshError> {
 /// A positive mpint in its one canonical encoding, returned without the sign
 /// byte. Canonical only, so one key has exactly one blob and one fingerprint.
 fn mpint(b: &[u8]) -> Result<&[u8], SshError> {
-    match b {
-        [0, rest @ ..] if rest.first().is_some_and(|x| x & 0x80 != 0) => Ok(rest),
-        [x, ..] if *x != 0 && *x & 0x80 == 0 => Ok(b),
-        // zero, negative, or padded with a needless zero byte
-        _ => Err(SshError::Malformed),
-    }
+    positive_int(b).ok_or(SshError::Malformed)
 }
 
 /// An ECDSA r or s mpint, left-padded into a 32-byte slot.
@@ -347,11 +297,7 @@ fn scalar32(m: &[u8], out: &mut [u8]) -> Result<(), SshError> {
     Ok(())
 }
 
-fn bits(n: &[u8]) -> usize {
-    n.first().map_or(0, |b| n.len() * 8 - b.leading_zeros() as usize)
-}
-
-fn put_string(out: &mut Vec<u8>, s: &[u8]) {
+pub(crate) fn put_string(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(&(s.len() as u32).to_be_bytes());
     out.extend_from_slice(s);
 }
@@ -384,6 +330,7 @@ impl<'a> Rd<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::armor;
 
     const NS: &str = "login@l4f.cc";
     const MSG: &[u8] = include_bytes!("../../tests/fixtures/sshsig/msg");
@@ -445,12 +392,6 @@ mod tests {
             put_string(&mut out, f);
         }
         out
-    }
-
-    fn armor(raw: &[u8]) -> String {
-        let b = STANDARD.encode(raw);
-        let lines: Vec<&str> = b.as_bytes().chunks(70).map(|c| std::str::from_utf8(c).unwrap()).collect();
-        format!("{BEGIN}\n{}\n{END}\n", lines.join("\n"))
     }
 
     fn join(p: &Parts) -> String {
@@ -727,7 +668,8 @@ mod tests {
             }
         }
         // The forgery the list exists for: identity key, R = identity, S = 0.
-        let identity = le(1, 0, 0);
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
         let mut p = split(ED_SIG);
         p.pk = Vec::new();
         put_string(&mut p.pk, b"ssh-ed25519");
@@ -973,9 +915,6 @@ mod tests {
         for bad in bads {
             assert_eq!(mpint(bad), Err(SshError::Malformed), "{bad:02x?}");
         }
-        assert_eq!(bits(&[0x01, 0, 0]), 17);
-        assert_eq!(bits(&[0x80; 256]), 2048);
-        assert_eq!(bits(&[]), 0);
     }
 
     #[test]
