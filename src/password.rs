@@ -174,7 +174,7 @@ pub(crate) fn bcrypt_accepted(s: &str) -> bool {
 
 /// The Argon2 hashes `verify` runs the KDF on rather than refusing outright,
 /// for the bootstrap's check of L4F_ADMIN_HASH. Costs one verify.
-#[cfg(feature = "mysql")]
+#[cfg(feature = "_db")]
 pub(crate) fn argon2_accepted(s: &str) -> bool {
     s.starts_with("$argon2") && verify_argon2("", s).is_some()
 }
@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(verify("l4f-accounts timing dummy", DUMMY_HASH), Verified { ok: true, needs_rehash: false });
     }
 
-    #[cfg(feature = "mysql")]
+    #[cfg(feature = "_db")]
     #[test]
     fn argon2_accepted_is_what_verify_would_hash_against() {
         assert!(argon2_accepted(DUMMY_HASH));

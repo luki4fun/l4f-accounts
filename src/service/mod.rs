@@ -43,7 +43,7 @@ use crate::keys::Keys;
 use crate::limit::RateLimiter;
 use crate::model::{AccountId, NewUser, User};
 use crate::scope::{self, ScopeDef};
-use crate::store::{CreateUserError, Store, WriteError};
+use crate::store::{CreateUserError, Store, StoreConn, WriteError};
 use crate::{migrate, password, pow, util};
 
 /// What the embedding app provides. Static dispatch with native async fns, so
@@ -54,13 +54,9 @@ pub trait Host: Send + Sync + 'static {
     /// App-owned rows tied to an account (e.g. l4f's link ownership), merged into the GDPR export.
     fn export(&self, user: AccountId) -> impl Future<Output = Vec<(String, serde_json::Value)>> + Send;
     /// Runs inside the account-deletion transaction: an error here, or a refusal
-    /// after it, rolls back the app's part too.
-    fn delete_user(
-        &self,
-        tx: &mut sqlx::MySqlConnection,
-        user: AccountId,
-        delete_owned: bool,
-    ) -> impl Future<Output = sqlx::Result<()>> + Send;
+    /// after it, rolls back the app's part too. `tx` is a connection of
+    /// whichever backend the store runs on.
+    fn delete_user(&self, tx: StoreConn<'_>, user: AccountId, delete_owned: bool) -> impl Future<Output = sqlx::Result<()>> + Send;
     /// The host's own public links for a profile, as (label, url): l4f's
     /// short links marked public, say. None by default.
     fn profile_links(&self, user: AccountId) -> impl Future<Output = Vec<(String, String)>> + Send {
@@ -493,9 +489,9 @@ impl<H: Host> Accounts<H> {
             self.manageable(actor, user).await?;
         }
         let mut tx = self.store.begin().await?;
-        self.host.delete_user(&mut tx, user, delete_owned).await?;
+        self.host.delete_user(tx.conn(), user, delete_owned).await?;
         // A refusal or a missing row drops `tx`, which rolls the app's part back.
-        if !Store::delete_user(&mut tx, user).await? {
+        if !Store::delete_user(tx.conn(), user).await? {
             return Err(Error::NotFound);
         }
         tx.commit().await?;
@@ -553,9 +549,9 @@ impl<H: Host> Accounts<H> {
     /// The hash is stored as given (YOURLS's `!` mangling undone) and replaced
     /// by an Argon2id hash at the first login.
     pub async fn bootstrap_admin(&self, username: &str, legacy_hash: &str) -> Result<Option<AccountId>, BootstrapError> {
-        let conn = migrate::lock(&self.store.0).await?;
+        let held = migrate::lock(&self.store).await?;
         let r = self.bootstrap_locked(username, legacy_hash).await;
-        migrate::unlock(conn).await;
+        migrate::unlock(held).await;
         r
     }
 

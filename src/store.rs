@@ -1,17 +1,41 @@
 //! Every SQL statement on the `acct_*` tables. Methods take and return crate
-//! types only, so a second backend later is the same set of methods.
+//! types only, so each backend is the same set of methods: `MySqlStore` here,
+//! and `store/portable.rs` once for Postgres (`pg`) and once for SQLite
+//! (`lite`). `Store` (`store/backend.rs`) is whichever of them runs.
 //!
 //! Writes that could take `*` away from the last account holding it refuse
 //! here, inside their own transaction, rather than in the service: a check
 //! before the write would let two admins revoking each other both pass.
 
+#[cfg(feature = "mysql")]
 use sqlx::{AssertSqlSafe, Connection, MySql, MySqlConnection, MySqlPool, Row, Transaction, mysql::MySqlRow};
 
-use crate::model::{AccountId, AuditEntry, Credential, NewUser, Role, SessionInfo, User, UserStatus};
+use crate::model::AccountId;
+#[cfg(feature = "mysql")]
+use crate::model::{AuditEntry, Credential, NewUser, Role, SessionInfo, User, UserStatus};
+#[cfg(feature = "mysql")]
 use crate::util;
 
+mod backend;
+pub use backend::{Store, StoreConn, StoreTx};
+
+#[cfg(feature = "postgres")]
+pub mod pg {
+    pub(super) type Db = sqlx::Postgres;
+    const PG: bool = true;
+    include!("store/portable.rs");
+}
+
+#[cfg(feature = "sqlite")]
+pub mod lite {
+    pub(super) type Db = sqlx::Sqlite;
+    const PG: bool = false;
+    include!("store/portable.rs");
+}
+
+#[cfg(feature = "mysql")]
 #[derive(Clone)]
-pub struct Store(pub MySqlPool);
+pub struct MySqlStore(pub MySqlPool);
 
 #[derive(Debug)]
 pub enum CreateUserError {
@@ -103,6 +127,7 @@ const EXPORT_AUDIT_ROWS: u32 = 10_000;
 /// gets one row (NULL scope) from the LEFT JOIN.
 const ROLE_COLS: &str = "r.id, r.name, r.description, r.badge, r.builtin, s.scope";
 
+#[cfg(feature = "mysql")]
 /// Active accounts holding `*` through any role. STRAIGHT_JOIN and FORCE INDEX
 /// pin the plan to start from the `*` rows through the `scope` key: as a
 /// locking read, a plan that began with acct_users would lock every account,
@@ -145,6 +170,7 @@ fn like_pattern(q: &str) -> String {
     p
 }
 
+#[cfg(feature = "mysql")]
 fn user(r: &MySqlRow) -> sqlx::Result<User> {
     Ok(User {
         id: id(r.try_get(0)?)?,
@@ -161,6 +187,7 @@ fn user(r: &MySqlRow) -> sqlx::Result<User> {
     })
 }
 
+#[cfg(feature = "mysql")]
 fn credential(r: &MySqlRow) -> sqlx::Result<Credential> {
     Ok(Credential {
         kind: r.try_get(0)?,
@@ -177,6 +204,7 @@ fn credential(r: &MySqlRow) -> sqlx::Result<Credential> {
     })
 }
 
+#[cfg(feature = "mysql")]
 fn session(r: &MySqlRow) -> sqlx::Result<SessionInfo> {
     let hash: Vec<u8> = r.try_get(0)?;
     Ok(SessionInfo {
@@ -193,6 +221,7 @@ fn session(r: &MySqlRow) -> sqlx::Result<SessionInfo> {
     })
 }
 
+#[cfg(feature = "mysql")]
 fn roles_from(rows: Vec<MySqlRow>) -> sqlx::Result<Vec<Role>> {
     let mut out: Vec<Role> = Vec::new();
     for r in rows {
@@ -214,6 +243,7 @@ fn roles_from(rows: Vec<MySqlRow>) -> sqlx::Result<Vec<Role>> {
     Ok(out)
 }
 
+#[cfg(feature = "mysql")]
 fn audit_entry(r: &MySqlRow) -> sqlx::Result<AuditEntry> {
     Ok(AuditEntry {
         id: r.try_get(0)?,
@@ -226,6 +256,7 @@ fn audit_entry(r: &MySqlRow) -> sqlx::Result<AuditEntry> {
     })
 }
 
+#[cfg(feature = "mysql")]
 /// How every write in `WriteError::LastAdmin`'s reach starts. Under READ
 /// COMMITTED the locking count holds record locks only on what it counts: the
 /// `*` scope rows, those roles' grants and the holders' user rows. Under
@@ -235,6 +266,7 @@ fn audit_entry(r: &MySqlRow) -> sqlx::Result<AuditEntry> {
 /// keeps MariaDB's snapshot isolation (an RR check) out of the way.
 const BEGIN_GUARDED: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED; START TRANSACTION";
 
+#[cfg(feature = "mysql")]
 /// The locking count every guarded write runs first: two of them queue on the
 /// first `*` row of the `scope` key, so the second one counts after the first
 /// has committed.
@@ -242,6 +274,7 @@ async fn star_holders_locked(c: &mut MySqlConnection) -> sqlx::Result<i64> {
     sqlx::query_scalar(AssertSqlSafe(format!("{STAR_HOLDERS} FOR UPDATE"))).fetch_one(c).await
 }
 
+#[cfg(feature = "mysql")]
 /// Runs after the change, in its transaction; an error drops (rolls back) it.
 /// `before == 0` is a database nobody administers yet (before bootstrap), where
 /// there is nothing to protect.
@@ -252,6 +285,7 @@ async fn keep_an_admin(c: &mut MySqlConnection, before: i64) -> Result<(), Write
     Ok(())
 }
 
+#[cfg(feature = "mysql")]
 /// Refuses anything `scope::valid_grant` does not accept. Beyond keeping junk
 /// out: the column is PAD SPACE, so a stored `* ` would count as `*` in the
 /// last-admin guard while granting nothing.
@@ -273,7 +307,8 @@ async fn insert_scopes(c: &mut MySqlConnection, role: AccountId, scopes: &[Strin
     q.execute(c).await.map(|_| ())
 }
 
-impl Store {
+#[cfg(feature = "mysql")]
+impl MySqlStore {
     /// A transaction for composing with `delete_user`, isolated the way the
     /// last-admin guard needs (see `BEGIN_GUARDED`), and holding the guard's
     /// locks from the start. The caller's own writes come before
@@ -1328,45 +1363,199 @@ impl Store {
 pub(crate) mod tests {
     use super::*;
     use crate::migrate;
-    use sqlx::mysql::MySqlConnectOptions;
+    use crate::model::{NewUser, SessionInfo, User, UserStatus};
+    use crate::util;
+    use sqlx::AssertSqlSafe;
 
     /// The shared test database. Tests run in parallel against it, so every
     /// name carries a random suffix, nothing grants `*`, and nothing counts
-    /// rows across the whole schema.
+    /// rows across the whole schema. `L4F_TEST_DATABASE_URL` picks the backend
+    /// (`mysql://`, `postgres://`, `sqlite://`); unset, the tests pass vacuously.
     pub(crate) async fn shared() -> Option<Store> {
         let url = std::env::var("L4F_TEST_DATABASE_URL").ok()?;
-        let pool = MySqlPool::connect(&url).await.expect("L4F_TEST_DATABASE_URL does not connect");
-        migrate::run(&pool).await.unwrap();
-        Some(Store(pool))
+        let store = Store::connect(&url).await.expect("L4F_TEST_DATABASE_URL does not connect");
+        migrate::run(&store).await.unwrap();
+        Some(store)
     }
 
     /// A database of its own (`l4f_test_<hex>`), for tests about global state:
     /// who holds `*`, how many rows a sweep removes. `done` drops it; a failed
-    /// test leaves it behind on the throwaway server.
+    /// test leaves it behind on the throwaway server (or in the temp dir).
     pub(crate) struct Fresh {
         pub(crate) store: Store,
         name: String,
-        opts: MySqlConnectOptions,
+        #[cfg_attr(not(any(feature = "mysql", feature = "postgres")), allow(dead_code))]
+        url: String,
     }
 
     pub(crate) async fn fresh() -> Option<Fresh> {
         let url = std::env::var("L4F_TEST_DATABASE_URL").ok()?;
-        let opts: MySqlConnectOptions = url.parse().expect("L4F_TEST_DATABASE_URL does not parse");
         let name = format!("l4f_test_{}", hex::encode(util::random::<6>()));
-        let mut c = MySqlConnection::connect_with(&opts).await.unwrap();
-        sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE `{name}`"))).execute(&mut c).await.unwrap();
-        let _ = c.close().await;
-        let pool = MySqlPool::connect_with(opts.clone().database(&name)).await.unwrap();
-        migrate::run(&pool).await.unwrap();
-        Some(Fresh { store: Store(pool), name, opts })
+        let store = match url.split_once(':').map_or("", |(s, _)| s) {
+            #[cfg(feature = "mysql")]
+            "mysql" | "mariadb" => {
+                let opts: sqlx::mysql::MySqlConnectOptions = url.parse().expect("L4F_TEST_DATABASE_URL does not parse");
+                let mut c = MySqlConnection::connect_with(&opts).await.unwrap();
+                sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE `{name}`"))).execute(&mut c).await.unwrap();
+                let _ = c.close().await;
+                Store::from(MySqlPool::connect_with(opts.database(&name)).await.unwrap())
+            }
+            #[cfg(feature = "postgres")]
+            "postgres" | "postgresql" => {
+                use sqlx::Connection;
+                let opts: sqlx::postgres::PgConnectOptions = url.parse().expect("L4F_TEST_DATABASE_URL does not parse");
+                let mut c = sqlx::PgConnection::connect_with(&opts).await.unwrap();
+                sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE \"{name}\""))).execute(&mut c).await.unwrap();
+                let _ = c.close().await;
+                Store::from(sqlx::PgPool::connect_with(opts.database(&name)).await.unwrap())
+            }
+            #[cfg(feature = "sqlite")]
+            "sqlite" => Store::connect(&format!("sqlite://{}", sqlite_path(&name).display())).await.unwrap(),
+            other => panic!("no backend for {other:?} in this build"),
+        };
+        migrate::run(&store).await.unwrap();
+        Some(Fresh { store, name, url })
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn sqlite_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{name}.db"))
     }
 
     impl Fresh {
         pub(crate) async fn done(self) {
-            self.store.0.close().await;
-            let mut c = MySqlConnection::connect_with(&self.opts).await.unwrap();
-            sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE `{}`", self.name))).execute(&mut c).await.unwrap();
-            let _ = c.close().await;
+            self.store.close().await;
+            match &self.store {
+                #[cfg(feature = "mysql")]
+                Store::My(_) => {
+                    let opts: sqlx::mysql::MySqlConnectOptions = self.url.parse().unwrap();
+                    let mut c = MySqlConnection::connect_with(&opts).await.unwrap();
+                    sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE `{}`", self.name))).execute(&mut c).await.unwrap();
+                    let _ = c.close().await;
+                }
+                #[cfg(feature = "postgres")]
+                Store::Pg(_) => {
+                    use sqlx::Connection;
+                    let mut c = sqlx::PgConnection::connect(&self.url).await.unwrap();
+                    sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE \"{}\"", self.name))).execute(&mut c).await.unwrap();
+                    let _ = c.close().await;
+                }
+                #[cfg(feature = "sqlite")]
+                Store::Lite(_) => {
+                    let path = sqlite_path(&self.name);
+                    for suffix in ["", "-wal", "-shm", ".lock"] {
+                        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A value for `exec`/`scalar`.
+    pub(crate) enum Arg {
+        B(Vec<u8>),
+        I(i64),
+        S(String),
+    }
+
+    /// `?` placeholders become `$1`, `$2`… on the portable backends. Test SQL
+    /// only: a `?` inside a string literal would be rewritten too.
+    fn dialect(store: &Store, sql: &str) -> String {
+        match store {
+            #[cfg(feature = "mysql")]
+            Store::My(_) => sql.to_string(),
+            #[allow(unreachable_patterns)]
+            _ => numbered(sql),
+        }
+    }
+
+    #[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
+    fn numbered(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len() + 8);
+        let mut n = 0;
+        for c in sql.chars() {
+            if c == '?' {
+                n += 1;
+                out.push_str(&format!("${n}"));
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    macro_rules! run_on {
+        ($store:expr, $sql:expr, $args:expr, $make:path, $fetch:ident $(, $post:ident)?) => {{
+            let sql = dialect($store, $sql);
+            match $store {
+                #[cfg(feature = "mysql")]
+                Store::My(b) => {
+                    let mut q = $make(AssertSqlSafe(sql));
+                    for a in $args {
+                        q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
+                    }
+                    q.$fetch(&b.0).await.unwrap()$(.$post())?
+                }
+                #[cfg(feature = "postgres")]
+                Store::Pg(b) => {
+                    let mut q = $make(AssertSqlSafe(sql));
+                    for a in $args {
+                        q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
+                    }
+                    q.$fetch(&b.0).await.unwrap()$(.$post())?
+                }
+                #[cfg(feature = "sqlite")]
+                Store::Lite(b) => {
+                    let mut q = $make(AssertSqlSafe(sql));
+                    for a in $args {
+                        q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
+                    }
+                    q.$fetch(&b.0).await.unwrap()$(.$post())?
+                }
+            }
+        }};
+    }
+
+    /// A raw statement on whichever backend the tests run on: rows affected.
+    pub(crate) async fn exec(store: &Store, sql: &str, args: Vec<Arg>) -> u64 {
+        run_on!(store, sql, args, sqlx::query, execute, rows_affected)
+    }
+
+    /// A raw `SELECT COUNT(*)`-style query: its one integer.
+    pub(crate) async fn scalar(store: &Store, sql: &str, args: Vec<Arg>) -> i64 {
+        run_on!(store, sql, args, sqlx::query_scalar, fetch_one)
+    }
+
+    /// `exec` on a connection a host was handed (`Host::delete_user`).
+    pub(crate) async fn exec_conn(conn: StoreConn<'_>, sql: &str, args: Vec<Arg>) -> u64 {
+        macro_rules! on {
+            ($c:expr, $sql:expr) => {{
+                let mut q = sqlx::query(AssertSqlSafe($sql));
+                for a in args {
+                    q = match a { Arg::B(v) => q.bind(v), Arg::I(v) => q.bind(v), Arg::S(v) => q.bind(v) };
+                }
+                q.execute($c).await.unwrap().rows_affected()
+            }};
+        }
+        match conn {
+            #[cfg(feature = "mysql")]
+            StoreConn::My(c) => on!(c, sql.to_string()),
+            #[cfg(feature = "postgres")]
+            StoreConn::Pg(c) => on!(c, numbered(sql)),
+            #[cfg(feature = "sqlite")]
+            StoreConn::Lite(c) => on!(c, numbered(sql)),
+        }
+    }
+
+    /// `delete_user` on a pool connection of its own, outside any transaction.
+    pub(crate) async fn delete(s: &Store, id: AccountId) -> Result<bool, WriteError> {
+        match s {
+            #[cfg(feature = "mysql")]
+            Store::My(b) => MySqlStore::delete_user(&mut b.0.acquire().await.unwrap(), id).await,
+            #[cfg(feature = "postgres")]
+            Store::Pg(b) => pg::Backend::delete_user(&mut b.0.acquire().await.unwrap(), id).await,
+            #[cfg(feature = "sqlite")]
+            Store::Lite(b) => lite::Backend::delete_user(&mut b.0.acquire().await.unwrap(), id).await,
         }
     }
 
@@ -1389,10 +1578,6 @@ pub(crate) mod tests {
         let u = new_user(&unique("u"));
         s.create_user(&u, role).await.unwrap();
         u.id
-    }
-
-    async fn delete(s: &Store, id: AccountId) -> Result<bool, WriteError> {
-        Store::delete_user(&mut s.0.acquire().await.unwrap(), id).await
     }
 
     async fn make_role(s: &Store, scopes: &[&str]) -> (AccountId, String) {
@@ -1422,11 +1607,7 @@ pub(crate) mod tests {
     }
 
     async fn rows_for(s: &Store, table: &str, id: AccountId) -> i64 {
-        sqlx::query_scalar(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?")))
-            .bind(&id.0[..])
-            .fetch_one(&s.0)
-            .await
-            .unwrap()
+        scalar(s, &format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?"), vec![Arg::B(id.0.to_vec())]).await
     }
 
     #[test]
@@ -1538,12 +1719,7 @@ pub(crate) mod tests {
         let (by_display, n) = s.list_users(Some(&format!("BETA {p}")), 10, 0).await.unwrap();
         assert_eq!((n, by_display[0].id), (1, ids[1]), "display names match case-insensitively");
         let mail = unique("m");
-        sqlx::query("UPDATE acct_users SET email = ? WHERE id = ?")
-            .bind(format!("{mail}@example.org"))
-            .bind(&ids[0].0[..])
-            .execute(&s.0)
-            .await
-            .unwrap();
+        exec(&s, "UPDATE acct_users SET email = ? WHERE id = ?", vec![Arg::S(format!("{mail}@example.org")), Arg::B(ids[0].0.to_vec())]).await;
         let (by_mail, n) = s.list_users(Some(&mail.to_uppercase()), 10, 0).await.unwrap();
         assert_eq!((ids_of(&by_mail), n), (vec![ids[0]], 1), "the verified address matches too");
         let (_, n) = s.list_users(Some(&format!("{p}%")), 10, 0).await.unwrap();
@@ -1810,8 +1986,8 @@ pub(crate) mod tests {
         // Inside a caller's transaction a refusal undoes only its own delete.
         let other = make_user(s, None).await;
         let mut tx = s.begin().await.unwrap();
-        assert!(Store::delete_user(&mut tx, other).await.unwrap());
-        assert!(matches!(Store::delete_user(&mut tx, a2).await, Err(WriteError::LastAdmin)));
+        assert!(Store::delete_user(tx.conn(), other).await.unwrap());
+        assert!(matches!(Store::delete_user(tx.conn(), a2).await, Err(WriteError::LastAdmin)));
         tx.commit().await.unwrap();
         assert!(s.user_by_id(other).await.unwrap().is_none(), "the caller's earlier work commits");
         assert!(s.user_by_id(a2).await.unwrap().is_some());
@@ -1828,7 +2004,7 @@ pub(crate) mod tests {
         let s = &f.store;
         s.ensure_builtin_roles(&strings(&["links:own", "profile:public"])).await.unwrap();
         let low = AccountId([0; 16]);
-        sqlx::query("INSERT INTO acct_roles (id, name, created_at) VALUES (?, 'low', 1)").bind(&low.0[..]).execute(&s.0).await.unwrap();
+        exec(s, "INSERT INTO acct_roles (id, name, created_at) VALUES (?, 'low', 1)", vec![Arg::B(low.0.to_vec())]).await;
         s.set_role_scopes(low, &strings(&["links:own", "profile:public"])).await.unwrap();
         let admin = s.role_by_name("admin").await.unwrap().unwrap().id;
 
@@ -1881,12 +2057,7 @@ pub(crate) mod tests {
         assert_eq!(s.audit_of(u, 1).await.unwrap().len(), 1);
 
         for at in 1..=7 {
-            sqlx::query("INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'old', ?)")
-                .bind(&u.0[..])
-                .bind(at)
-                .execute(&s.0)
-                .await
-                .unwrap();
+            exec(s, "INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'old', ?)", vec![Arg::B(u.0.to_vec()), Arg::I(at)]).await;
         }
         assert_eq!(s.delete_audit_before(100, 3).await.unwrap(), 3);
         assert_eq!(s.delete_audit_before(100, 3).await.unwrap(), 3);
@@ -1906,15 +2077,16 @@ pub(crate) mod tests {
         s.insert_session(&sess(u, now, now, now + 100)).await.unwrap();
         s.audit(Some(u), None, "login_ok", "", "").await.unwrap();
         s.audit(Some(bystander), Some(u), "role_grant", "", "").await.unwrap();
-        let b = &u.0[..];
-        for sql in [
+        for (sql, extra) in [
             // ext_id = the user id: unique, and the key is global across test runs.
-            "INSERT INTO acct_credentials (kind, ext_id, user_id, created_at) SELECT 'ssh', id, id, 1 FROM acct_users WHERE id = ?",
-            "INSERT INTO acct_recovery (user_id, code_hash) VALUES (?, REPEAT('a', 32))",
-            "INSERT INTO acct_blobs (user_id, ns, k, v, updated_at) VALUES (?, 'kv', 'k', 'v', 1)",
-            "INSERT INTO acct_profiles (user_id, updated_at) VALUES (?, 1)",
+            ("INSERT INTO acct_credentials (kind, ext_id, user_id, created_at) SELECT 'ssh', id, id, 1 FROM acct_users WHERE id = ?", None),
+            ("INSERT INTO acct_recovery (user_id, code_hash) VALUES (?, ?)", Some(vec![b'a'; 32])),
+            ("INSERT INTO acct_blobs (user_id, ns, k, v, updated_at) VALUES (?, 'kv', 'k', ?, 1)", Some(b"v".to_vec())),
+            ("INSERT INTO acct_profiles (user_id, updated_at) VALUES (?, 1)", None),
         ] {
-            sqlx::query(sql).bind(b).execute(&s.0).await.unwrap();
+            let mut args = vec![Arg::B(u.0.to_vec())];
+            args.extend(extra.map(Arg::B));
+            exec(&s, sql, args).await;
         }
         let tables = [
             "acct_sessions",
@@ -1931,7 +2103,7 @@ pub(crate) mod tests {
 
         // Inside a caller's transaction the delete is undone with it.
         let mut tx = s.begin().await.unwrap();
-        assert!(Store::delete_user(&mut tx, u).await.unwrap());
+        assert!(Store::delete_user(tx.conn(), u).await.unwrap());
         tx.rollback().await.unwrap();
         assert!(s.user_by_id(u).await.unwrap().is_some());
 
@@ -1959,23 +2131,15 @@ pub(crate) mod tests {
         let public_key = [0x99u8; 65];
         let recovery = [0x55u8; 32];
         let ext: [u8; 16] = util::random();
-        sqlx::query("UPDATE acct_users SET totp_enc = ? WHERE id = ?").bind(&totp[..]).bind(&u.0[..]).execute(&s.0).await.unwrap();
-        sqlx::query(
+        exec(&s, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(totp.to_vec()), Arg::B(u.0.to_vec())]).await;
+        exec(
+            &s,
             "INSERT INTO acct_credentials (kind, ext_id, user_id, public_key, alg, name, created_at)
              VALUES ('passkey', ?, ?, ?, -7, 'Laptop', 5)",
+            vec![Arg::B(ext.to_vec()), Arg::B(u.0.to_vec()), Arg::B(public_key.to_vec())],
         )
-        .bind(&ext[..])
-        .bind(&u.0[..])
-        .bind(&public_key[..])
-        .execute(&s.0)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO acct_recovery (user_id, code_hash) VALUES (?, ?)")
-            .bind(&u.0[..])
-            .bind(&recovery[..])
-            .execute(&s.0)
-            .await
-            .unwrap();
+        .await;
+        exec(&s, "INSERT INTO acct_recovery (user_id, code_hash) VALUES (?, ?)", vec![Arg::B(u.0.to_vec()), Arg::B(recovery.to_vec())]).await;
         let now = util::now();
         let session = sess(u, now, now, now + 100);
         s.insert_session(&session).await.unwrap();

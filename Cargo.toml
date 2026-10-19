@@ -11,7 +11,13 @@ description = "Users, roles, scopes and authentication for l4f (and later voipc)
 # The default build is the pure core: synchronous, no tokio, sqlx, axum or reqwest,
 # so a non-HTTP server can use the verifiers, limiter and PoW directly.
 default = []
-mysql = ["dep:sqlx", "dep:tokio"]
+# A backend each; any of them brings the store, migrations and the service.
+# They add up: one binary can serve whichever database its URL names.
+mysql = ["_db", "sqlx/mysql"]
+postgres = ["_db", "sqlx/postgres"]
+sqlite = ["_db", "sqlx/sqlite"]
+# Internal: what every backend needs. Enable a backend, not this.
+_db = ["dep:sqlx", "dep:tokio"]
 axum = ["mysql", "dep:axum", "dep:askama"]
 oauth = ["mysql", "dep:reqwest"]
 email = ["mysql", "dep:lettre"]
@@ -33,7 +39,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 tracing = "0.1"
 
 bcrypt = { version = "0.19", optional = true }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-none", "mysql", "derive", "macros", "migrate"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-none", "derive", "macros", "migrate"], optional = true }
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"], optional = true }
 axum = { version = "0.8", optional = true }
 askama = { version = "0.16", optional = true }

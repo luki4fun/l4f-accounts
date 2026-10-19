@@ -12,7 +12,7 @@ use super::profile::uuid_of;
 use super::auth::{clean_email, new_token, token_hash};
 use super::*;
 use crate::model::{SessionInfo, UserStatus};
-use crate::store::tests::{fresh, shared as shared_store};
+use crate::store::tests::{Arg, delete, exec, exec_conn, fresh, scalar, shared as shared_store};
 
 const APP: &[ScopeDef] = &[ScopeDef { name: "t:one", description: "test" }, ScopeDef { name: "t:two", description: "test" }];
 const POW_KEY: &[u8] = b"service-test-pow-key-0123456789ab";
@@ -32,14 +32,11 @@ impl Host for Stub {
         vec![("links".into(), serde_json::json!([user.hex()]))]
     }
 
-    async fn delete_user(&self, tx: &mut sqlx::MySqlConnection, user: AccountId, delete_owned: bool) -> sqlx::Result<()> {
+    async fn delete_user(&self, tx: StoreConn<'_>, user: AccountId, delete_owned: bool) -> sqlx::Result<()> {
         self.deleted.lock().unwrap().push((user, delete_owned));
         // A write in the caller's transaction, to see it go back with a refusal.
-        sqlx::query("UPDATE acct_users SET display_name = 'host was here' WHERE id = ?")
-            .bind(&user.0[..])
-            .execute(tx)
-            .await
-            .map(|_| ())
+        exec_conn(tx, "UPDATE acct_users SET display_name = 'host was here' WHERE id = ?", vec![Arg::B(user.0.to_vec())]).await;
+        Ok(())
     }
 }
 
@@ -159,7 +156,7 @@ async fn make_role(a: &Accounts<Stub>, scopes: &[&str]) -> String {
 
 async fn cleanup(a: &Accounts<Stub>, users: &[AccountId], roles: &[&str]) {
     for u in users {
-        Store::delete_user(&mut a.store.0.acquire().await.unwrap(), *u).await.unwrap();
+        delete(&a.store, *u).await.unwrap();
     }
     for r in roles {
         let role = a.store.role_by_name(r).await.unwrap().unwrap();
@@ -559,7 +556,7 @@ async fn privileged_scopes_wait_for_a_second_factor() {
     let Some(w) = shared(wide).await else { return };
     assert_eq!(w.effective_scopes(&u).await.unwrap(), ["t:one", "t:two"], "a default wildcard covers its scopes");
     // What Phase 2's TOTP enrolment writes.
-    sqlx::query("UPDATE acct_users SET totp_enc = x'00' WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    exec(&a.store, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(vec![0]), Arg::B(u.id.0.to_vec())]).await;
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
     assert_eq!(a.effective_scopes(&u).await.unwrap(), ["t:one", "t:two", "users:read"]);
 
@@ -599,12 +596,12 @@ async fn delete_account_takes_the_app_rows_in_one_transaction() {
     let scopes = a.effective_scopes(&boss).await.unwrap();
     a.delete_account(&c, Actor { user: &boss, scopes: &scopes }, target.id, false).await.unwrap();
     assert_eq!(a.host.deleted.lock().unwrap().last(), Some(&(target.id, false)));
-    let logged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acct_audit WHERE actor_id = ? AND event = 'account_delete' AND detail = ?")
-        .bind(&boss.id.0[..])
-        .bind(target.id.hex())
-        .fetch_one(&a.store.0)
-        .await
-        .unwrap();
+    let logged = scalar(
+        &a.store,
+        "SELECT COUNT(*) FROM acct_audit WHERE actor_id = ? AND event = 'account_delete' AND detail = ?",
+        vec![Arg::B(boss.id.0.to_vec()), Arg::S(target.id.hex())],
+    )
+    .await;
     assert_eq!(logged, 1, "an admin's deletion stays on the record");
     cleanup(&a, &[boss.id], &[&mod_role, &one]).await;
 }
@@ -728,12 +725,7 @@ async fn sweep_removes_dead_sessions_and_old_audit_rows() {
         a.store.insert_session(&s).await.unwrap();
     }
     for at in [now - 181 * DAY, now - 200 * DAY] {
-        sqlx::query("INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'old', ?)")
-            .bind(&u.id.0[..])
-            .bind(at)
-            .execute(&a.store.0)
-            .await
-            .unwrap();
+        exec(&a.store, "INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'old', ?)", vec![Arg::B(u.id.0.to_vec()), Arg::I(at)]).await;
     }
     a.store.audit(Some(u.id), None, "recent", "", "").await.unwrap();
     assert_eq!(a.sweep(now).await.unwrap(), Swept { sessions: 2, audit: 2, devkeys: 0 });
@@ -743,11 +735,7 @@ async fn sweep_removes_dead_sessions_and_old_audit_rows() {
     assert_eq!(a.sweep(now).await.unwrap(), Swept::default());
 
     let keep_all = on(f.store.clone(), Config { audit_retention_days: 0, ..cfg() }).await;
-    sqlx::query("INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'ancient', 1)")
-        .bind(&u.id.0[..])
-        .execute(&a.store.0)
-        .await
-        .unwrap();
+    exec(&a.store, "INSERT INTO acct_audit (user_id, event, at) VALUES (?, 'ancient', 1)", vec![Arg::B(u.id.0.to_vec())]).await;
     assert_eq!(keep_all.sweep(now).await.unwrap().audit, 0, "retention 0 keeps the log");
     drop((a, keep_all));
     f.done().await;
@@ -805,7 +793,7 @@ async fn step_up_refreshes_auth_at_and_rotates_the_token() {
     let pending = a.create_session(u.id, "password", false, 0, &c).await.unwrap();
     assert!(matches!(a.step_up(&c, &u, &pending.info, PW).await, Err(Error::Forbidden)));
     assert!(!a.fresh(&pending.info, now));
-    sqlx::query("UPDATE acct_users SET totp_enc = x'00' WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    exec(&a.store, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(vec![0]), Arg::B(u.id.0.to_vec())]).await;
     let u2 = a.store.user_by_id(u.id).await.unwrap().unwrap();
     assert!(matches!(a.step_up(&c, &u2, &fresh, PW).await, Err(Error::Invalid(_))), "a password alone is not enough with 2FA");
     cleanup(&a, &[u.id, other.id], &[]).await;
@@ -892,7 +880,7 @@ async fn totp_turns_on_gates_sign_in_and_refuses_replays() {
     // spent its five tries above, which every code counts against.
     let Some(b) = shared(cfg()).await else { return };
     assert!(matches!(b.step_up(&c, &u, &done.info, PW).await, Err(Error::Invalid(_))));
-    sqlx::query("UPDATE acct_users SET totp_last_step = 0 WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    exec(&a.store, "UPDATE acct_users SET totp_last_step = 0 WHERE id = ?", vec![Arg::B(u.id.0.to_vec())]).await;
     let up = b.step_up_totp(&c, &u, &done.info, &code).await.unwrap();
     assert!(b.fresh(&up.info, util::now()));
     assert!(matches!(a.step_up_totp(&c, &u, &up.info, &code).await, Err(Error::RateLimited)), "5 codes per 15 minutes");
@@ -993,7 +981,7 @@ async fn a_passkey_is_a_second_factor_and_a_step_up() {
     let s = a.passkey_mfa(&c, &u, &pending.info, &token, NONCE, &json).await.unwrap();
     assert!(s.info.mfa_ok && a.fresh(&s.info, util::now()));
 
-    sqlx::query("UPDATE acct_sessions SET auth_at = 1 WHERE token_hash = ?").bind(&s.info.token_hash[..]).execute(&a.store.0).await.unwrap();
+    exec(&a.store, "UPDATE acct_sessions SET auth_at = 1 WHERE token_hash = ?", vec![Arg::B(s.info.token_hash.to_vec())]).await;
     let (_, info, _) = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap();
     let (_, token) = a.passkey_options(PasskeyFor::StepUp, Some(&u), NONCE).await.unwrap();
     let ch = crate::challenge::challenge_bytes(&token);
@@ -1061,7 +1049,7 @@ async fn an_ssh_key_signs_in_once_it_signed_its_own_enrolment() {
     assert!(a.ssh_login(&c, &stranger, NONCE, &other.ssh_sign(&ns, stranger.as_bytes())).await.is_err(), "an unknown key");
 
     // With a second factor, an SSH key is only the first one.
-    sqlx::query("UPDATE acct_users SET totp_enc = x'00' WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    exec(&a.store, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(vec![0]), Arg::B(u.id.0.to_vec())]).await;
     let login = a.ssh_challenge(None, NONCE);
     let pending = pending_of(a.ssh_login(&c, &login, NONCE, &key.ssh_sign(&ns, login.as_bytes())).await);
     assert!(!pending.info.mfa_ok);
@@ -1090,7 +1078,7 @@ async fn a_device_key_signs_in_this_browser_until_it_is_revoked() {
     assert!(a.devkey_login(&c, &t, NONCE, &util::random::<16>(), &sign_in(&t)).await.is_err(), "another device id");
 
     // Unused for 90 days: gone.
-    sqlx::query("UPDATE acct_credentials SET last_used_at = 1 WHERE kind = 'devkey' AND ext_id = ?").bind(&device[..]).execute(&a.store.0).await.unwrap();
+    exec(&a.store, "UPDATE acct_credentials SET last_used_at = 1 WHERE kind = 'devkey' AND ext_id = ?", vec![Arg::B(device.to_vec())]).await;
     let t = a.devkey_challenge(None, NONCE);
     assert!(a.devkey_login(&c, &t, NONCE, &device, &sign_in(&t)).await.is_err());
     assert!(a.devkeys(u.id).await.unwrap().is_empty(), "and deleted");
@@ -1314,7 +1302,7 @@ mod social_flows {
         let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await.unwrap();
         assert!(matches!(out, SocialOutcome::Signed(LoginStep::Done(_))), "the same identity signs in now");
 
-        sqlx::query("UPDATE acct_users SET totp_enc = x'00' WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+        exec(&a.store, "UPDATE acct_users SET totp_enc = ? WHERE id = ?", vec![Arg::B(vec![0]), Arg::B(u.id.0.to_vec())]).await;
         let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "").unwrap();
         let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await.unwrap();
         assert!(matches!(out, SocialOutcome::Signed(LoginStep::NeedMfa(_))), "a first factor only, with 2FA on");

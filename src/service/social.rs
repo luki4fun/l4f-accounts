@@ -263,8 +263,9 @@ impl<H: Host> Accounts<H> {
         let id = Identity { subject: c.sub, handle: c.handle, email: None, auth_time: None };
         if !self.store.insert_credential(&Self::identity_row(kind, &user, &id)).await? {
             // Lost a race for the identity: no account without a way in.
-            let mut conn = self.store.0.acquire().await?;
-            crate::store::Store::delete_user(&mut conn, user.id).await?;
+            let mut tx = self.store.begin().await?;
+            crate::store::Store::delete_user(tx.conn(), user.id).await?;
+            tx.commit().await?;
             return Err(Error::Invalid("That account is linked to another account here already."));
         }
         permit.commit(&self.limiter);

@@ -37,7 +37,7 @@ impl Host for T {
         Vec::new()
     }
 
-    async fn delete_user(&self, _: &mut sqlx::MySqlConnection, _: AccountId, _: bool) -> sqlx::Result<()> {
+    async fn delete_user(&self, _: crate::store::StoreConn<'_>, _: AccountId, _: bool) -> sqlx::Result<()> {
         Ok(())
     }
 }
@@ -65,7 +65,7 @@ fn cfg() -> Config {
 }
 
 fn nowhere() -> Store {
-    Store(MySqlPoolOptions::new().acquire_timeout(Duration::from_millis(200)).connect_lazy("mysql://x:x@127.0.0.1:9/x").unwrap())
+    Store::from(MySqlPoolOptions::new().acquire_timeout(Duration::from_millis(200)).connect_lazy("mysql://x:x@127.0.0.1:9/x").unwrap())
 }
 
 fn app(store: Store, cfg: Config) -> (Router, Arc<Accounts<T>>) {
@@ -259,7 +259,7 @@ async fn make_user(a: &Accounts<T>) -> NewUser {
 }
 
 async fn drop_user(a: &Accounts<T>, id: AccountId) {
-    Store::delete_user(&mut a.store.0.acquire().await.unwrap(), id).await.unwrap();
+    crate::store::tests::delete(&a.store, id).await.unwrap();
 }
 
 /// Brute-force the page's challenge the way pow.js does.
@@ -912,7 +912,7 @@ async fn social_sign_in_runs_through_start_and_callback() {
     assert!(location(&r).starts_with("/account/login?err="), "without the flow cookie: refused");
 
     // An account with nothing but the identity confirms it there.
-    sqlx::query("UPDATE acct_users SET password_hash = NULL WHERE id = ?").bind(&u.id.0[..]).execute(&a.store.0).await.unwrap();
+    crate::store::tests::exec(&a.store, "UPDATE acct_users SET password_hash = NULL WHERE id = ?", vec![crate::store::tests::Arg::B(u.id.0.to_vec())]).await;
     let page = text(send(&app, get("/account/reauth?next=%2Faccount%2Fdelete", Some(&c))).await).await;
     assert!(page.contains("/account/oauth/discord?intent=reauth") && !page.contains(r#"name="password""#));
     drop_user(&a, u.id).await;
