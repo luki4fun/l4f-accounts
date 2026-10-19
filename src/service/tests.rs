@@ -1871,6 +1871,73 @@ mod social_flows {
         assert!(a.fresh(&up.info, util::now()) && next == "/account/delete");
         cleanup(&a, &[u.id], &[]).await;
     }
+
+    /// Discord forces its prompt by a URL parameter the browser can drop: it
+    /// confirms nobody who has a password, and no provider confirms someone
+    /// with a second factor. Checked when the flow starts and again, on the
+    /// account as it is then, at the callback (OUT-1).
+    #[tokio::test]
+    async fn a_social_step_up_is_for_accounts_with_nothing_else() {
+        let Some((a, fake)) = setup().await else { return };
+        let c = ctx("203.0.113.103");
+        fake.lock().unwrap().subject = unique("d");
+        let u = make_user(&a, &[]).await;
+        let s = a.create_session(u.id, "password", true, util::now(), &c).await.unwrap();
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Link, Some(&u), "").unwrap();
+        a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", Some((&u, &s.info))).await.unwrap();
+        let mut bare = u.clone();
+        bare.has_password = false;
+        let mut coded = bare.clone();
+        coded.totp_enabled = true;
+        assert!(matches!(a.oauth_begin(Kind::Discord, Intent::Reauth, Some(&u), ""), Err(Error::Invalid(_))), "a password account");
+        assert!(matches!(a.oauth_begin(Kind::Discord, Intent::Reauth, Some(&coded), ""), Err(Error::Invalid(_))), "a TOTP account");
+        assert!(matches!(a.oauth_begin(Kind::Google, Intent::Reauth, Some(&coded), ""), Err(Error::Invalid(_))), "not even Google");
+
+        // Begun while the account had nothing else, finished once it has.
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Reauth, Some(&bare), "").unwrap();
+        let st = param(&url, "state");
+        for (me, why) in [(&coded, "a TOTP account"), (&u, "a password account")] {
+            let r = a.oauth_finish(&c, Kind::Discord, &cookie, &st, "code", Some((me, &s.info))).await;
+            assert!(matches!(r, Err(Error::Invalid(_))), "{why}, at the callback");
+        }
+        let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &st, "code", Some((&bare, &s.info))).await.unwrap();
+        assert!(matches!(out, SocialOutcome::SteppedUp(_)), "nothing else to confirm with");
+        cleanup(&a, &[u.id], &[]).await;
+    }
+
+    /// Only the callback of a flow this browser started spends the sign-in
+    /// bucket, so another site's images cannot use it up (OUT-14).
+    #[tokio::test]
+    async fn callbacks_of_no_flow_spend_nothing() {
+        let Some((a, fake)) = setup().await else { return };
+        let c = ctx("203.0.113.105");
+        for _ in 0..=a.host.config().login_per_15min * 3 {
+            assert!(matches!(a.oauth_finish(&c, Kind::Discord, "", "state", "code", None).await, Err(Error::Invalid(_))));
+        }
+        fake.lock().unwrap().subject = unique("d");
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "").unwrap();
+        let r = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await;
+        assert!(matches!(r, Ok((SocialOutcome::Signup { .. }, _))), "not rate limited");
+    }
+
+    /// An identity unlinked while its sign-in was under way signs nobody in
+    /// (store-data-1); a counter no identity has stands in for the missing row.
+    #[tokio::test]
+    async fn an_identity_gone_mid_sign_in_signs_nobody_in() {
+        let Some((a, fake)) = setup().await else { return };
+        let c = ctx("203.0.113.104");
+        fake.lock().unwrap().subject = unique("d");
+        let u = make_user(&a, &[]).await;
+        let s = a.create_session(u.id, "password", true, util::now(), &c).await.unwrap();
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Link, Some(&u), "").unwrap();
+        a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", Some((&u, &s.info))).await.unwrap();
+        exec(&a.store, "UPDATE acct_credentials SET sign_count = 1 WHERE user_id = ?", vec![Arg::B(u.id.0.to_vec())]).await;
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "").unwrap();
+        let r = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await;
+        assert!(matches!(r, Err(Error::BadLogin)));
+        assert_eq!(a.sessions(u.id, util::now()).await.unwrap().len(), 1, "the linking session only");
+        cleanup(&a, &[u.id], &[]).await;
+    }
 }
 
 // ---- storage

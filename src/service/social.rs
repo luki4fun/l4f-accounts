@@ -14,7 +14,6 @@ use super::auth::WINDOW;
 use super::{ACCOUNT_PATH, Accounts, Ctx, Error, Host, LoginStep, NewSession, has_second_factor};
 use crate::model::{Credential, NewUser, SessionInfo, User, UserStatus};
 use crate::oauth::{self, Flow, Identity, Kind, Provider};
-use crate::store::CreateUserError;
 use crate::{pow, scope, util};
 
 /// The configured providers and the client that may reach them.
@@ -48,6 +47,15 @@ pub enum SocialOutcome {
 
 const FLOW_SECS: i64 = 600;
 const EXPIRED: Error = Error::Invalid("That sign-in took too long or started in another browser. Try again.");
+const NO_STEP_UP: Error = Error::Invalid("Confirm it's you with your code, passkey or password instead.");
+
+/// A provider stands in for a recent sign-in only on an account with nothing
+/// better: never next to a second factor, which is the step-up there, and next
+/// to a password only Google, whose `auth_time` shows it asked again. The
+/// others force their prompt by a URL parameter the browser can drop.
+fn steps_up(u: &User, kind: Kind) -> bool {
+    !has_second_factor(u) && (!u.has_password || kind == Kind::Google)
+}
 
 #[derive(Serialize, Deserialize)]
 struct FlowCookie {
@@ -104,6 +112,9 @@ impl<H: Host> Accounts<H> {
         if intent != Intent::Login && user.is_none() {
             return Err(Error::Forbidden);
         }
+        if intent == Intent::Reauth && user.is_some_and(|u| !steps_up(u, kind)) {
+            return Err(NO_STEP_UP);
+        }
         let flow = Flow::new();
         let url = oauth::authorize_url(p, &self.redirect_uri(kind), &flow, intent == Intent::Reauth);
         let c = FlowCookie {
@@ -133,13 +144,14 @@ impl<H: Host> Accounts<H> {
         if !cfg.enabled {
             return Err(Error::Closed);
         }
-        if !self.limiter.check(&format!("acct-oauth:{}", util::ip_key(ctx.ip)), WINDOW, cfg.login_per_15min * 3) {
-            return Err(Error::RateLimited);
-        }
         let fc: FlowCookie = self.open_json("oauth-flow", cookie).ok_or(EXPIRED)?;
         if fc.e <= util::now() || fc.p != kind.slug() || !util::ct_eq(&fc.s, state) {
             return Err(EXPIRED);
         }
+        // Not `door`: the provider sends the browser back from its own site.
+        // Counted only for a flow this browser started, so another site's
+        // images cannot spend a visitor's bucket.
+        self.per_ip(ctx, "acct-oauth", WINDOW, cfg.login_per_15min * 3)?;
         let (http, p) = self.provider(kind)?;
         let flow = Flow { state: fc.s, verifier: fc.v, nonce: fc.n };
         let id = oauth::exchange(http, p, code, &self.redirect_uri(kind), &flow).await.map_err(|e| {
@@ -159,6 +171,10 @@ impl<H: Host> Accounts<H> {
             }
             Intent::Reauth => {
                 let (u, s) = me.filter(|(u, _)| mine(u)).ok_or(Error::Forbidden)?;
+                // The account as it is now, not as it was when the flow began.
+                if !steps_up(u, kind) {
+                    return Err(NO_STEP_UP);
+                }
                 let cred = self.store.credential(&kind.credential_kind(), id.subject.as_bytes()).await?;
                 if !cred.is_some_and(|c| c.user_id == u.id) {
                     return Err(Error::Invalid("That is not the account linked here."));
@@ -185,39 +201,29 @@ impl<H: Host> Accounts<H> {
             return Err(Error::Invalid("No account here uses that sign-in. Sign in another way, then link it on your security page."));
         };
         let user = self.store.user_by_id(cred.user_id).await?.filter(|u| u.status == UserStatus::Active).ok_or(Error::BadLogin)?;
-        self.store.used_credential(&ckind, &cred.ext_id, 0, util::now()).await?;
+        // False once the identity was unlinked after the lookup above.
+        if !self.store.used_credential(&ckind, &cred.ext_id, 0, util::now()).await? {
+            return Err(Error::BadLogin);
+        }
         if has_second_factor(&user) {
             self.audit(ctx, Some(user.id), None, "login_need_mfa", &ckind).await?;
             return Ok(SocialOutcome::Signed(LoginStep::NeedMfa(self.create_session(user.id, "oauth", false, 0, ctx).await?)));
         }
-        self.audit(ctx, Some(user.id), None, "login_ok", &ckind).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "login_ok", user = %user.id.hex(), how = %ckind);
+        self.record(ctx, Some(user.id), None, "login_ok", &ckind).await?;
         Ok(SocialOutcome::Signed(LoginStep::Done(self.create_session(user.id, "oauth", true, 0, ctx).await?)))
     }
 
     fn identity_row(kind: Kind, user: &User, id: &Identity) -> Credential {
-        Credential {
-            kind: kind.credential_kind(),
-            ext_id: id.subject.as_bytes().to_vec(),
-            user_id: user.id,
-            public_key: None,
-            alg: 0,
-            sign_count: 0,
-            flags: 0,
-            // What the provider calls the person, for the security page.
-            name: scope::clean_display_name(&id.handle).unwrap_or_else(|_| kind.label().to_string()),
-            created_at: util::now(),
-            last_used_at: None,
-            public: false,
-        }
+        // What the provider calls the person, for the security page.
+        let name = scope::clean_display_name(&id.handle).unwrap_or_else(|_| kind.label().to_string());
+        Credential::new(kind.credential_kind(), id.subject.as_bytes().to_vec(), user.id, None, name)
     }
 
     async fn social_link(&self, ctx: &Ctx, kind: Kind, user: &User, id: &Identity) -> Result<(), Error> {
         if !self.store.insert_credential(&Self::identity_row(kind, user, id)).await? {
             return Err(Error::Invalid("That account is linked to another account here already."));
         }
-        self.audit(ctx, Some(user.id), Some(user.id), "oauth_link", kind.slug()).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "oauth_link", user = %user.id.hex(), provider = kind.slug());
+        self.record_after(ctx, Some(user.id), Some(user.id), "oauth_link", kind.slug()).await;
         Ok(())
     }
 
@@ -242,8 +248,7 @@ impl<H: Host> Accounts<H> {
         let gate = pow::Gate { limiter: &self.limiter, key, limits: &cfg.signup, ns: "acct-reg", bucket: &bucket };
         let reg = self.reg_lock.lock().await;
         let no_js = gate.precheck(pow::Proof { sec_fetch_site: &ctx.sec_fetch_site, ..proof }, true).map_err(Error::Gate)?;
-        let extra: Vec<&str> = cfg.reserved_usernames.iter().map(String::as_str).collect();
-        let username = scope::normalize_username(username, &extra).map_err(Error::Invalid)?;
+        let username = cfg.username(username)?;
         if self.store.user_by_username(&username).await?.is_some() {
             return Err(Error::UsernameTaken);
         }
@@ -254,11 +259,10 @@ impl<H: Host> Accounts<H> {
         let now = util::now();
         let display_name = scope::clean_display_name(&c.handle).unwrap_or_else(|_| username.clone());
         let new = NewUser { id: crate::model::AccountId::new(), username, display_name, email_pending: None, password_hash: None, created_at: now };
-        match self.store.create_user(&new, Some("user")).await {
-            Ok(()) => {}
-            Err(CreateUserError::UsernameTaken) => return Err(Error::UsernameTaken),
-            Err(CreateUserError::Db(e)) => return Err(e.into()),
-        }
+        // Counted before the INSERT, as in `register`: a hang-up after it
+        // must not leave the account uncounted.
+        permit.commit(&self.limiter);
+        self.store.create_user(&new, Some("user")).await?;
         let user = self.store.user_by_id(new.id).await?.ok_or(Error::NotFound)?;
         let id = Identity { subject: c.sub, handle: c.handle, email: None, auth_time: None };
         if !self.store.insert_credential(&Self::identity_row(kind, &user, &id)).await? {
@@ -268,10 +272,8 @@ impl<H: Host> Accounts<H> {
             tx.commit().await?;
             return Err(Error::Invalid("That account is linked to another account here already."));
         }
-        permit.commit(&self.limiter);
         drop(reg);
-        self.audit(ctx, Some(user.id), None, "register", &kind.credential_kind()).await?;
-        tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "register", user = %user.id.hex(), how = kind.slug());
+        self.record_after(ctx, Some(user.id), None, "register", &kind.credential_kind()).await;
         Ok(self.create_session(user.id, "oauth", true, 0, ctx).await?)
     }
 

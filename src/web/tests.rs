@@ -1017,6 +1017,56 @@ async fn social_sign_in_runs_through_start_and_callback() {
     drop_user(&a, u.id).await;
 }
 
+/// One account may link two identities of a provider; unlinking removes the
+/// one its form names (OUT-9).
+#[cfg(feature = "oauth")]
+#[tokio::test]
+async fn unlinking_removes_the_identity_it_names() {
+    use crate::model::Credential;
+    use crate::oauth::{Kind, Provider};
+    let Some(store) = crate::store::tests::shared().await else { return };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let oauth = crate::service::OAuth::new(http, vec![Provider::at(Kind::Discord, "http://127.0.0.1:9")]);
+    let host = T { cfg: Arc::new(pk_cfg()) };
+    let a = Arc::new(
+        Accounts::new(store, Keys::new(&[9; 32], None).unwrap(), Arc::default(), host, &[], Some(POW.to_vec()), Vec::new())
+            .unwrap()
+            .with_oauth(oauth),
+    );
+    let app = Router::new().nest(BASE, router(a.clone()));
+    let u = make_user(&a).await;
+    let subjects = [unique("d"), unique("d")];
+    for s in &subjects {
+        let ext_id = s.as_bytes().to_vec();
+        let cred = Credential {
+            kind: Kind::Discord.credential_kind(),
+            ext_id,
+            user_id: u.id,
+            public_key: None,
+            alg: 0,
+            sign_count: 0,
+            flags: 0,
+            name: s.clone(),
+            created_at: util::now(),
+            last_used_at: None,
+            public: false,
+        };
+        assert!(a.store.insert_credential(&cred).await.unwrap());
+    }
+    let (c, t, _) = browser(&a, u.id, util::now()).await;
+    let second = util::b64u(subjects[1].as_bytes());
+    let page = text(send(&app, get("/account/security", Some(&c))).await).await;
+    assert!(page.contains(&format!(r#"name="id" value="{second}""#)), "each row names its identity");
+    let r = send(&app, post("/account/oauth/discord/unlink", &format!("csrf={t}&id={second}"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/security?ok=Unlinked."), "{}", location(&r));
+    let left: Vec<Vec<u8>> = a.oauth_linked(u.id).await.unwrap().into_iter().map(|(_, c)| c.ext_id).collect();
+    assert_eq!(left, [subjects[0].as_bytes().to_vec()], "that one went, the other stays");
+    let r = send(&app, post("/account/oauth/discord/unlink", &format!("csrf={t}"), Some(&c))).await;
+    assert!(location(&r).starts_with("/account/security?err=That+is+not+linked."), "naming none removes none");
+    drop_user(&a, u.id).await;
+}
+
 // ---- storage
 
 fn put_raw(uri: &str, body: Vec<u8>, ctype: &str, cookie: &str, csrf: Option<&str>, version: i64) -> Request<Body> {
