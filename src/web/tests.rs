@@ -176,6 +176,40 @@ async fn cross_and_same_site_posts_are_refused() {
     assert!(location(&r).starts_with("/account/login?ok=Signed+out."));
 }
 
+/// A browser without Fetch Metadata still names a form's origin (AUTH-7).
+#[tokio::test]
+async fn without_fetch_metadata_a_foreign_origin_is_refused() {
+    let (app, _) = app(nowhere(), Config { base_url: "https://l4f.cc".into(), ..cfg() });
+    let logout = |site: Option<&str>, origin: Option<&str>| {
+        let mut req = post("/account/logout", "", None);
+        req.headers_mut().remove("sec-fetch-site");
+        if let Some(s) = site {
+            req.headers_mut().insert("sec-fetch-site", s.parse().unwrap());
+        }
+        if let Some(o) = origin {
+            req.headers_mut().insert(header::ORIGIN, o.parse().unwrap());
+        }
+        req
+    };
+    for bad in ["https://evil.example", "null", "http://l4f.cc", "https://l4f.cc.evil.example"] {
+        assert_eq!(send(&app, logout(None, Some(bad))).await.status(), StatusCode::FORBIDDEN, "{bad}");
+    }
+    for ok in [Some("https://l4f.cc"), None] {
+        assert_eq!(send(&app, logout(None, ok)).await.status(), StatusCode::SEE_OTHER, "{ok:?}");
+    }
+    let r = send(&app, logout(Some("same-origin"), Some("null"))).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER, "where the browser sends Fetch Metadata, that decides");
+}
+
+/// Never framed, unless a handler or the host's page set its own policy (FAC-3).
+#[tokio::test]
+async fn account_pages_are_never_framed_unless_the_host_says_so() {
+    let (app, _) = app(nowhere(), cfg());
+    assert_eq!(send(&app, get("/account/login", None)).await.headers()[header::X_FRAME_OPTIONS], "DENY");
+    let own = ([(header::X_FRAME_OPTIONS, "SAMEORIGIN")], "x").into_response();
+    assert_eq!(account_headers(own).await.headers()[header::X_FRAME_OPTIONS], "SAMEORIGIN");
+}
+
 #[tokio::test]
 async fn post_with_session_cookie_needs_its_token() {
     let (app, a) = app(nowhere(), cfg());
@@ -658,7 +692,10 @@ async fn totp_setup_then_sign_in_through_the_second_step() {
     assert_eq!(location(&r), "/account/mfa?next=%2Faccount%2Fsecurity");
     let pending = set_cookie(&r, "__Host-acct").unwrap();
     assert!(set_cookie(&r, "__Host-acct-dev").is_none(), "not a known device before the second step");
-    assert_eq!(send(&app, get("/account", Some(&pending))).await.status(), StatusCode::SEE_OTHER, "a pending session is nobody");
+    // A pending session is nobody: an account page sends it to its second step, cookie kept.
+    let r = send(&app, get("/account/security", Some(&pending))).await;
+    assert_eq!((r.status(), location(&r)), (StatusCode::SEE_OTHER, "/account/mfa?next=%2Faccount%2Fsecurity"));
+    assert!(set_cookie(&r, "__Host-acct").is_none(), "a live pending cookie stays");
     let page = text(send(&app, get("/account/mfa?next=%2Faccount%2Fsecurity", Some(&pending))).await).await;
     assert!(page.contains("authenticator app") && !page.contains(r#"data-passkey="mfa""#));
     let pt = field(&page, "csrf");

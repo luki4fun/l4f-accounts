@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::{AccountsState, BASE, ClientIp, clear_session, csrf, error_page, header_str, see_other, session_token};
+use super::{AccountsState, BASE, ClientIp, LOGIN_PAGE, clear_session, csrf, error_page, header_str, see_other, session_token};
 use crate::model::{SessionInfo, User};
 use crate::service::{Accounts, Actor, Ctx, Host, require, token_hash};
 use crate::util;
@@ -31,7 +31,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Ctx {
 
 /// A full session (second factor done, if any): the account, the session row,
 /// the scopes it grants now, and its form token. Rejects with a 303 to the
-/// sign-in page, which comes back here afterwards.
+/// sign-in page, or to the second step for a session waiting for it; either
+/// comes back here afterwards.
 pub struct Authed {
     pub user: User,
     pub session: SessionInfo,
@@ -63,13 +64,17 @@ impl<H: Host> Accounts<H> {
     /// The signed-in account behind the request's cookie, if its session is
     /// live and complete. For host pages that are not behind `Authed`.
     pub async fn viewer(&self, h: &HeaderMap) -> sqlx::Result<Option<Authed>> {
+        // A session still waiting for its second factor is not signed in yet.
+        Ok(self.live_session(h).await?.filter(|me| me.session.mfa_ok))
+    }
+
+    /// The live session behind the request's cookie, complete or still
+    /// waiting for its second factor. Only `Authed`'s refusal looks at the
+    /// second kind; everything else goes through `viewer`.
+    async fn live_session(&self, h: &HeaderMap) -> sqlx::Result<Option<Authed>> {
         let Some(token) = session_token(&self.host.config(), h) else { return Ok(None) };
         let Some(hash) = token_hash(token) else { return Ok(None) };
         let Some((user, session, scopes)) = self.session_from_token(token, util::now()).await? else { return Ok(None) };
-        // A session still waiting for its second factor is not signed in yet.
-        if !session.mfa_ok {
-            return Ok(None);
-        }
         let csrf = csrf::token(&self.keys, &hash);
         Ok(Some(Authed { user, session, scopes, csrf }))
     }
@@ -91,10 +96,13 @@ impl<S: AccountsState> FromRequestParts<S> for Authed {
 
     async fn from_request_parts(parts: &mut Parts, st: &S) -> Result<Self, Response> {
         let a = st.accounts();
-        match a.viewer(&parts.headers).await {
-            Ok(Some(me)) => Ok(me),
+        match a.live_session(&parts.headers).await {
+            Ok(Some(me)) if me.session.mfa_ok => Ok(me),
+            // Between the password and the second factor: that step first. The
+            // cookie stays, or the code form would post without it.
+            Ok(Some(_)) => Err(see_other(&format!("{BASE}/mfa?next={}", util::urlencode(&next_of(parts))), &[])),
             Ok(None) => {
-                let to = format!("{BASE}/login?next={}", util::urlencode(&next_of(parts)));
+                let to = format!("{LOGIN_PAGE}?next={}", util::urlencode(&next_of(parts)));
                 let cfg = a.host.config();
                 // A cookie that names no session is cleared, so the next form
                 // doesn't carry a token for it.
@@ -142,7 +150,7 @@ impl<S: AccountsState> FromRequestParts<S> for PendingMfa {
                 }
             }
         }
-        Err(see_other(&format!("{BASE}/login"), &[]))
+        Err(see_other(LOGIN_PAGE, &[]))
     }
 }
 

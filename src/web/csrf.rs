@@ -2,7 +2,10 @@
 //!
 //! - GET and HEAD never change state and pass.
 //! - Any other method from another site (`Sec-Fetch-Site` cross-site, or
-//!   same-site, which covers sibling `*.l4f.cc` hosts) is refused.
+//!   same-site, which covers sibling `*.l4f.cc` hosts) is refused. A browser
+//!   without Fetch Metadata still sends `Origin`: without the header, a
+//!   request whose `Origin` is not one of `Config::origins`, or is `null`, is
+//!   refused too.
 //! - With a session cookie, the request must also carry that session's token:
 //!   the `X-CSRF` header, or the `csrf` field of an urlencoded form. The body
 //!   is read here (72 KiB at most) and handed on unchanged. Raw bodies never
@@ -22,7 +25,7 @@ use axum::{
 
 use super::{WebHost, error_page, header_str, session_token};
 use crate::keys::Keys;
-use crate::service::{Accounts, token_hash};
+use crate::service::{Accounts, Config, token_hash};
 use crate::util;
 
 const FORM_LIMIT: usize = 72 * 1024;
@@ -41,6 +44,12 @@ fn form_field<'a>(body: &'a [u8], name: &str) -> Option<&'a str> {
     })
 }
 
+/// An `Origin` header naming one of the site's own origins. `null` never
+/// does: any page can make its own origin `null`.
+fn our_origin(cfg: &Config, origin: &[u8]) -> bool {
+    origin != b"null" && cfg.origins().iter().any(|o| o.trim_end_matches('/').as_bytes().eq_ignore_ascii_case(origin))
+}
+
 const EXPIRED: &str = "This form expired or came from another site. Go back, reload and try again.";
 
 fn refuse<H: WebHost>(status: StatusCode, a: &Accounts<H>, h: &axum::http::HeaderMap) -> Response {
@@ -53,10 +62,15 @@ pub(super) async fn layer<H: WebHost>(State(a): State<Arc<Accounts<H>>>, req: Re
         return next.run(req).await;
     }
     let h = req.headers();
-    if matches!(header_str(h, "sec-fetch-site"), "cross-site" | "same-site") {
+    let cfg = a.host.config();
+    let foreign = match header_str(h, "sec-fetch-site") {
+        "cross-site" | "same-site" => true,
+        "" => h.get(header::ORIGIN).is_some_and(|o| !our_origin(&cfg, o.as_bytes())),
+        _ => false,
+    };
+    if foreign {
         return refuse(StatusCode::FORBIDDEN, &a, h);
     }
-    let cfg = a.host.config();
     let Some(hash) = session_token(&cfg, h).and_then(token_hash) else {
         return next.run(req).await;
     };
