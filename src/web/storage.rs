@@ -16,7 +16,7 @@ use serde_json::json;
 
 use super::auth::need_fresh;
 use super::flash;
-use super::{AccountsState, Authed, BASE, St, WebHost, json_ok, json_refused, page, refused};
+use super::{AccountsState, Authed, BASE, St, WebHost, error_page, json_ok, json_refused, page, refused, with_cookies};
 use crate::service::{Ctx, Error, Put};
 use crate::store::Blob;
 use crate::util;
@@ -68,6 +68,11 @@ fn value(b: &Blob, json_value: bool) -> serde_json::Value {
     }
 }
 
+/// Each one as `{k, v, version}`, `v` shown as `value` shows it.
+fn rows(bs: &[Blob], json_value: bool) -> Vec<serde_json::Value> {
+    bs.iter().map(|b| json!({ "k": b.k, "v": value(b, json_value), "version": b.version })).collect()
+}
+
 fn deleted(r: Result<bool, Error>) -> Response {
     match r {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -78,12 +83,24 @@ fn deleted(r: Result<bool, Error>) -> Response {
 
 // ---- synced settings
 
+/// Sync off: 409, and the hint goes. Nothing the browser holds is on the
+/// server any more, so the script keeps every value and forgets only what the
+/// server had confirmed; after a 401 or 403 it would delete those values too.
 pub(super) async fn kv_list<H: WebHost>(State(a): St<H>, Api(me): Api) -> Response {
-    match a.kv_list(&me.user, &me.scopes).await {
-        Ok(items) => {
-            let items: Vec<_> = items.iter().map(|b| json!({ "k": b.k, "v": value(b, true), "version": b.version })).collect();
+    if !me.user.sync_enabled {
+        let off = (StatusCode::CONFLICT, axum::Json(json!({ "error": "Sync is off." }))).into_response();
+        return with_cookies(off, &[super::sync_hint(&a.host.config(), false)]);
+    }
+    // The epoch after the items: when the copy was deleted between the two
+    // reads, the epoch is gone or new too, and the script keeps its values.
+    let listed = match a.kv_list(&me.user, &me.scopes).await {
+        Ok(items) => a.sync_epoch(me.user.id).await.map(|epoch| (items, epoch)).map_err(Error::Db),
+        Err(e) => Err(e),
+    };
+    match listed {
+        Ok((items, epoch)) => {
             // The form token rides along: the script runs on pages that have none.
-            json_ok(json!({ "csrf": me.csrf(), "items": items }), &[])
+            json_ok(json!({ "csrf": me.csrf(), "account": me.user.id.hex(), "epoch": epoch, "items": rows(&items, true) }), &[])
         }
         Err(e) => json_refused(&e),
     }
@@ -104,13 +121,19 @@ pub(super) struct SyncForm {
     action: String,
 }
 
+/// Off keeps the hint: the script's next pull gets the 409 that keeps this
+/// browser's values (`kv_list`). Without the hint the host would run the
+/// sign-out cleanup, which deletes them.
 pub(super) async fn sync<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: HeaderMap, Form(f): Form<SyncForm>) -> Response {
-    let on = f.action == "on";
+    // Spelled out: anything else turning sync off would delete the copy.
+    let on = match f.action.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return error_page(&a, &h, StatusCode::BAD_REQUEST, "Unknown action."),
+    };
     match a.sync_set(&ctx, &me.user, &me.scopes, on).await {
-        Ok(()) => {
-            let msg = if on { "Sync is on." } else { "Sync is off; the copy here is deleted. This browser keeps its own." };
-            flash::to(&a.keys, BASE, true, msg, &[super::sync_hint(&a.host.config(), on)])
-        }
+        Ok(()) if on => flash::to(&a.keys, BASE, true, "Sync is on.", &[super::sync_hint(&a.host.config(), true)]),
+        Ok(()) => flash::to(&a.keys, BASE, true, "Sync is off; the copy here is deleted. This browser keeps its own.", &[]),
         Err(e) => refused(&a, &h, &e),
     }
 }
@@ -120,10 +143,8 @@ pub(super) async fn sync<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, h: H
 pub(super) async fn vault_list<H: WebHost>(State(a): St<H>, Api(me): Api) -> Response {
     match a.vault_list(&me.user, &me.scopes).await {
         Ok((slots, items)) => {
-            let slots: Vec<_> = slots.iter().map(|b| json!({ "k": b.k, "v": value(b, true), "version": b.version })).collect();
-            let items: Vec<_> = items.iter().map(|b| json!({ "k": b.k, "v": value(b, false), "version": b.version })).collect();
             // The account id is part of every AAD (docs/vault-format.md).
-            json_ok(json!({ "csrf": me.csrf(), "account": me.user.id.hex(), "slots": slots, "items": items }), &[])
+            json_ok(json!({ "csrf": me.csrf(), "account": me.user.id.hex(), "slots": rows(&slots, true), "items": rows(&items, false) }), &[])
         }
         Err(e) => json_refused(&e),
     }
@@ -171,14 +192,10 @@ pub(super) async fn vault_wipe<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx
     }
 }
 
-fn script(body: &'static str) -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
-}
-
 pub(super) async fn sync_script() -> Response {
-    script(include_str!("../../assets/sync.js"))
+    super::script(include_str!("../../assets/sync.js"))
 }
 
 pub(super) async fn vault_script() -> Response {
-    script(include_str!("../../assets/vault.js"))
+    super::script(include_str!("../../assets/vault.js"))
 }

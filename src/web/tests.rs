@@ -1032,12 +1032,18 @@ async fn sync_api_is_compare_and_set_behind_the_switch() {
     give(&a, u.id, &role).await;
     let (c, t, _) = browser(&a, u.id, util::now()).await;
     assert_eq!(send(&app, get("/account/api/kv", None)).await.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(send(&app, get("/account/api/kv", Some(&c))).await.status(), StatusCode::BAD_REQUEST, "sync is off");
+    assert_eq!(send(&app, get("/account/api/kv", Some(&c))).await.status(), StatusCode::CONFLICT, "sync is off");
     let r = send(&app, post("/account/sync", &format!("csrf={t}&_action=on"), Some(&c))).await;
     let hint = r.headers().get_all(header::SET_COOKIE).iter().map(|v| v.to_str().unwrap().to_string()).find(|c| c.starts_with("__Host-acct-sync=1")).unwrap();
     assert!(!hint.contains("HttpOnly"), "the script reads it");
     let j = json_of(send(&app, get("/account/api/kv", Some(&c))).await).await;
     assert_eq!((j["csrf"].as_str(), j["items"].as_array().map(Vec::len)), (Some(t.as_str()), Some(0)));
+    assert_eq!((j["account"].as_str(), j["epoch"].as_str().map(str::len)), (Some(u.id.hex().as_str()), Some(22)), "the copy's epoch");
+    for bad in ["", "&_action=Off", "&_action=nonsense"] {
+        let r = send(&app, post("/account/sync", &format!("csrf={t}{bad}"), Some(&c))).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad:?} must not turn sync off");
+    }
+    assert!(a.store.user_by_id(u.id).await.unwrap().unwrap().sync_enabled);
     let body = br#"[{"short":"https://l4f.cc/abc"}]"#.to_vec();
     assert_eq!(send(&app, put_raw("/account/api/kv/links:v1", body.clone(), "application/json", &c, None, 0)).await.status(), StatusCode::FORBIDDEN, "X-CSRF");
     let r = send(&app, put_raw("/account/api/kv/links:v1", body.clone(), "application/json", &c, Some(&t), 0)).await;
@@ -1049,8 +1055,14 @@ async fn sync_api_is_compare_and_set_behind_the_switch() {
     let mut del = Request::delete("/account/api/kv/links:v1").header(header::COOKIE, &c).header("x-csrf", &t).header(header::IF_MATCH, "1");
     del = del.header("sec-fetch-site", "same-origin");
     assert_eq!(send(&app, del.body(Body::empty()).unwrap()).await.status(), StatusCode::NO_CONTENT);
+    // Off keeps the hint; the next pull is a 409 that clears it, so the
+    // script keeps this browser's values instead of cleaning up (ADMIN-2).
     let r = send(&app, post("/account/sync", &format!("csrf={t}&_action=off"), Some(&c))).await;
-    assert!(r.headers().get_all(header::SET_COOKIE).iter().any(|v| v.to_str().unwrap().starts_with("__Host-acct-sync=;")));
+    assert!(location(&r).starts_with("/account?ok=Sync+is+off"));
+    assert_eq!(set_cookie(&r, "__Host-acct-sync"), None, "the hint stays");
+    let r = send(&app, get("/account/api/kv", Some(&c))).await;
+    assert_eq!((r.status(), set_cookie(&r, "__Host-acct-sync").as_deref()), (StatusCode::CONFLICT, Some("__Host-acct-sync=")));
+    assert_eq!(json_of(r).await["error"], "Sync is off.");
     drop_user(&a, u.id).await;
     drop_role(&a, &role).await;
 }

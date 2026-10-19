@@ -3,14 +3,16 @@
 //! server keeps opaque values under compare-and-set versions and a quota per
 //! account; for the vault it only ever sees ciphertext.
 
-use super::{Accounts, Ctx, Error, Host};
-use crate::model::User;
-use crate::scope;
-use crate::store::{Blob, PutBlob};
+use super::{Accounts, Ctx, Error, Host, need};
+use crate::model::{AccountId, User};
+use crate::store::{Blob, PutBlob, PutLimited};
+use crate::util;
 
 pub(super) const KV: &str = "kv";
 pub(super) const VAULT: &str = "vault";
 pub(super) const SLOT: &str = "vault_slot";
+/// The sync epoch's namespace and key (`sync_epoch`).
+const EPOCH: &str = "kv_epoch";
 pub const KV_MAX_KEYS: i64 = 200;
 pub const KV_MAX_BYTES: usize = 32 * 1024;
 pub const VAULT_ITEM_MAX: usize = 72 * 1024;
@@ -58,23 +60,25 @@ fn slot_shape(k: &str, v: &[u8]) -> bool {
 }
 
 impl<H: Host> Accounts<H> {
-    fn need(scopes: &[String], s: &str) -> Result<(), Error> {
-        if scope::allowed(scopes, s) { Ok(()) } else { Err(Error::Forbidden) }
-    }
-
-    async fn put(&self, user: &User, ns: &str, k: &str, v: &[u8], expect: i64) -> Result<Put, Error> {
+    /// `max_keys` and, for synced settings, the sync switch are checked under
+    /// the account's lock: racing creates cannot all pass at the cap, nor a
+    /// push land after sync was turned off and the copy deleted.
+    pub(super) async fn put(&self, user: &User, ns: &str, k: &str, v: &[u8], expect: i64, max_keys: Option<i64>) -> Result<Put, Error> {
         let quota = self.host.config().storage_quota_bytes;
-        match self.store.put_blob(user.id, ns, k, v, expect, quota).await? {
-            PutBlob::Done(ver) => Ok(Put::Done(ver)),
-            PutBlob::Conflict => Ok(Put::Conflict(self.store.blob(user.id, ns, k).await?)),
-            PutBlob::Quota => Err(Error::Invalid("Your storage is full.")),
+        match self.store.put_blob_limited(user.id, ns, k, v, expect, quota, max_keys, ns == KV).await? {
+            PutLimited::Put(PutBlob::Done(ver)) => Ok(Put::Done(ver)),
+            PutLimited::Put(PutBlob::Conflict) => Ok(Put::Conflict(self.store.blob(user.id, ns, k).await?)),
+            PutLimited::Put(PutBlob::Quota) => Err(Error::Invalid("Your storage is full.")),
+            PutLimited::Full if ns == KV => Err(Error::Invalid("Too many synced settings.")),
+            PutLimited::Full => Err(Error::Invalid("Your vault is full.")),
+            PutLimited::SyncOff => Err(Error::Invalid("Sync is off.")),
         }
     }
 
     // ---- synced settings
 
     fn sync_on(user: &User, scopes: &[String]) -> Result<(), Error> {
-        Self::need(scopes, "storage:sync")?;
+        need(scopes, "storage:sync")?;
         if user.sync_enabled { Ok(()) } else { Err(Error::Invalid("Sync is off.")) }
     }
 
@@ -91,10 +95,7 @@ impl<H: Host> Accounts<H> {
         if v.len() > KV_MAX_BYTES || serde_json::from_slice::<serde_json::Value>(v).is_err() {
             return Err(Error::Invalid("That setting is too large or not JSON."));
         }
-        if expect == 0 && self.store.blob_count(user.id, KV).await? >= KV_MAX_KEYS {
-            return Err(Error::Invalid("Too many synced settings."));
-        }
-        self.put(user, KV, k, v, expect).await
+        self.put(user, KV, k, v, expect, Some(KV_MAX_KEYS)).await
     }
 
     pub async fn kv_delete(&self, user: &User, scopes: &[String], k: &str, expect: i64) -> Result<bool, Error> {
@@ -103,28 +104,45 @@ impl<H: Host> Accounts<H> {
     }
 
     /// Turning sync off deletes the server's copy; the browser keeps its own.
+    /// Turning it on starts a new copy, under a new `sync_epoch`.
     pub async fn sync_set(&self, ctx: &Ctx, user: &User, scopes: &[String], on: bool) -> Result<(), Error> {
         if on {
-            Self::need(scopes, "storage:sync")?;
+            need(scopes, "storage:sync")?;
+            // Before the switch, so a pull that sees sync on sees this epoch;
+            // outside the quota, as the site's note rather than the account's
+            // data. Of two turn-ons at once one writes it, new either way.
+            self.store.delete_blobs(user.id, EPOCH).await?;
+            self.store.put_blob(user.id, EPOCH, EPOCH, &util::random::<16>(), 0, i64::MAX).await?;
         }
         self.store.set_sync_enabled(user.id, on).await?;
         if !on {
+            // The epoch before the copy: a pull that finds the copy gone then
+            // finds no epoch either, and drops none of the values it holds.
+            self.store.delete_blobs(user.id, EPOCH).await?;
             self.store.delete_blobs(user.id, KV).await?;
         }
-        self.audit(ctx, Some(user.id), Some(user.id), if on { "sync_on" } else { "sync_off" }, "").await?;
+        self.audit_after(ctx, Some(user.id), Some(user.id), if on { "sync_on" } else { "sync_off" }, "").await;
         Ok(())
+    }
+
+    /// The epoch of the server's copy: random, new each time sync is turned
+    /// on, and none while it is off (nor for a copy older than epochs). A
+    /// browser that last synced under another one knows that copy was deleted
+    /// since, so what it saw then tells it nothing about what was deleted.
+    pub async fn sync_epoch(&self, user: AccountId) -> sqlx::Result<Option<String>> {
+        Ok(self.store.blob(user, EPOCH, EPOCH).await?.map(|b| util::b64u(&b.v)))
     }
 
     // ---- the vault
 
     /// Its slots and items, ciphertext all of it.
     pub async fn vault_list(&self, user: &User, scopes: &[String]) -> Result<(Vec<Blob>, Vec<Blob>), Error> {
-        Self::need(scopes, "vault:use")?;
+        need(scopes, "vault:use")?;
         Ok((self.store.blobs(user.id, SLOT).await?, self.store.blobs(user.id, VAULT).await?))
     }
 
     pub async fn vault_put(&self, user: &User, scopes: &[String], slot: bool, k: &str, v: &[u8], expect: i64) -> Result<Put, Error> {
-        Self::need(scopes, "vault:use")?;
+        need(scopes, "vault:use")?;
         let ok = if slot {
             b64u_id(k) && v.len() <= VAULT_SLOT_MAX && slot_shape(k, v)
         } else {
@@ -133,24 +151,22 @@ impl<H: Host> Accounts<H> {
         if !ok {
             return Err(Error::Invalid("That is not a vault entry this site takes."));
         }
-        if !slot && expect == 0 && self.store.blob_count(user.id, VAULT).await? >= VAULT_MAX_ITEMS {
-            return Err(Error::Invalid("Your vault is full."));
-        }
-        self.put(user, if slot { SLOT } else { VAULT }, k, v, expect).await
+        let (ns, max_keys) = if slot { (SLOT, None) } else { (VAULT, Some(VAULT_MAX_ITEMS)) };
+        self.put(user, ns, k, v, expect, max_keys).await
     }
 
     pub async fn vault_delete(&self, user: &User, scopes: &[String], slot: bool, k: &str, expect: i64) -> Result<bool, Error> {
-        Self::need(scopes, "vault:use")?;
+        need(scopes, "vault:use")?;
         Ok(self.store.delete_blob(user.id, if slot { SLOT } else { VAULT }, k, expect).await?)
     }
 
     /// Empties the vault: every item and slot. For a forgotten passphrase
     /// without the recovery key; nothing in it can be read without one.
     pub async fn vault_wipe(&self, ctx: &Ctx, user: &User, scopes: &[String]) -> Result<(), Error> {
-        Self::need(scopes, "vault:use")?;
+        need(scopes, "vault:use")?;
         self.store.delete_blobs(user.id, VAULT).await?;
         self.store.delete_blobs(user.id, SLOT).await?;
-        self.audit(ctx, Some(user.id), Some(user.id), "vault_wipe", "").await?;
+        self.audit_after(ctx, Some(user.id), Some(user.id), "vault_wipe", "").await;
         Ok(())
     }
 }

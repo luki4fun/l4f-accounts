@@ -1776,6 +1776,7 @@ async fn synced_settings_are_compare_and_set_and_go_with_sync() {
     assert!(matches!(a.kv_put(&u, &scopes, "links:v1", b"[]", 0).await, Err(Error::Invalid("Sync is off."))));
     a.sync_set(&c, &u, &scopes, true).await.unwrap();
     let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let first = a.sync_epoch(u.id).await.unwrap().expect("turning sync on starts an epoch");
     let Put::Done(v1) = a.kv_put(&u, &scopes, "links:v1", b"[1]", 0).await.unwrap() else { panic!("created") };
     assert!(matches!(a.kv_put(&u, &scopes, "links:v1", b"[2]", 0).await.unwrap(), Put::Conflict(Some(b)) if b.v == b"[1]"), "create finds it");
     let Put::Done(v2) = a.kv_put(&u, &scopes, "links:v1", b"[2]", v1).await.unwrap() else { panic!("replaced") };
@@ -1791,6 +1792,12 @@ async fn synced_settings_are_compare_and_set_and_go_with_sync() {
     assert!(a.kv_delete(&u, &scopes, "a", 0).await.unwrap());
     a.sync_set(&c, &u, &scopes, false).await.unwrap();
     assert_eq!(a.store.blob_count(u.id, "kv").await.unwrap(), 0, "the server's copy goes with sync");
+    assert_eq!(a.sync_epoch(u.id).await.unwrap(), None, "and its epoch");
+    // `u` still says on, as for a push that passed the check before the
+    // switch: the store reads the switch again under its lock (ADMIN-9).
+    assert!(matches!(a.kv_put(&u, &scopes, "late", b"1", 0).await, Err(Error::Invalid("Sync is off."))));
+    a.sync_set(&c, &u, &scopes, true).await.unwrap();
+    assert!(a.sync_epoch(u.id).await.unwrap().is_some_and(|e| e != first), "a new copy, a new epoch");
     assert!(matches!(a.kv_list(&u, &[]).await, Err(Error::Forbidden)), "needs storage:sync");
     cleanup(&a, &[u.id], &[]).await;
 }
