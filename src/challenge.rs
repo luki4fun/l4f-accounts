@@ -4,17 +4,19 @@
 //! binding under an HMAC, and single use comes from burning the nonce in the
 //! rate limiter. A restart forgets the burns, so a captured response (token,
 //! signature and the browser cookie) could be replayed until the token's
-//! expiry; keep ttls short.
+//! expiry; keep ttls short. Burns are per process, too: every other instance
+//! would accept that response once more (see `limit`).
 //!
-//! What the client signs is [`challenge_bytes`] of the token, so WebAuthn, SSH
-//! and the device key all sign one fixed 32-byte value.
+//! WebAuthn and the device key sign [`challenge_bytes`] of the token, one
+//! fixed 32-byte value; SSH signs the token text itself (SSHSIG hashes it
+//! under the namespace).
 
 use sha2::{Digest, Sha256};
 
 use crate::{
     keys::Keys,
     limit::RateLimiter,
-    util::{b64u, b64u_dec, ct_eq_bytes, now, random},
+    util::{b64u, ct_eq_bytes, now, random, split_token},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +62,7 @@ pub const MAX_USER: usize = 16;
 /// The browser cookie must be at least this random; a shorter one cannot bind.
 pub const MIN_BROWSER_NONCE: usize = 16;
 
-/// Longest ttl `issue` grants. Every burn lasts this long plus [`SKEW`], so a
+/// Longest ttl `issue` grants. Every burn lasts this long plus `SKEW`, so a
 /// burn always outlives its token whatever ttl the caller picked.
 pub const MAX_TTL: i64 = 600;
 /// Slack for the wall clock stepping back while a burn is live.
@@ -113,16 +115,9 @@ pub fn check(
     now: i64,
 ) -> Result<[u8; 16], ChallengeError> {
     use ChallengeError::*;
-    if token.len() > MAX_TOKEN {
-        return Err(Malformed);
-    }
-    let (p64, tag) = token.split_once('.').ok_or(Malformed)?;
-    let p = b64u_dec(p64).ok_or(Malformed)?;
-    // `b64u_dec` drops trailing '=': one spelling per token, or a caller keyed
-    // on the token text or `challenge_bytes` would see the same nonce as new.
-    if b64u(&p) != p64 {
-        return Err(Malformed);
-    }
+    // One spelling per token, or a caller keyed on the token text or
+    // `challenge_bytes` would see the same nonce as new.
+    let (p, tag) = split_token(token, MAX_TOKEN).ok_or(Malformed)?;
     if p.len() < FIXED || p[25] as usize > MAX_USER || p.len() != FIXED + p[25] as usize {
         return Err(Malformed);
     }
@@ -149,17 +144,19 @@ pub fn check(
     Ok(nonce)
 }
 
-/// Spend a checked nonce. `false` means it was already used (or a million
-/// burns are live, which fails closed). Call it only once the signature or
-/// assertion over [`challenge_bytes`] verified: a burn before that lets anyone
-/// who can fetch a token fill the set.
+/// Spend a checked nonce. `false` means it was already used (or the
+/// limiter's ceiling of live challenge burns is reached, which fails closed;
+/// other single-use keys, such as sign-up proofs-of-work, count against
+/// ceilings of their own). Call it only once the signature or assertion
+/// verified: a burn before that lets anyone who can fetch a token fill the
+/// set.
 pub fn burn(limiter: &RateLimiter, nonce: &[u8; 16]) -> bool {
     let ttl = std::time::Duration::from_secs((MAX_TTL + SKEW) as u64);
     limiter.spend(&format!("acct-ch:{}", hex::encode(nonce)), ttl)
 }
 
-/// SHA-256 of the token text: the WebAuthn `challenge`, the SSH signed message
-/// and the device-key challenge.
+/// SHA-256 of the token text: the WebAuthn `challenge` and the device-key
+/// challenge. An SSH signature is over the token text, not this.
 pub fn challenge_bytes(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
@@ -167,6 +164,7 @@ pub fn challenge_bytes(token: &str) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::b64u_dec;
 
     const UID: &[u8] = &[0x42; 16];
     const BROWSER: &[u8] = &[0x07; 32];

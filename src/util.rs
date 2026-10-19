@@ -124,6 +124,19 @@ pub fn b64u_dec(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).ok()
 }
 
+/// A `b64u(payload).tag` token, split: the payload decoded and the tag as
+/// sent, for the caller to check. `None` past `max` bytes, without a dot, or
+/// for a payload in any spelling but the one `b64u` writes (`b64u_dec` alone
+/// also takes padding).
+pub(crate) fn split_token(t: &str, max: usize) -> Option<(Vec<u8>, &str)> {
+    if t.len() > max {
+        return None;
+    }
+    let (p64, tag) = t.split_once('.')?;
+    let p = b64u_dec(p64)?;
+    (b64u(&p) == p64).then_some((p, tag))
+}
+
 /// `n` bytes from the OS CSPRNG. Not `rand`'s thread RNG: that one is a
 /// userspace generator a fork would duplicate.
 ///

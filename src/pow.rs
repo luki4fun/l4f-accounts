@@ -8,14 +8,19 @@
 //! Server signs a challenge; the browser brute-forces a counter until
 //! `SHA256(salt ++ n)` matches; the server re-checks one hash plus the signature.
 
-use hmac::{Hmac, Mac};
-use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::util::now_secs;
+use crate::util::{self, now_secs};
 
-type H = Hmac<Sha256>;
+/// Below this an ALTCHA key can be guessed or was mistyped, and a forged
+/// proof-of-work passes: `Accounts` keeps sign-up closed with a shorter one.
+pub const MIN_KEY_LEN: usize = 32;
+/// Longest ttl `issue` grants. `verify` refuses an expiry further out: only a
+/// forged challenge (a weak key) carries one, and its burn would last until it.
+pub const MAX_POW_TTL: u64 = 86_400;
+/// Slack for the wall clock stepping back while a challenge or its burn is live.
+const SKEW: u64 = 60;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Challenge {
@@ -47,20 +52,18 @@ pub enum PowErr {
     Forged,
 }
 
+/// `ttl_secs` is clamped to [`MAX_POW_TTL`].
 pub fn issue(key: &[u8], maxnumber: u32, ttl_secs: u64) -> Challenge {
-    let mut raw = [0u8; 12];
-    rand::rng().fill_bytes(&mut raw);
     // The trailing `&` ends the number. Without it, digits can move from the
     // solution into the salt with the hashed string unchanged, and the expiry
     // grows at will (ALTCHA's CVE-2025-68113).
-    let salt = format!("{}?expires={}&", hex::encode(raw), now_secs().saturating_add(ttl_secs));
-    let number = rand::rng().random_range(0..maxnumber.max(1)) as u64;
+    let salt = format!("{}?expires={}&", hex::encode(util::random::<12>()), now_secs().saturating_add(ttl_secs.min(MAX_POW_TTL)));
+    // The modulo bias is below 2^-32.
+    let number = u64::from_le_bytes(util::random()) % u64::from(maxnumber.max(1));
     let challenge = hex::encode(Sha256::digest(format!("{salt}{number}").as_bytes()));
-    let mut m = <H>::new_from_slice(key).expect("hmac accepts any key length");
-    m.update(challenge.as_bytes());
     Challenge {
         algorithm: "SHA-256",
-        signature: hex::encode(m.finalize().into_bytes()),
+        signature: hex::encode(util::mac_raw(key, challenge.as_bytes())),
         challenge,
         maxnumber,
         max_number: maxnumber,
@@ -68,18 +71,28 @@ pub fn issue(key: &[u8], maxnumber: u32, ttl_secs: u64) -> Challenge {
     }
 }
 
-/// Returns the challenge hex on success.
+/// Returns the challenge hex on success. The payload is the solution's JSON,
+/// as is or in base64 as the official widget sends it.
 ///
 /// The signature makes a challenge unforgeable but **not single-use** - the
 /// caller must burn the returned value (`RateLimiter::spend`), or one solved
 /// challenge registers unlimited accounts. [`Gate`] does.
-pub fn verify(key: &[u8], payload_json: &str) -> Result<String, PowErr> {
-    verify_until(key, payload_json).map(|(challenge, _)| challenge)
+pub fn verify(key: &[u8], payload: &str) -> Result<String, PowErr> {
+    verify_until(key, payload).map(|(challenge, _)| challenge)
 }
 
 /// `verify`, plus the signed expiry (unix seconds) the burn must outlive.
-fn verify_until(key: &[u8], payload_json: &str) -> Result<(String, u64), PowErr> {
-    let p: Payload = serde_json::from_str(payload_json).map_err(|_| PowErr::Malformed)?;
+fn verify_until(key: &[u8], payload: &str) -> Result<(String, u64), PowErr> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let payload = payload.trim();
+    let decoded;
+    let json = if payload.starts_with('{') {
+        payload.as_bytes()
+    } else {
+        decoded = STANDARD.decode(payload).map_err(|_| PowErr::Malformed)?;
+        &decoded[..]
+    };
+    let p: Payload = serde_json::from_slice(json).map_err(|_| PowErr::Malformed)?;
     if p.algorithm != "SHA-256" {
         return Err(PowErr::Malformed);
     }
@@ -90,17 +103,22 @@ fn verify_until(key: &[u8], payload_json: &str) -> Result<(String, u64), PowErr>
         .ok_or(PowErr::Malformed)?
         .parse()
         .map_err(|_| PowErr::Malformed)?;
-    if now_secs() > exp {
+    let now = now_secs();
+    if now > exp {
         return Err(PowErr::Expired);
+    }
+    // Further out than `issue` ever signs: only a forger picks that.
+    if exp - now > MAX_POW_TTL + SKEW {
+        return Err(PowErr::Malformed);
     }
     // One cheap hash before touching the HMAC.
     if hex::encode(Sha256::digest(format!("{}{}", p.salt, p.number).as_bytes())) != p.challenge {
         return Err(PowErr::WrongSolution);
     }
-    let mut m = <H>::new_from_slice(key).expect("hmac accepts any key length");
-    m.update(p.challenge.as_bytes());
-    m.verify_slice(&hex::decode(&p.signature).map_err(|_| PowErr::Malformed)?)
-        .map_err(|_| PowErr::Forged)?; // constant-time, free with hmac
+    let sig = hex::decode(&p.signature).map_err(|_| PowErr::Malformed)?;
+    if !util::ct_eq_bytes(&util::mac_raw(key, p.challenge.as_bytes()), &sig) {
+        return Err(PowErr::Forged);
+    }
     Ok((p.challenge, exp))
 }
 
@@ -109,15 +127,13 @@ fn verify_until(key: &[u8], payload_json: &str) -> Result<(String, u64), PowErr>
 /// not single-use: a replay within the accepted age passes, and the caller's
 /// rate limits are what stop that.
 pub fn stamp(key: &[u8], secs: u64) -> String {
-    let mut m = <H>::new_from_slice(key).expect("hmac accepts any key length");
-    m.update(secs.to_string().as_bytes());
-    format!("{secs}.{}", hex::encode(&m.finalize().into_bytes()[..16]))
+    format!("{secs}.{}", util::mac(key, &secs.to_string()))
 }
 
 pub fn stamp_age(key: &[u8], raw: &str) -> Option<u64> {
     let (secs, _) = raw.split_once('.')?;
     let secs: u64 = secs.parse().ok()?;
-    if !crate::util::ct_eq(&stamp(key, secs), raw) {
+    if !util::ct_eq(&stamp(key, secs), raw) {
         return None;
     }
     now_secs().checked_sub(secs)
@@ -131,8 +147,8 @@ pub fn stamp_age(key: &[u8], raw: &str) -> Option<u64> {
 /// Two halves, because the caller validates its own fields in between and the
 /// order matters: cheap junk is refused by [`Gate::precheck`] before it can
 /// spend the site-wide attempt cap that [`Gate::caps`] charges. Account counts
-/// are only peeked there; [`Permit::commit`] records them once the account
-/// really exists, so a mistyped password never costs someone their sign-up.
+/// are only peeked there; [`Permit::commit`] records them once the caller's
+/// own checks passed, so a mistyped password never costs someone their sign-up.
 ///
 /// Callers must hold one async lock from `precheck` to `commit`, or parallel
 /// posts all pass the same peek before any of them counts.
@@ -198,10 +214,12 @@ pub struct Gate<'a> {
     pub bucket: &'a str,
 }
 
-/// Returned by [`Gate::caps`]; records the account caps when committed. Owns
-/// its keys so it can move into the task that creates the account: a client
-/// that hangs up must not stop an account that gets created from being counted.
-#[must_use = "commit() once the account exists, or the caps never count it"]
+/// Returned by [`Gate::caps`]; records the account caps when committed. A
+/// client that hangs up drops the request's future, so commit where that
+/// cannot skip it for an account that gets created: right before the INSERT
+/// (a lost race or a database error then counts one too many), or in a
+/// spawned task that creates the account, which is why it owns its keys.
+#[must_use = "commit() it with the account's creation, or the caps never count it"]
 pub struct Permit {
     ns: String,
     bucket: String,
@@ -216,8 +234,9 @@ impl<'a> Gate<'a> {
     /// work (burned, so one solution is one sign-up) or, without JavaScript, a
     /// much stricter one-per-day cap that is only peeked here.
     ///
-    /// `with_pow` false skips the PoW and the no-JS cap entirely: for a form that
-    /// only exists after a provider already vouched for a human (social sign-up).
+    /// `with_pow` false skips the PoW and the no-JS cap entirely: for a host
+    /// form with a human check of its own. The crate's sign-up forms, social
+    /// sign-up included, all pass true.
     pub fn precheck(&self, p: Proof<'_>, with_pow: bool) -> Result<bool, Deny> {
         let (ns, b, l) = (self.ns, self.bucket, self.limits);
         // Another site submitting the form through a visitor's browser would get
@@ -257,7 +276,7 @@ impl<'a> Gate<'a> {
             // The signature proves the challenge is ours, not that it is unused.
             // Burned until its own signed expiry, not the configured ttl, which
             // a reload may have shortened since it was issued.
-            let ttl = std::time::Duration::from_secs(exp.saturating_sub(now_secs()) + 60);
+            let ttl = std::time::Duration::from_secs(exp.saturating_sub(now_secs()) + SKEW);
             if !self.limiter.spend(&format!("{ns}:pow:{challenge}"), ttl) {
                 return Err(deny("bad_pow", "That anti-spam check was already used. Please try again."));
             }
@@ -362,12 +381,56 @@ mod tests {
         assert_eq!(verify(k, &p.to_string()), Err(PowErr::Malformed));
     }
 
+    /// The official widget posts base64 of the JSON (GATES-7).
+    #[test]
+    fn accepts_the_widgets_base64_payload() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let k = b"powkey";
+        let c = issue(k, 500, 600);
+        assert_eq!(verify(k, &STANDARD.encode(solve(&c))), Ok(c.challenge.clone()));
+        assert_eq!(verify(k, &format!(" {}\n", solve(&c))), Ok(c.challenge), "raw JSON too");
+        assert_eq!(verify(k, "not base64!"), Err(PowErr::Malformed));
+        assert_eq!(verify(k, &STANDARD.encode("[1]")), Err(PowErr::Malformed));
+    }
+
+    /// A challenge signed with the key itself, for an expiry `issue` never
+    /// grants: what a weak key lets anyone forge (GATES-4).
+    fn signed(k: &[u8], exp: u64) -> String {
+        use hmac::{Hmac, Mac};
+        let salt = format!("00?expires={exp}&");
+        let challenge = hex::encode(Sha256::digest(format!("{salt}0").as_bytes()));
+        let mut m = Hmac::<Sha256>::new_from_slice(k).unwrap();
+        m.update(challenge.as_bytes());
+        let signature = hex::encode(m.finalize().into_bytes());
+        serde_json::json!({ "algorithm": "SHA-256", "challenge": challenge, "number": 0, "salt": salt, "signature": signature })
+            .to_string()
+    }
+
+    #[test]
+    fn the_expiry_is_bounded() {
+        let k = b"powkey";
+        let c = issue(k, 10, u64::MAX);
+        let exp: u64 = c.salt.split_once("?expires=").unwrap().1.trim_end_matches('&').parse().unwrap();
+        assert!(exp <= now_secs() + MAX_POW_TTL, "issue clamps the ttl");
+        assert!(verify(k, &solve(&c)).is_ok());
+        assert!(verify(k, &signed(k, now_secs() + MAX_POW_TTL)).is_ok());
+        assert_eq!(verify(k, &signed(k, now_secs() + MAX_POW_TTL + SKEW + 5)), Err(PowErr::Malformed));
+        assert_eq!(verify(k, &signed(k, u64::MAX)), Err(PowErr::Malformed), "would have panicked the limiter");
+    }
+
     #[test]
     fn stamp_rejects_backdating() {
         let k = b"powkey";
         let s = stamp(k, now_secs() - 10);
         assert!(stamp_age(k, &s).unwrap() >= 10);
         assert_eq!(stamp_age(k, "9999.deadbeef"), None, "unsigned stamp must be refused");
+    }
+
+    /// A form rendered before an upgrade carries a stamp the old code made:
+    /// HMAC-SHA256 over the decimal seconds, its first 16 bytes in hex.
+    #[test]
+    fn stamp_spelling_is_fixed() {
+        assert_eq!(stamp(b"powkey", 1_700_000_000), "1700000000.b067c047a0c7ecd540d76793c255f999");
     }
 
     fn gate<'a>(l: &'a crate::limit::RateLimiter, lim: &'a Limits) -> Gate<'a> {
