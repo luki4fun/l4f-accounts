@@ -74,3 +74,23 @@ fn version_1_vectors_open_with_ring() {
     let wrong = format!("l4f-vault-item/v1|{}|{kind}|{id}", "ff".repeat(16));
     assert!(k.open_in_place(aead::Nonce::try_assume_unique_for_key(&item[9..21]).unwrap(), aead::Aad::from(wrong.as_bytes()), &mut buf).is_err());
 }
+
+/// The browser side under Node: tests/vault_vectors.mjs rebuilds these vectors
+/// with assets/vault.js, tests/sync_flows.mjs drives assets/sync.js. Skipped,
+/// and passing, where node is not on PATH.
+#[test]
+fn the_browser_side_passes_under_node() {
+    for script in ["tests/vault_vectors.mjs", "tests/sync_flows.mjs"] {
+        let run = std::process::Command::new("node").arg(script).current_dir(env!("CARGO_MANIFEST_DIR")).output();
+        let out = match run {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node is not on PATH: {script} not run");
+                return;
+            }
+            Err(e) => panic!("node {script}: {e}"),
+        };
+        let say = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        assert!(out.status.success(), "node {script} failed:\n{}{}", say(&out.stdout), say(&out.stderr));
+    }
+}

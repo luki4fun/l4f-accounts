@@ -1,14 +1,20 @@
 // Opt-in sync of the site's `store` settings for a signed-in account: local
 // first, pulled once per page, every change pushed as one compare-and-set
 // write. The host imports this only while the sync hint cookie is set, or to
-// clean up after it went away (signed out, sync turned off).
+// clean up after a sign-out cleared it. Turning sync off keeps the hint until
+// the next pull, whose 409 clears it: this browser then keeps every value.
 const API = '/account/api/kv';
 // What the server last confirmed, per key: { version, json }. Lets a later
 // sign-out remove exactly what came from the server and nothing changed here.
 const ACKED = 'l4f-sync:acked';
+// `account.epoch` of the server's copy ACKED is about. Turning sync on starts
+// a new copy under a new epoch, after the old one was deleted with sync off.
+const EPOCH = 'l4f-sync:epoch';
 
 function readAcked() { try { return JSON.parse(localStorage.getItem(ACKED) || '{}') || {}; } catch { return {}; } }
 function writeAcked(a) { try { localStorage.setItem(ACKED, JSON.stringify(a)); } catch { /* storage full or blocked */ } }
+function readEpoch() { try { return localStorage.getItem(EPOCH) || ''; } catch { return ''; } }
+function writeEpoch(e) { try { localStorage.setItem(EPOCH, e); } catch { /* storage full or blocked */ } }
 function rawGet(k) { try { return localStorage.getItem(`l4f:${k}`); } catch { return null; } }
 function rawSet(k, json) { try { localStorage.setItem(`l4f:${k}`, json); } catch { /* storage full or blocked */ } }
 function rawDel(k) { try { localStorage.removeItem(`l4f:${k}`); } catch { /* nothing to delete */ } }
@@ -27,7 +33,7 @@ function localKeys() {
 export function cleanup() {
   const acked = readAcked();
   Object.keys(acked).forEach((k) => { if (rawGet(k) === acked[k].json) rawDel(k); });
-  try { localStorage.removeItem(ACKED); } catch { /* storage blocked */ }
+  try { localStorage.removeItem(ACKED); localStorage.removeItem(EPOCH); } catch { /* storage blocked */ }
 }
 
 // Both sides changed: this browser wins, except My links, which become the
@@ -49,7 +55,8 @@ export function attach(store) {
   let csrf = '';
   const acked = readAcked();
   const headers = (version) => ({ 'Content-Type': 'application/json', 'X-CSRF': csrf, 'If-Match': String(version) });
-  // Signed out or sync off: stop, and clean up what came from the server.
+  // Signed out (401) or no longer allowed to sync (403): stop, and clean up
+  // what came from the server. Sync off is the pull's 409, which keeps it.
   const gone = (r) => {
     if (r.status !== 401 && r.status !== 403) return false;
     cleanup();
@@ -87,9 +94,24 @@ export function attach(store) {
 
   fetch(API, { credentials: 'same-origin' })
     .then((r) => {
-      if (gone(r) || !r.ok) return undefined;
+      if (gone(r)) return undefined;
+      // Sync is off and the server's copy deleted: keep every value here,
+      // forget only what the server had confirmed, and stop.
+      if (r.status === 409) {
+        try { localStorage.removeItem(ACKED); } catch { /* storage blocked */ }
+        return undefined;
+      }
+      if (!r.ok) return undefined;
       return r.json().then((j) => {
         csrf = j.csrf;
+        // Not the copy ACKED is about (sync went off and on since, or no epoch
+        // was kept): nothing in ACKED was deleted elsewhere then, and every
+        // key here goes up as new. Another account's ACKED stays, to clear
+        // what came from that account.
+        const epoch = `${j.account}.${j.epoch || ''}`;
+        const was = readEpoch();
+        if (was !== epoch && (!was || was.startsWith(`${j.account}.`))) Object.keys(acked).forEach((k) => { delete acked[k]; });
+        writeEpoch(epoch);
         const seen = new Set();
         j.items.forEach((it) => {
           seen.add(it.k);

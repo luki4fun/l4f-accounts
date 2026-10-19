@@ -4,7 +4,9 @@
 // shown only when this browser holds a key). No inline script, no HTML strings.
 (function () {
   'use strict';
-  var DB = 'l4f-account', STORE = 'devkey', SLOT = 'this';
+  // A new key waits under PENDING until the server takes it, so a failed try
+  // never touches the key this browser may already hold under SLOT.
+  var DB = 'l4f-account', STORE = 'devkey', SLOT = 'this', PENDING = 'pending';
   var enc = new TextEncoder();
 
   function idb(mode, fn) {
@@ -19,9 +21,9 @@
       };
     });
   }
-  var load = function () { return idb('readonly', function (s) { return s.get(SLOT); }); };
-  var save = function (v) { return idb('readwrite', function (s) { return s.put(v, SLOT); }); };
-  var forget = function () { return idb('readwrite', function (s) { return s.delete(SLOT); }); };
+  var load = function (slot) { return idb('readonly', function (s) { return s.get(slot); }); };
+  var save = function (slot, v) { return idb('readwrite', function (s) { return s.put(v, slot); }); };
+  var forget = function (slot) { return idb('readwrite', function (s) { return s.delete(slot); }); };
 
   function b64u(bytes) {
     var s = '';
@@ -53,23 +55,27 @@
   }
 
   function add(b) {
-    var base = b.dataset.base, csrf = b.dataset.csrf, id = crypto.getRandomValues(new Uint8Array(16)), pair, token;
+    var base = b.dataset.base, csrf = b.dataset.csrf, id = crypto.getRandomValues(new Uint8Array(16)), pair, token, rec;
     return post(base + '/devkey/options/add', {}, csrf)
       .then(function (o) { token = o.token; return crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']); })
-      .then(function (p) { pair = p; return save({ id: id, key: p.privateKey, user: b.dataset.user || '' }); })
+      .then(function (p) { pair = p; return save(PENDING, { id: id, key: p.privateKey, user: b.dataset.user || '' }); })
       // Stored and read back before the server learns of it: some browsers
       // cannot keep a CryptoKey in IndexedDB, and a key that is gone after a
       // reload must never be enrolled.
-      .then(load)
-      .then(function (rec) {
+      .then(function () { return load(PENDING); })
+      .then(function (r) {
+        rec = r;
         if (!rec || !rec.key) throw new Error('This browser cannot keep the key.');
         return Promise.all([crypto.subtle.exportKey('raw', pair.publicKey), sign(rec.key, id, token)]);
       })
       .then(function (r) {
         return post(base + '/devkey/add', { token: token, device_id: b64u(id), public_key: b64u(r[0]), signature: b64u(r[1]) }, csrf);
       })
-      .then(function (r) { location.assign(r.next); })
-      .catch(function (e) { forget(); throw e; });
+      // Taken: the new key replaces the old one, in one transaction.
+      .then(function (r) {
+        return idb('readwrite', function (s) { s.delete(PENDING); return s.put(rec, SLOT); }).then(function () { location.assign(r.next); });
+      })
+      .catch(function (e) { forget(PENDING); throw e; });
   }
 
   function login(b, rec) {
@@ -83,7 +89,7 @@
       .catch(function (e) {
         // Revoked or expired on the server: this key is no use any more. A
         // challenge that merely timed out is no reason to forget it.
-        if (e.status === 400 && /not remembered/.test(e.message)) { forget(); b.hidden = true; }
+        if (e.status === 400 && /not remembered/.test(e.message)) { forget(SLOT); b.hidden = true; }
         throw e;
       });
   }
@@ -98,7 +104,7 @@
       b.addEventListener('click', function () { say(''); b.disabled = true; add(b).catch(fail); });
       return;
     }
-    load().then(function (rec) {
+    load(SLOT).then(function (rec) {
       if (!rec || !rec.key) return;
       if (rec.user) b.textContent = 'Sign in as ' + rec.user;
       b.hidden = false;

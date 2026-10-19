@@ -15,7 +15,9 @@ The vault does protect against:
 - A database or backup leak.
 - An operator browsing the tables.
 
-It does **not** protect against a malicious or compromised server, because that server also serves `vault.js`. A changed script can read what you unlock. Changing the passphrase re-wraps the vault key. A backup taken before the change can still be opened with the old passphrase.
+It does **not** protect against a malicious or compromised server, because that server also serves `vault.js`. A changed script can read what you unlock.
+
+A passphrase change keeps the DEK and only re-wraps it. So the old passphrase still opens any older copy of the `pass` slot, from a backup or a dump taken before the change. The DEK from that copy then opens every item in any later leak, also the items written after the change. The recovery key works the same way. The page cannot replace or revoke it, and a new recovery slot under the same DEK would not help. If the old passphrase or the recovery key leaked, only a DEK rotation locks out someone who holds an older copy of a slot, and the page does not offer rotation yet (see Operations).
 
 ## Keys
 
@@ -74,16 +76,17 @@ offset  size  field
 ## Operations
 
 - **Create the vault:**
-  1. Generate the DEK.
-  2. Write a `pass` slot.
-  3. Write a `recovery` slot.
-  4. Show the recovery key once.
+  1. Fetch the slots. If there are any, the vault exists: unlock it instead. This stops a retry or a second tab. It cannot stop two creates at the very same moment, because the server takes any number of slots.
+  2. Generate the DEK.
+  3. Write a `pass` slot.
+  4. Write a `recovery` slot. If either write fails, delete both slots again, best effort, with `If-Match: 0` (any version): a write whose answer was lost may still have landed.
+  5. Show the recovery key once, as soon as both slots are written.
 - **Unlock:**
   1. Fetch the slots.
-  2. Derive the KEK for the chosen slot.
+  2. Derive the KEK for a slot of the chosen kind. With more than one, try first the slot whose `dek_id` the most items carry in their header, then the others.
   3. Unwrap the DEK.
   4. Import it as a **non-extractable** CryptoKey.
-- **Change passphrase:** unwrap the DEK, then write a new `pass` slot under the same slot id. No item is touched.
+- **Change passphrase:** unwrap the DEK with the current passphrase or with the recovery key, then write a new `pass` slot. With the passphrase, it replaces the `pass` slot that opened (same id, compare-and-set on its version). With the recovery key, it replaces the `pass` slot with the same `dek_id`, or gets a new id if there is none. The DEK stays the same and no item is touched; the threat model above says what that leaves open.
 - **Add a passkey slot:** in the same `get()` that unlocks, pass `prf: { eval: { first: prf_salt } }`, then write a `prf` slot. (Defined for the format; the page does not offer it yet.)
 - **Rotate the DEK** (defined for the format; the page does not offer it yet), after a suspected leak or before 2^32 writes:
   1. Decrypt every item.
@@ -94,9 +97,13 @@ offset  size  field
 
 ## Test vectors
 
-`tests/vault_vectors.rs` decrypts fixed vectors (`tests/fixtures/vault/v1.json`, made by `assets/vault.js` under Node's WebCrypto) with ring and so pins this layout:
+`tests/fixtures/vault/v1.json` holds fixed vectors, made by `assets/vault.js` under Node's WebCrypto:
 - a `pass` slot (iter 600 000)
 - a `recovery` slot
 - one `totp` item
+
+Two tests pin this layout with them:
+- `tests/vault_vectors.rs` decrypts them with ring (`cargo test`).
+- `tests/vault_vectors.mjs` runs `assets/vault.js` itself: `node tests/vault_vectors.mjs` (Node 22, no packages). It opens the `pass` slot for the DEK and rebuilds both slots and the item byte for byte from the vectors' salts and IVs. It also checks that a wrong secret fails with an `OperationError`, that a slot under 600 000 rounds is refused, and that the passphrase is NFC-normalised. `cargo test` runs it too when `node` is on PATH, and skips it otherwise.
 
 A client change that breaks them is a format change. It needs `v: 2` and a migration, never an edit to version 1.

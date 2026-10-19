@@ -1,7 +1,8 @@
 // The end-to-end encrypted vault (docs/vault-format.md, version 1). Every
 // key is made and used here, with WebCrypto; the server stores ciphertext.
-// The format functions are exported so a test can produce the vectors the
-// Rust side decrypts. The page part runs only where #vault exists.
+// The format functions are exported for tests/vault_vectors.mjs, which
+// rebuilds the vectors the Rust side decrypts. The page part runs only where
+// #vault exists.
 // No inline script, no HTML strings: text goes in with textContent only.
 
 const subtle = globalThis.crypto.subtle;
@@ -71,6 +72,23 @@ export async function openSlot(account, slot, kek) {
   const pt = await subtle.decrypt({ name: 'AES-GCM', iv: unb64u(slot.iv), additionalData: slotAad(account, slot.id) }, kek, unb64u(slot.ct));
   return new Uint8Array(pt);
 }
+/** A `pass` slot, as creating the vault and changing the passphrase write it. */
+export async function passSlot(account, id, pass, dek, salt = random(16), iv = random(12)) {
+  const kdf = { alg: 'PBKDF2-SHA256', iter: PBKDF2_ITER, salt: b64u(salt) };
+  return makeSlot(account, id, 'pass', kdf, await kekFromPassphrase(pass, salt, PBKDF2_ITER), dek, iv);
+}
+/** A `recovery` slot for the 32 random bytes shown as the recovery key. */
+export async function recoverySlot(account, id, secret, dek, salt = random(32), iv = random(12)) {
+  const kdf = { alg: 'HKDF-SHA256', salt: b64u(salt), info: HKDF_INFO };
+  return makeSlot(account, id, 'recovery', kdf, await kekFromSecret(secret, salt), dek, iv);
+}
+/** The raw DEK, opened with the passphrase or the recovery key as typed. A wrong one throws an OperationError. */
+export async function unwrap(account, slot, secret) {
+  const kek = slot.kind === 'pass'
+    ? await kekFromPassphrase(secret, unb64u(slot.kdf.salt), slot.kdf.iter)
+    : await kekFromSecret(unbase32(secret), unb64u(slot.kdf.salt));
+  return openSlot(account, slot, kek);
+}
 export async function dekKey(dek) {
   return subtle.importKey('raw', dek, 'AES-GCM', false, ['encrypt', 'decrypt']);
 }
@@ -105,6 +123,8 @@ function page(root) {
     return e;
   };
   const say = (msg, good) => { const n = root.querySelector('#vault-msg'); n.className = good ? 'notice good mt-2' : 'notice mt-2'; n.textContent = msg; n.hidden = !msg; };
+  // Some errors carry no message (WebCrypto's, in Chromium): never say nothing.
+  const fail = (err) => say(err.message || 'Something went wrong.');
   const call = (method, path, body, version, type = 'application/json') =>
     fetch(`${API}${path}`, { method, credentials: 'same-origin', headers: { 'Content-Type': type, 'X-CSRF': csrf, 'If-Match': String(version || 0) }, body })
       .then((r) => {
@@ -119,6 +139,43 @@ function page(root) {
   });
   const view = (...kids) => { const body = root.querySelector('#vault-body'); body.replaceChildren(...kids); };
   const busy = (form, on) => form.querySelectorAll('button').forEach((b) => { b.disabled = on; });
+  // The unlocked view again once a write is done, unless the vault was locked
+  // (or opened with another key) while it was in flight.
+  const redraw = (k) => () => (key === k ? unlocked() : undefined);
+
+  // Each vault form names its own credential, so a password manager files the
+  // vault passphrase apart from the account password.
+  const who = () => h('input', { type: 'text', name: 'username', value: `vault:${account}`, autocomplete: 'username', hidden: true });
+
+  // How to open the vault: the passphrase, or the recovery key in a plain text
+  // field of its own that no password manager takes for a password. The two
+  // inputs are named after the slot kinds; `p` prefixes their ids.
+  function opener(p, label, passLabel) {
+    const pass = h('input', { type: 'password', id: `${p}pass`, name: 'pass', autocomplete: 'current-password', required: true });
+    const rec = h('input', { type: 'text', id: `${p}recovery`, name: 'recovery', autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', required: true, disabled: true });
+    const pf = h('div', { class: 'field' }, h('label', { for: pass.id }, passLabel), pass);
+    const rf = h('div', { class: 'field', hidden: true }, h('label', { for: rec.id }, 'Recovery key'), rec);
+    const how = h('select', { id: `${p}how`, name: 'how', onchange: () => {
+      const r = how.value === 'recovery';
+      pf.hidden = pass.disabled = r; rf.hidden = rec.disabled = !r;
+    } }, h('option', { value: 'pass' }, 'the passphrase'), h('option', { value: 'recovery' }, 'the recovery key'));
+    return [h('div', { class: 'field' }, h('label', { for: how.id }, label), how), pf, rf];
+  }
+
+  // The slots of one kind, those whose key opens the most items first: a
+  // create that failed halfway may have left a slot whose key opens nothing.
+  const slotsOf = (kind) => {
+    const opens = (s) => state.items.filter((it) => b64u(it.bytes.slice(1, 9)) === s.dek_id).length;
+    return state.slots.filter((s) => s.kind === kind).sort((a, b) => opens(b) - opens(a));
+  };
+  // The raw DEK and the slot that gave it, trying the slots of `kind` in turn.
+  async function openAny(kind, secret) {
+    let last = new Error('That way to unlock is not set up.');
+    for (const slot of slotsOf(kind)) {
+      try { return { slot, dek: await unwrap(account, slot, secret) }; } catch (err) { last = err; }
+    }
+    throw last;
+  }
 
   function create() {
     const form = h('form', { class: 'narrow mt-2', onsubmit: (e) => {
@@ -128,22 +185,31 @@ function page(root) {
       if (p1 !== p2) return say('The two passphrases differ.');
       busy(form, true); say('Creating… this takes a moment.', true);
       (async () => {
+        // A second tab, or a try that failed halfway, may have made one already.
+        await load();
+        if (state.slots.length) { say('The vault exists already. Unlock it.'); return locked(); }
         const dek = random(32), recovery = random(32);
         const passId = b64u(random(16)), recId = b64u(random(16));
-        const salt = random(16), rsalt = random(32);
-        const pass = await makeSlot(account, passId, 'pass', { alg: 'PBKDF2-SHA256', iter: PBKDF2_ITER, salt: b64u(salt) }, await kekFromPassphrase(p1, salt, PBKDF2_ITER), dek);
-        const rec = await makeSlot(account, recId, 'recovery', { alg: 'HKDF-SHA256', salt: b64u(rsalt), info: HKDF_INFO }, await kekFromSecret(recovery, rsalt), dek);
-        await call('PUT', `/slots/${passId}`, JSON.stringify(pass), 0);
-        await call('PUT', `/slots/${recId}`, JSON.stringify(rec), 0);
+        const pass = await passSlot(account, passId, p1, dek), rec = await recoverySlot(account, recId, recovery, dek);
+        try {
+          await call('PUT', `/slots/${passId}`, JSON.stringify(pass), 0);
+          await call('PUT', `/slots/${recId}`, JSON.stringify(rec), 0);
+        } catch (err) {
+          // Half a vault is worse than none, and a write whose answer was lost
+          // may still have landed: take both back. If-Match 0 deletes any version.
+          await Promise.all([passId, recId].map((id) => call('DELETE', `/slots/${id}`, undefined, 0).catch(() => {})));
+          throw err;
+        }
         key = await dekKey(dek); keyIdBytes = await dekId(dek);
-        await load();
         say('');
+        // Shown as soon as it is stored; the refresh after it fails on its own.
         view(h('div', { class: 'callout warn mt-2' },
           h('p', {}, 'Your recovery key, shown only now. Write it down and keep it apart from the passphrase: with neither, nothing in the vault can be read again, by you or anyone.'),
           h('p', { class: 'mono big anywhere' }, base32(recovery))),
-        h('button', { class: 'btn mt-2', type: 'button', onclick: () => unlocked() }, 'I wrote it down'));
-      })().catch((err) => { say(err.message); busy(form, false); });
+        h('button', { class: 'btn mt-2', type: 'button', onclick: () => load().then(unlocked).catch(fail) }, 'I wrote it down'));
+      })().catch((err) => { fail(err); busy(form, false); });
     } },
+    who(),
     h('div', { class: 'field' }, h('label', { for: 'p1' }, 'Vault passphrase'), h('input', { type: 'password', id: 'p1', name: 'p1', autocomplete: 'new-password', required: true })),
     h('div', { class: 'field' }, h('label', { for: 'p2' }, 'The same again'), h('input', { type: 'password', id: 'p2', name: 'p2', autocomplete: 'new-password', required: true })),
     h('p', { class: 'hint' }, 'Not your account password. The server never sees it; nobody can reset it.'),
@@ -151,27 +217,17 @@ function page(root) {
     view(h('p', {}, 'Your vault is empty. Create it with a passphrase.'), form);
   }
 
-  async function unwrap(slot, secret) {
-    const kek = slot.kind === 'pass'
-      ? await kekFromPassphrase(secret, unb64u(slot.kdf.salt), slot.kdf.iter)
-      : await kekFromSecret(unbase32(secret), unb64u(slot.kdf.salt));
-    return openSlot(account, slot, kek);
-  }
-
   function locked() {
     const form = h('form', { class: 'narrow mt-2', onsubmit: (e) => {
       e.preventDefault();
-      const useRecovery = form.elements.how.value === 'recovery';
-      const slot = state.slots.find((s) => s.kind === (useRecovery ? 'recovery' : 'pass'));
-      if (!slot) return say('That way to unlock is not set up.');
+      const kind = form.elements.how.value;
+      if (!slotsOf(kind).length) return say('That way to unlock is not set up.');
       busy(form, true); say('Unlocking…', true);
-      unwrap(slot, form.elements.secret.value)
-        .then(async (dek) => { key = await dekKey(dek); keyIdBytes = await dekId(dek); say(''); unlocked(); })
+      openAny(kind, form.elements[kind].value)
+        .then(async ({ dek }) => { key = await dekKey(dek); keyIdBytes = await dekId(dek); say(''); unlocked(); })
         .catch(() => { say('That does not unlock the vault.'); busy(form, false); });
     } },
-    h('div', { class: 'field' }, h('label', { for: 'how' }, 'Unlock with'),
-      h('select', { id: 'how', name: 'how' }, h('option', { value: 'pass' }, 'the passphrase'), h('option', { value: 'recovery' }, 'the recovery key'))),
-    h('div', { class: 'field' }, h('label', { for: 'secret' }, 'Passphrase or recovery key'), h('input', { type: 'password', id: 'secret', name: 'secret', autocomplete: 'current-password', required: true })),
+    who(), opener('', 'Unlock with', 'Vault passphrase'),
     h('button', { class: 'btn', type: 'submit' }, 'Unlock'));
     view(form);
   }
@@ -185,7 +241,7 @@ function page(root) {
         rows.push(h('tr', {}, h('td', {}, kind), h('td', {}, v.name || ''), h('td', { class: 'mono small anywhere' }, v.secret || ''),
           h('td', {}, h('button', { class: 'btn btn-sm btn-quiet', type: 'button', onclick: () => {
             if (!confirm(`Delete ${v.name || 'this entry'}?`)) return;
-            call('DELETE', `/items/${it.k}`, undefined, it.version).then(load).then(unlocked).catch((err) => say(err.message));
+            call('DELETE', `/items/${it.k}`, undefined, it.version).then(load).then(redraw(key)).catch(fail);
           } }, 'Delete'))));
       } catch { rows.push(h('tr', {}, h('td', { colspan: '4', class: 'muted' }, `${it.k}: cannot be opened with this key`))); }
     }
@@ -196,7 +252,7 @@ function page(root) {
       busy(add, true);
       sealItem(account, kind, id, key, keyIdBytes, value)
         .then((bytes) => call('PUT', `/items/${id}`, bytes, 0, 'application/octet-stream'))
-        .then(load).then(unlocked).catch((err) => { say(err.message); busy(add, false); });
+        .then(load).then(redraw(key)).catch((err) => { fail(err); busy(add, false); });
     } },
     h('h2', {}, 'Add an entry'),
     h('div', { class: 'field' }, h('label', { for: 'kind' }, 'Kind'), h('select', { id: 'kind', name: 'kind' }, KINDS.map((k) => h('option', { value: k }, k)))),
@@ -205,21 +261,34 @@ function page(root) {
     h('button', { class: 'btn btn-sm', type: 'submit' }, 'Save'));
     const change = h('form', { class: 'narrow mt-3', onsubmit: (e) => {
       e.preventDefault();
-      const slot = state.slots.find((s) => s.kind === 'pass');
-      const np = change.elements.np.value;
+      const f = change.elements, kind = f.how.value, np = f.np.value;
+      if (!slotsOf(kind).length) return say('That way to unlock is not set up.');
       if (np.length < 12) return say('Use at least 12 characters for the vault passphrase.');
+      if (np !== f.np2.value) return say('The two passphrases differ.');
       busy(change, true); say('Changing…', true);
       (async () => {
-        const dek = await unwrap(slot, change.elements.op.value);
-        const salt = random(16);
-        const fresh = await makeSlot(account, slot.id, 'pass', { alg: 'PBKDF2-SHA256', iter: PBKDF2_ITER, salt: b64u(salt) }, await kekFromPassphrase(np, salt, PBKDF2_ITER), dek);
-        await call('PUT', `/slots/${slot.id}`, JSON.stringify(fresh), slot.version);
-        await load(); say('Passphrase changed.', true); busy(change, false); change.reset();
-      })().catch((err) => { say(err.message === 'The operation failed for an operation-specific reason' ? 'The current passphrase is wrong.' : err.message); busy(change, false); });
+        const { slot, dek } = await openAny(kind, f[kind].value);
+        // Replace the pass slot that opened, else the one wrapping this DEK;
+        // with neither, start a new one.
+        const kid = b64u(await dekId(dek));
+        const old = kind === 'pass' ? slot : slotsOf('pass').find((s) => s.dek_id === kid);
+        const fresh = await passSlot(account, old ? old.id : b64u(random(16)), np, dek);
+        const { version } = await call('PUT', `/slots/${fresh.id}`, JSON.stringify(fresh), old ? old.version : 0);
+        // Changed, whatever the refresh says: the new slot stands in until it answers.
+        state.slots = [...state.slots.filter((s) => s.id !== fresh.id), { ...fresh, version }];
+        await load().catch(() => {});
+        say('Passphrase changed.', true); busy(change, false);
+        change.reset(); f.how.dispatchEvent(new Event('change'));
+      })().catch((err) => {
+        const wrong = kind === 'pass' ? 'The current passphrase is wrong.' : 'That recovery key is wrong.';
+        say(err.name === 'OperationError' ? wrong : (err.message || 'Something went wrong.'));
+        busy(change, false);
+      });
     } },
     h('h2', {}, 'Change the passphrase'),
-    h('div', { class: 'field' }, h('label', { for: 'op' }, 'Current passphrase'), h('input', { type: 'password', id: 'op', name: 'op', autocomplete: 'current-password', required: true })),
+    who(), opener('o', 'Confirm with', 'Current passphrase'),
     h('div', { class: 'field' }, h('label', { for: 'np' }, 'New passphrase'), h('input', { type: 'password', id: 'np', name: 'np', autocomplete: 'new-password', required: true })),
+    h('div', { class: 'field' }, h('label', { for: 'np2' }, 'The same again'), h('input', { type: 'password', id: 'np2', name: 'np2', autocomplete: 'new-password', required: true })),
     h('button', { class: 'btn btn-sm btn-quiet', type: 'submit' }, 'Change'));
     view(
       h('div', { class: 'spread' }, h('p', { class: 'muted' }, `${state.items.length} entries`),
@@ -228,5 +297,5 @@ function page(root) {
       add, change);
   }
 
-  load().then(() => (state.slots.length ? locked() : create())).catch((err) => say(err.message));
+  load().then(() => (state.slots.length ? locked() : create())).catch(fail);
 }
