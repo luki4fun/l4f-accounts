@@ -1,6 +1,7 @@
 //! The password page, and with mail: the address, its confirmation link,
 //! and resetting a forgotten password. Link pages show a button whose POST
-//! uses the token, so a mail scanner opening the link changes nothing.
+//! uses the token, so a mail scanner opening the link changes nothing. The
+//! confirmation link works in a signed-in session of its account only.
 
 use askama::Template;
 use axum::{
@@ -13,11 +14,9 @@ use serde::Deserialize;
 
 use super::auth::need_fresh;
 use super::flash;
-use super::{Authed, BASE, St, WebHost, page, refused, status_of};
+use super::{Authed, BASE, SECURITY_PAGE, St, WebHost, page, refused, status_of};
 use crate::password::MAX_LEN;
 use crate::service::{Accounts, Ctx, Error};
-
-const SECURITY_PAGE: &str = "/account/security";
 
 // ---- changing the password while signed in
 
@@ -67,7 +66,7 @@ pub(super) async fn password<H: WebHost>(State(a): St<H>, me: Authed, ctx: Ctx, 
     }
     match a.password_change(&ctx, &me.user, &me.session, &f.password).await {
         Ok(()) => flash::to(&a.keys, SECURITY_PAGE, true, "Password changed. Every other session is signed out.", &[]),
-        Err(e @ (Error::Invalid(_) | Error::Busy)) => password_page(&a, &h, status_of(&e), &me, Some(e.message())),
+        Err(e @ (Error::Invalid(_) | Error::Busy | Error::RateLimited)) => password_page(&a, &h, status_of(&e), &me, Some(e.message())),
         Err(e) => refused(&a, &h, &e),
     }
 }
@@ -79,8 +78,11 @@ pub(super) use with_mail::*;
 
 #[cfg(feature = "email")]
 mod with_mail {
+    use super::super::{LOGIN_PAGE, Viewer, see_other};
     use super::*;
+    use crate::util;
     use axum::extract::Query;
+    use axum::http::{HeaderValue, header};
 
     #[derive(Template)]
     #[template(path = "email.html")]
@@ -147,23 +149,39 @@ mod with_mail {
         t: String,
     }
 
+    /// For a page whose URL carries a link's token: what it loads or links
+    /// to learns the site, never the URL. Not `no-referrer`: under it a
+    /// browser without Fetch Metadata posts the page's own form with
+    /// `Origin: null`, which the CSRF layer refuses.
+    fn token_page(mut r: Response) -> Response {
+        r.headers_mut().insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin"));
+        r
+    }
+
     #[derive(Template)]
     #[template(path = "verify_email.html")]
     struct VerifyTpl<'a> {
         base: &'static str,
         t: &'a str,
-        csrf: Option<String>,
+        csrf: &'a str,
     }
 
-    pub(in super::super) async fn verify_form<H: WebHost>(State(a): St<H>, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
-        let t = VerifyTpl { base: BASE, t: &q.t, csrf: super::super::csrf_for_cookie(&a, &h) };
-        page(&a, &h, "Confirm your address", StatusCode::OK, &t)
+    /// Behind a sign-in, which comes back here: the POST takes the session's
+    /// account, and only the one the link is for.
+    pub(in super::super) async fn verify_form<H: WebHost>(State(a): St<H>, me: Authed, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
+        let t = VerifyTpl { base: BASE, t: &q.t, csrf: me.csrf() };
+        token_page(page(&a, &h, "Confirm your address", StatusCode::OK, &t))
     }
 
-    pub(in super::super) async fn verify<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, Form(q): Form<TokenQuery>) -> Response {
-        match a.email_confirm(&ctx, &q.t).await {
+    pub(in super::super) async fn verify<H: WebHost>(State(a): St<H>, Viewer(me): Viewer, ctx: Ctx, h: HeaderMap, Form(q): Form<TokenQuery>) -> Response {
+        // Signed out since the page was shown: in again, then back to the page.
+        let Some(me) = me else {
+            let back = format!("{BASE}/verify-email?t={}", util::urlencode(&q.t));
+            return see_other(&format!("{LOGIN_PAGE}?next={}", util::urlencode(util::safe_next(&back, BASE))), &[]);
+        };
+        match a.email_confirm(&ctx, &me.user, &q.t).await {
             Ok(()) => flash::to(&a.keys, BASE, true, "Your address is confirmed.", &[]),
-            Err(e @ Error::Invalid(_)) => flash::to(&a.keys, &format!("{BASE}/login"), false, e.message(), &[]),
+            Err(e @ Error::Invalid(_)) => flash::to(&a.keys, BASE, false, e.message(), &[]),
             Err(e) => refused(&a, &h, &e),
         }
     }
@@ -191,7 +209,7 @@ mod with_mail {
         match a.password_forgot(&ctx, &f.who).await {
             Ok(()) => {
                 let msg = "If that account has a confirmed address, a link is on its way. It works for an hour.";
-                flash::to(&a.keys, &format!("{BASE}/login"), true, msg, &[])
+                flash::to(&a.keys, LOGIN_PAGE, true, msg, &[])
             }
             Err(e) => refused(&a, &h, &e),
         }
@@ -217,7 +235,7 @@ mod with_mail {
             max_len: MAX_LEN,
             error,
         };
-        page(a, h, "Choose a new password", status, &tpl)
+        token_page(page(a, h, "Choose a new password", status, &tpl))
     }
 
     pub(in super::super) async fn reset_form<H: WebHost>(State(a): St<H>, h: HeaderMap, Query(q): Query<TokenQuery>) -> Response {
@@ -233,8 +251,8 @@ mod with_mail {
 
     pub(in super::super) async fn reset<H: WebHost>(State(a): St<H>, ctx: Ctx, h: HeaderMap, Form(f): Form<ResetForm>) -> Response {
         match a.password_reset(&ctx, &f.t, &f.password).await {
-            Ok(()) => flash::to(&a.keys, &format!("{BASE}/login"), true, "Password changed. Sign in with it.", &[]),
-            Err(e @ (Error::Invalid(_) | Error::Busy)) => reset_page(&a, &h, status_of(&e), &f.t, Some(e.message())),
+            Ok(()) => flash::to(&a.keys, LOGIN_PAGE, true, "Password changed. Sign in with it.", &[]),
+            Err(e @ (Error::Invalid(_) | Error::Busy | Error::RateLimited)) => reset_page(&a, &h, status_of(&e), &f.t, Some(e.message())),
             Err(e) => refused(&a, &h, &e),
         }
     }

@@ -1551,7 +1551,7 @@ mod mail_flows {
     async fn an_address_is_confirmed_by_its_link_and_belongs_to_one_account() {
         let Some((a, sent)) = with_mail(mail_cfg()).await else { return };
         let c = ctx("203.0.113.90");
-        let u = make_user(&a, &[]).await;
+        let (u, other) = (make_user(&a, &[]).await, make_user(&a, &[]).await);
         let addr = format!("{}@example.org", unique("m"));
         a.email_set(&c, &u, &format!(" {} ", addr.to_uppercase())).await.unwrap();
         let m = nth(&sent, 0).await;
@@ -1559,16 +1559,17 @@ mod mail_flows {
         assert!(m.body.contains("https://l4f.cc/account/verify-email?t=") && m.body.contains(&u.username));
         let t = token_in(&m.body);
         assert_eq!(a.store.user_by_id(u.id).await.unwrap().unwrap().email_pending.as_deref(), Some(addr.as_str()));
-        assert!(matches!(a.email_confirm(&c, &format!("{t}x")).await, Err(Error::Invalid(_))), "a forged link");
-        a.email_confirm(&c, &t).await.unwrap();
+        assert!(matches!(a.email_confirm(&c, &u, &format!("{t}x")).await, Err(Error::Invalid(_))), "a forged link");
+        let r = a.email_confirm(&c, &other, &t).await;
+        assert!(matches!(r, Err(Error::Invalid(msg)) if msg.starts_with("That link is for another account")), "its own account only");
+        a.email_confirm(&c, &u, &t).await.unwrap();
         let v = a.store.user_by_id(u.id).await.unwrap().unwrap();
         assert_eq!((v.email.as_deref(), v.email_pending.as_deref()), (Some(addr.as_str()), None));
-        assert!(matches!(a.email_confirm(&c, &t).await, Err(Error::Invalid(_))), "used up: nothing pending");
+        assert!(matches!(a.email_confirm(&c, &u, &t).await, Err(Error::Invalid(_))), "used up: nothing pending");
 
-        let other = make_user(&a, &[]).await;
         a.email_set(&c, &other, &addr).await.unwrap();
         let t2 = token_in(&nth(&sent, 1).await.body);
-        assert!(matches!(a.email_confirm(&c, &t2).await, Err(Error::Invalid("That address belongs to another account."))));
+        assert!(matches!(a.email_confirm(&c, &other, &t2).await, Err(Error::Invalid("That address belongs to another account."))));
         assert!(matches!(a.email_set(&c, &other, &addr).await, Err(Error::RateLimited) | Ok(())));
         cleanup(&a, &[u.id, other.id], &[]).await;
     }
@@ -1580,7 +1581,7 @@ mod mail_flows {
         let u = make_user(&a, &[]).await;
         let addr = format!("{}@example.org", unique("r"));
         a.email_set(&c, &u, &addr).await.unwrap();
-        a.email_confirm(&c, &token_in(&nth(&sent, 0).await.body)).await.unwrap();
+        a.email_confirm(&c, &u, &token_in(&nth(&sent, 0).await.body)).await.unwrap();
         let s = signed_in(a.login_password(&c, &u.username, PW, None).await);
 
         a.password_forgot(&c, "nobody-at-all").await.unwrap();
@@ -1588,6 +1589,7 @@ mod mail_flows {
         let m = nth(&sent, 1).await;
         assert!(m.body.contains("/account/reset?t="));
         assert_eq!(sent.lock().unwrap().len(), 2, "nothing for a name nobody has");
+        assert!(audit_events(&a, u.id).await.contains(&"reset_mail".to_string()), "written after the answer, before the mail");
         let t = token_in(&m.body);
         assert!(matches!(a.password_reset(&c, &t, "short").await, Err(Error::Invalid(_))));
         a.password_reset(&c, &t, "a whole new password").await.unwrap();
@@ -1596,6 +1598,115 @@ mod mail_flows {
         assert!(matches!(a.login_password(&c, &u.username, PW, None).await, Err(Error::BadLogin)));
         signed_in(a.login_password(&c, &u.username, "a whole new password", None).await);
         assert!(nth(&sent, 2).await.body.contains("with a reset link"), "the owner is told");
+        cleanup(&a, &[u.id], &[]).await;
+    }
+
+    /// An account without a password, and its link used twice at once: both
+    /// uses check out against no hash, and only one of them sets a password.
+    #[tokio::test]
+    async fn a_reset_link_used_twice_at_once_sets_one_password() {
+        let Some((a, sent)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.93");
+        let u = make_user(&a, &[]).await;
+        exec(&a.store, "UPDATE acct_users SET password_hash = NULL WHERE id = ?", vec![Arg::B(u.id.0.to_vec())]).await;
+        let addr = format!("{}@example.org", unique("r"));
+        a.email_set(&c, &u, &addr).await.unwrap();
+        a.email_confirm(&c, &u, &token_in(&nth(&sent, 0).await.body)).await.unwrap();
+        a.password_forgot(&c, &addr).await.unwrap();
+        let t = token_in(&nth(&sent, 1).await.body);
+        let (one, two) = ("the first new password", "the second new password");
+        let won = match tokio::join!(a.password_reset(&c, &t, one), a.password_reset(&c, &t, two)) {
+            (Ok(()), Err(Error::Invalid(_))) => one,
+            (Err(Error::Invalid(_)), Ok(())) => two,
+            x => panic!("expected one reset and one refusal, got {x:?}"),
+        };
+        signed_in(a.login_password(&c, &u.username, won, None).await);
+        cleanup(&a, &[u.id], &[]).await;
+    }
+
+    /// A reset link is bound to the address it went to: once the account has
+    /// another one, the link is dead (OUT-5).
+    #[tokio::test]
+    async fn a_reset_link_dies_with_its_address() {
+        let Some((a, sent)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.94");
+        let u = make_user(&a, &[]).await;
+        let (one, two) = (format!("{}@example.org", unique("r")), format!("{}@example.org", unique("r")));
+        a.email_set(&c, &u, &one).await.unwrap();
+        a.email_confirm(&c, &u, &token_in(&nth(&sent, 0).await.body)).await.unwrap();
+        a.password_forgot(&c, &u.username).await.unwrap();
+        let t = token_in(&nth(&sent, 1).await.body);
+        let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+        a.email_set(&c, &u, &two).await.unwrap();
+        a.email_confirm(&c, &u, &token_in(&nth(&sent, 2).await.body)).await.unwrap();
+        let r = a.password_reset(&c, &t, "a whole new password").await;
+        assert!(matches!(r, Err(Error::Invalid(msg)) if msg.contains("not valid any more")), "{r:?}");
+        signed_in(a.login_password(&c, &u.username, PW, None).await);
+        cleanup(&a, &[u.id], &[]).await;
+    }
+
+    /// The address an account stops using is told, so a recovery address
+    /// that moved does not go unseen (OUT-6).
+    #[tokio::test]
+    async fn the_old_address_hears_of_a_new_one_and_of_its_removal() {
+        let Some((a, sent)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.95");
+        let u = make_user(&a, &[]).await;
+        let (one, two) = (format!("{}@example.org", unique("o")), format!("{}@example.org", unique("o")));
+        a.email_set(&c, &u, &one).await.unwrap();
+        a.email_confirm(&c, &u, &token_in(&nth(&sent, 0).await.body)).await.unwrap();
+        let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+        a.email_set(&c, &u, &two).await.unwrap();
+        a.email_confirm(&c, &u, &token_in(&nth(&sent, 1).await.body)).await.unwrap();
+        let m = nth(&sent, 2).await;
+        assert!(m.to == one && m.body.contains("was just changed") && !m.body.contains(&two), "the old one, not told the new one");
+        let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+        a.email_remove(&c, &u).await.unwrap();
+        let m = nth(&sent, 3).await;
+        assert!(m.to == two && m.body.contains("was just removed"));
+        cleanup(&a, &[u.id], &[]).await;
+    }
+
+    /// A refusal spends none of the buckets, and `+tags` spell one mailbox
+    /// (OUT-3, OUT-8).
+    #[tokio::test]
+    async fn a_refused_mail_spends_nothing_and_tags_share_a_mailbox() {
+        let Some((a, _)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.96");
+        let local = unique("m");
+        let mut users = Vec::new();
+        for _ in 0..4 {
+            users.push(make_user(&a, &[]).await);
+        }
+        for (u, tag) in users.iter().zip(["", "+a", "+b"]) {
+            a.email_set(&c, u, &format!("{local}{tag}@example.org")).await.unwrap();
+        }
+        let last = &users[3];
+        let r = a.email_set(&c, last, &format!("{}+c@example.org", local.to_uppercase())).await;
+        assert!(matches!(r, Err(Error::RateLimited)), "three per mailbox, however it is spelled");
+        for i in 0..5 {
+            a.email_set(&c, last, &format!("{i}.{local}@example.org")).await.unwrap();
+        }
+        assert!(matches!(a.email_set(&c, last, &format!("5.{local}@example.org")).await, Err(Error::RateLimited)), "five per account");
+        cleanup(&a, &users.iter().map(|u| u.id).collect::<Vec<_>>(), &[]).await;
+    }
+
+    /// Resets and confirmations each have a site-wide ceiling: neither kind
+    /// can use up the other's (OUT-3).
+    #[tokio::test]
+    async fn resets_have_a_site_ceiling_of_their_own() {
+        let Some((a, sent)) = with_mail(mail_cfg()).await else { return };
+        let c = ctx("203.0.113.97");
+        let u = make_user(&a, &[]).await;
+        let addr = format!("{}@example.org", unique("r"));
+        a.email_set(&c, &u, &addr).await.unwrap();
+        a.email_confirm(&c, &u, &token_in(&nth(&sent, 0).await.body)).await.unwrap();
+        for _ in 0..200 {
+            a.limiter.record("acct-mail:global", std::time::Duration::from_secs(3600));
+        }
+        assert!(matches!(a.email_set(&c, &u, &format!("x{addr}")).await, Err(Error::RateLimited)), "no confirmations left");
+        a.password_forgot(&c, &u.username).await.unwrap();
+        assert!(nth(&sent, 1).await.body.contains("/account/reset?t="), "a reset still goes out");
         cleanup(&a, &[u.id], &[]).await;
     }
 

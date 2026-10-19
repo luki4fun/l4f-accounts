@@ -929,17 +929,24 @@ async fn confirm_and_reset_links_work_through_their_pages() {
     let r = send(&app, post("/account/email", &format!("csrf={t}&_action=set&email={addr}"), Some(&c))).await;
     assert!(location(&r).starts_with("/account/security?ok=A+link"));
     let vt = link_token(0).await;
-    let page = text(send(&app, get(&format!("/account/verify-email?t={vt}"), None)).await).await;
-    assert!(page.contains(">Confirm</button>"), "opening the link changes nothing");
+    let link = format!("/account/verify-email?t={vt}");
+    let sign_in_first = format!("/account/login?next={}", util::urlencode(&link));
+    assert_eq!(location(&send(&app, get(&link, None)).await), sign_in_first, "signed in first, then back to the link");
+    let r = send(&app, get(&link, Some(&c))).await;
+    assert_eq!(r.headers()[header::REFERRER_POLICY], "strict-origin", "the token never leaves in a Referer");
+    assert!(text(r).await.contains(">Confirm</button>"), "opening the link changes nothing");
     assert!(a.store.user_by_id(u.id).await.unwrap().unwrap().email.is_none());
-    let r = send(&app, post("/account/verify-email", &format!("t={vt}"), None)).await;
+    assert_eq!(location(&send(&app, post("/account/verify-email", &format!("t={vt}"), None)).await), sign_in_first, "nor does a signed-out POST");
+    let r = send(&app, post("/account/verify-email", &format!("csrf={t}&t={vt}"), Some(&c))).await;
     assert!(location(&r).starts_with("/account?ok=Your+address+is+confirmed."));
 
     assert!(text(send(&app, get("/account/login", None)).await).await.contains("/account/forgot"));
     let r = send(&app, post("/account/forgot", &format!("who={}", u.username), None)).await;
     assert!(location(&r).starts_with("/account/login?ok=If+that+account"));
     let rt = link_token(1).await;
-    assert!(text(send(&app, get(&format!("/account/reset?t={rt}"), None)).await).await.contains(r#"name="password""#));
+    let r = send(&app, get(&format!("/account/reset?t={rt}"), None)).await;
+    assert_eq!(r.headers()[header::REFERRER_POLICY], "strict-origin");
+    assert!(text(r).await.contains(r#"name="password""#));
     let r = send(&app, post("/account/reset", &format!("t={rt}&password=reset+by+link+now"), None)).await;
     assert!(location(&r).starts_with("/account/login?ok=Password+changed."));
     let r = send(&app, post("/account/reset", &format!("t={rt}&password=and+again+please"), None)).await;
