@@ -25,7 +25,7 @@ mod tests;
 pub use admin::{Actor, RoleForm, UserDetail};
 pub use auth::{LoginStep, NewSession, RegisterForm};
 pub use invite::{InviteForm, MAX_INVITE_DAYS};
-pub use mfa::TotpSetup;
+pub use mfa::{SecondFactor, TotpSetup};
 pub use keylogin::NewDeviceKey;
 pub use passkey::PasskeyFor;
 pub use profile::{AVATAR_MAX, PublicProfile, image_type, uuid_of};

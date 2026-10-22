@@ -3,6 +3,21 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## Unreleased (v0.10.0)
+
+For voipc 1.0's password reset with a recovery key. No migration.
+
+- `Accounts::password_set_as_host(ctx, target, new)`: a new password from the
+  host's own code, for a reset the host proved by other means. The policy, the
+  per-account cap and Argon2 as for any change; every device key and every
+  session goes; the audit row says `host`.
+- `Accounts::second_factor_check(ctx, user, SecondFactor::Totp(code) |
+  SecondFactor::Recovery(code))`: a second factor checked without a session,
+  on the step-up buckets; a recovery code is spent.
+- SQLite connections set `secure_delete = FAST`: a deleted account's rows
+  are overwritten where that costs no extra I/O, rather than left readable in
+  the file's free pages.
+
 ## v0.9.0 (2026-10-20)
 
 Postgres and SQLite next to MySQL, for voipc's relays. New migration sets

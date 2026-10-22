@@ -71,6 +71,16 @@ impl<H: Host> Accounts<H> {
         self.set_password(ctx, user, new, old.as_deref(), Some(&session.token_hash), "change").await
     }
 
+    /// Sets an account's password from the host's own code, for a reset the
+    /// host proved by other means (VoIPC: a signature by the account's
+    /// identity key, which only its recovery key opens). Every remembered
+    /// device and every session goes, as with any password change.
+    pub async fn password_set_as_host(&self, ctx: &Ctx, target: AccountId, new: &str) -> Result<(), Error> {
+        let user = self.store.user_by_id(target).await?.ok_or(Error::NotFound)?;
+        let old = self.store.password_hash_of(user.id).await?;
+        self.set_password(ctx, &user, new, old.as_deref(), None, "host").await
+    }
+
     /// The one way a password changes: the policy, a per-account cap, Argon2,
     /// written only over `old` (the hash the caller saw, `None` for an account
     /// without one), then every remembered browser and every session but

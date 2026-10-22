@@ -320,4 +320,23 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
+
+    /// Deleted rows are overwritten where that costs no extra I/O, not left
+    /// readable in the file (`secure_delete` 2 is FAST).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    #[allow(irrefutable_let_patterns)]
+    async fn sqlite_overwrites_what_is_deleted() {
+        let path = std::env::temp_dir().join(format!("l4f_sd_{}.db", hex::encode(crate::util::random::<6>())));
+        let store = Store::connect(&format!("sqlite://{}", path.display())).await.unwrap();
+        let mut held = lock(&store).await.unwrap();
+        let StoreConn::Lite(conn) = held.conn() else { unreachable!() };
+        let mode: i64 = sqlx::query_scalar("PRAGMA secure_delete").fetch_one(&mut *conn).await.unwrap();
+        assert_eq!(mode, 2);
+        drop(held);
+        store.close().await;
+        for suffix in ["", "-wal", "-shm", ".lock"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

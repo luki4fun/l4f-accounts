@@ -912,6 +912,33 @@ async fn a_password_change_needs_a_recent_sign_in_and_is_capped() {
     cleanup(&a, &[u.id], &[]).await;
 }
 
+/// The host's reset: a new password, every session and device key gone, the
+/// old password dead. A second factor checks out without a session, and a
+/// wrong one does not.
+#[tokio::test]
+async fn a_host_sets_a_password_and_checks_a_second_factor() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.65");
+    let u = make_user(&a, &[]).await;
+    let s = a.create_session(u.id, "password", true, util::now(), &c).await.unwrap();
+    a.password_set_as_host(&c, u.id, "a password from the reset").await.unwrap();
+    assert!(a.session_from_token(&s.token, util::now()).await.unwrap().is_none(), "signed out everywhere");
+    assert!(matches!(a.confirm_password(&c, &u, PW).await, Err(Error::Invalid(_))), "the old one is dead");
+    a.confirm_password(&c, &u, "a password from the reset").await.unwrap();
+    assert!(matches!(a.password_set_as_host(&c, u.id, "tiny").await, Err(Error::Invalid(_))), "the policy holds");
+
+    let setup = a.totp_setup(&u);
+    let secret = totp_secret(&setup);
+    let (codes, _) = a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &format!("{:06}", crate::totp::code_at(&secret, step_now()))).await.unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    assert!(matches!(a.second_factor_check(&c, &u, SecondFactor::Totp("000000")).await, Err(Error::Invalid(_))));
+    let next = format!("{:06}", crate::totp::code_at(&secret, step_now() + 1));
+    a.second_factor_check(&c, &u, SecondFactor::Totp(&next)).await.unwrap();
+    a.second_factor_check(&c, &u, SecondFactor::Recovery(&codes[0])).await.unwrap();
+    assert!(a.second_factor_check(&c, &u, SecondFactor::Recovery(&codes[0])).await.is_err(), "a recovery code is spent");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
 #[tokio::test]
 async fn display_name_sessions_and_revoke() {
     let Some(a) = shared(cfg()).await else { return };

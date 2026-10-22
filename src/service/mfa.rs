@@ -15,6 +15,12 @@ const SECOND_STEP: &str = "acct-mfa";
 /// `SECOND_STEP` cannot lock the owner out of these.
 const STEP_UP: &str = "acct-mfa-up";
 
+/// What `second_factor_check` takes.
+pub enum SecondFactor<'a> {
+    Totp(&'a str),
+    Recovery(&'a str),
+}
+
 /// What the setup page shows. `sealed` goes back with the first code, so
 /// nothing is stored until a code proves the app has the secret.
 pub struct TotpSetup {
@@ -207,6 +213,19 @@ impl<H: Host> Accounts<H> {
         }
         self.audit(ctx, Some(user.id), None, "mfa_fail", "recovery").await?;
         Err(Error::Invalid("That recovery code is not right, or was already used."))
+    }
+
+    /// A second factor checked without a session, for a host that proves the
+    /// rest itself (VoIPC's reset with a recovery key): a code, or a recovery
+    /// code, which it spends. The step-up buckets and audit rows.
+    pub async fn second_factor_check(&self, ctx: &Ctx, user: &User, factor: SecondFactor<'_>) -> Result<(), Error> {
+        match factor {
+            SecondFactor::Totp(code) => self.check_totp(ctx, user, code, STEP_UP).await,
+            SecondFactor::Recovery(code) => {
+                self.mfa_try(STEP_UP, user.id)?;
+                self.spend_recovery(ctx, user, code).await
+            }
+        }
     }
 
     /// Step-up with a code, for accounts that have codes: a password alone is

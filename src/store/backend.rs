@@ -123,9 +123,13 @@ impl Store {
             "sqlite" => {
                 use std::str::FromStr;
                 use std::time::{Duration, Instant};
+                // `secure_delete`: what is deleted (an account, its sessions,
+                // an app's rows) is overwritten where that costs no extra
+                // I/O, instead of staying readable in the file's free pages.
                 let opts = sqlx::sqlite::SqliteConnectOptions::from_str(url)?
                     .create_if_missing(true)
-                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                    .pragma("secure_delete", "FAST");
                 // The switch to WAL takes an exclusive lock and does not wait
                 // for it: of processes opening a new file at once, all but one
                 // get SQLITE_BUSY (primary code 5). Those try again, a while.
