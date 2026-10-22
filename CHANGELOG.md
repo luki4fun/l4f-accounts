@@ -3,7 +3,7 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
-## Unreleased (v0.10.0)
+## v0.10.0 (2026-10-22)
 
 For voipc 1.0's password reset with a recovery key. No migration.
 
