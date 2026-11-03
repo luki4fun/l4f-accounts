@@ -560,6 +560,59 @@ async fn roles_change_only_on_accounts_the_actor_covers() {
 }
 
 #[tokio::test]
+async fn a_revoke_of_a_role_without_scopes_keeps_the_sessions() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.51");
+    let mod_role = make_role(&a, &["users:admin", "t:one"]).await;
+    let group = make_role(&a, &[]).await;
+    let boss = make_user(&a, &[&mod_role]).await;
+    let scopes = a.effective_scopes(&boss).await.unwrap();
+    let actor = Actor { user: &boss, scopes: &scopes };
+    let target = make_user(&a, &[&group]).await;
+    let now = util::now();
+
+    let s = signed_in(a.login_password(&c, &target.username, PW, None).await);
+    assert!(a.revoke_role(&c, actor, target.id, &group).await.unwrap());
+    assert!(a.session_from_token(&s.token, now).await.unwrap().is_some(), "a group that granted nothing signs nobody out");
+    assert!(a.store.user_roles(target.id).await.unwrap().iter().all(|r| r.name != group));
+    assert!(a.grant_role_as_host(&c, target.id, &group).await.unwrap());
+    assert!(a.revoke_role_as_host(&c, target.id, &group).await.unwrap());
+    assert!(a.session_from_token(&s.token, now).await.unwrap().is_some(), "from the host's shell too");
+    cleanup(&a, &[boss.id, target.id], &[&mod_role, &group]).await;
+}
+
+#[tokio::test]
+async fn role_members_pages_by_name_and_needs_users_read() {
+    let Some(a) = shared(cfg()).await else { return };
+    let reader_role = make_role(&a, &["users:read"]).await;
+    let group = make_role(&a, &[]).await;
+    let other = make_role(&a, &[]).await;
+    let reader = make_user(&a, &[&reader_role]).await;
+    let scopes = a.effective_scopes(&reader).await.unwrap();
+    let actor = Actor { user: &reader, scopes: &scopes };
+    let mut members = Vec::new();
+    for _ in 0..3 {
+        members.push(make_user(&a, &[&group]).await);
+    }
+    let outsider = make_user(&a, &[&other]).await;
+    let mut names: Vec<String> = members.iter().map(|u| u.username.clone()).collect();
+    names.sort();
+
+    let (page, total) = a.role_members(actor, &group, 2, 0).await.unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(page.iter().map(|u| u.username.clone()).collect::<Vec<_>>(), names[..2]);
+    let (rest, _) = a.role_members(actor, &group, 2, 2).await.unwrap();
+    assert_eq!(rest.iter().map(|u| u.username.clone()).collect::<Vec<_>>(), names[2..]);
+    assert!(matches!(a.role_members(actor, "no-such-role", 10, 0).await, Err(Error::NotFound)));
+
+    let plain = Actor { user: &outsider, scopes: &[] };
+    assert!(matches!(a.role_members(plain, &group, 10, 0).await, Err(Error::Forbidden)));
+    let mut all: Vec<AccountId> = members.iter().map(|u| u.id).collect();
+    all.extend([reader.id, outsider.id]);
+    cleanup(&a, &all, &[&reader_role, &group, &other]).await;
+}
+
+#[tokio::test]
 async fn revoke_and_disable_end_the_targets_sessions() {
     let Some(a) = shared(cfg()).await else { return };
     let c = ctx("203.0.113.50");

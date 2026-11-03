@@ -3,6 +3,20 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.11.0 (unreleased)
+
+For voipc 1.7's groups: roles a host checks by name, managed from its own app.
+No migration.
+
+- `revoke_role` and `revoke_role_as_host` end the account's sessions only
+  when the role carried scopes. A role without scopes granted no power, so
+  taking it away leaves the account signed in; the host sees the change at
+  its next role read. **Host action** only if a host relied on any revoke
+  signing the account out.
+- `Accounts::role_members(actor, role, limit, offset)`: the accounts holding
+  a role, by username, at most 100 a page, with the total. Needs `users:read`;
+  `NotFound` for an unknown role. `Store::role_members` underneath.
+
 ## v0.10.0 (2026-10-22)
 
 For voipc 1.0's password reset with a recovery key. No migration.

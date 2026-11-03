@@ -173,9 +173,11 @@ impl<H: Host> Accounts<H> {
         Ok(true)
     }
 
-    /// False when the account did not hold the role. Ends every session of the
-    /// account, so the loss counts from now on in every tab. The actor covers
-    /// the role and the target, as for `grant_role`.
+    /// False when the account did not hold the role. A role with scopes ends
+    /// every session of the account, so the loss counts from now on in every
+    /// tab; one without scopes (a group a host checks by name) took no power
+    /// away and leaves them. The actor covers the role and the target, as for
+    /// `grant_role`.
     pub async fn revoke_role(&self, ctx: &Ctx, actor: Actor<'_>, target: AccountId, role: &str) -> Result<bool, Error> {
         actor.need("users:admin")?;
         let role = self.role(role).await?;
@@ -196,7 +198,9 @@ impl<H: Host> Accounts<H> {
         if !self.store.revoke_role(target, role.id).await? {
             return Ok(false);
         }
-        self.store.delete_sessions_of(target, None).await?;
+        if !role.scopes.is_empty() {
+            self.store.delete_sessions_of(target, None).await?;
+        }
         self.record_after(ctx, Some(target), actor, "role_revoke", &marked(&role.name, actor)).await;
         Ok(true)
     }
@@ -232,6 +236,14 @@ impl<H: Host> Accounts<H> {
         }
         self.record_after(ctx, Some(target), actor, "totp_reset", &marked("", actor)).await;
         Ok(true)
+    }
+
+    /// The accounts holding `role`, by username, at most 100 a page, with the
+    /// total.
+    pub async fn role_members(&self, actor: Actor<'_>, role: &str, limit: u32, offset: u32) -> Result<(Vec<User>, i64), Error> {
+        actor.need("users:read")?;
+        let role = self.role(role).await?;
+        Ok(self.store.role_members(role.id, limit.min(100), offset).await?)
     }
 
     /// Newest first, at most 100 a page, with the total.

@@ -1262,6 +1262,26 @@ impl Backend {
         roles_from(rows)
     }
 
+    pub async fn role_members(&self, role: AccountId, limit: u32, offset: u32) -> sqlx::Result<(Vec<User>, i64)> {
+        let users = sqlx::query(sql!(
+            "SELECT {USER_COLS} FROM acct_users WHERE id IN (SELECT user_id FROM acct_user_roles WHERE role_id = ?)
+              ORDER BY username LIMIT ? OFFSET ?"
+        ))
+        .bind(&role.0[..])
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.0)
+        .await?
+        .iter()
+        .map(user)
+        .collect::<sqlx::Result<_>>()?;
+        let total = sqlx::query_scalar::<_, i64>(sql!("SELECT COUNT(*) FROM acct_user_roles WHERE role_id = ?"))
+            .bind(&role.0[..])
+            .fetch_one(&self.0)
+            .await?;
+        Ok((users, total))
+    }
+
     pub async fn user_scopes(&self, user: AccountId) -> sqlx::Result<Vec<String>> {
         sqlx::query_scalar(sql!(
             "SELECT DISTINCT s.scope FROM acct_user_roles ur JOIN acct_role_scopes s ON s.role_id = ur.role_id

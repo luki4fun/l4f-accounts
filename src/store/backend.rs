@@ -403,6 +403,8 @@ forward! {
     /// False when there is no such role. Its scopes and grants go with it.
     fn delete_role(&self, role: AccountId) -> Result<bool, WriteError>;
     fn user_roles(&self, user: AccountId) -> sqlx::Result<Vec<Role>>;
+    /// The accounts holding the role, by username, one page, with the total.
+    fn role_members(&self, role: AccountId, limit: u32, offset: u32) -> sqlx::Result<(Vec<User>, i64)>;
     /// Every scope of every role the account holds, deduplicated and sorted.
     fn user_scopes(&self, user: AccountId) -> sqlx::Result<Vec<String>>;
     /// False when the account already held the role. Plain INSERT, not IGNORE:
