@@ -3,7 +3,7 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
-## v0.11.0 (unreleased)
+## v0.11.0 (2026-11-03)
 
 For voipc 1.7's groups: roles a host checks by name, managed from its own app.
 No migration.
