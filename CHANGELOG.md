@@ -8,6 +8,9 @@ only move forward. **BREAKING** marks changes a host has to act on.
 For voipc 1.8's sign-in with a provider, on a host with no web pages. No migration.
 
 - The `oauth` feature no longer pulls in MySQL: any backend will do.
+  **BREAKING** for a build whose only database feature was `oauth` (no
+  `mysql`, `axum` or `email`): add `mysql` to its features, or the build
+  stops with an error that says so.
 - `Config.oauth_base_url`: where a provider sends the browser back, for a host
   whose `base_url` is no web address (device keys verify against `base_url`, so
   it cannot change). Empty, the default: `base_url`, as before.

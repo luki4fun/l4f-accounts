@@ -7,6 +7,9 @@
 //! templates; `oauth` and `email` the outbound integrations. See
 //! `docs/embedding.md`.
 
+#[cfg(all(feature = "_db", not(any(feature = "mysql", feature = "postgres", feature = "sqlite"))))]
+compile_error!("`oauth` needs a backend as well: enable `mysql`, `postgres` or `sqlite`");
+
 pub mod challenge;
 #[cfg(feature = "email")]
 pub mod email;

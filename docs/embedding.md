@@ -15,7 +15,7 @@ l4f (MaxLuki) is the reference host: `src/main.rs`, `src/site_host.rs` and
 | `sqlite` | the same on SQLite (bundled, so a static build keeps working) | sqlx (SQLite), tokio |
 | `axum` | `web`: the `/account` router, `profile_router`, extractors, `WebHost`; `templates/`, `assets/` | `mysql`, axum, askama |
 | `email` | `email::Mailer`; address confirmation, password reset, notices | `mysql`, lettre (rustls, ring) |
-| `oauth` | `oauth`: Discord, Google, Facebook; social sign-in, linking, step-up | `mysql`, reqwest (rustls, ring) |
+| `oauth` | `oauth`: Discord, Google, Facebook; social sign-in, linking, step-up | reqwest (rustls, ring); a backend of the host's choice |
 | `legacy-bcrypt` | verifies a YOURLS bcrypt hash once and rehashes it to Argon2id | bcrypt |
 
 No feature pulls in OpenSSL or aws-lc: TLS and signatures run on ring, and a
