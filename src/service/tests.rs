@@ -1925,6 +1925,66 @@ mod social_flows {
         cleanup(&a, &[u.id], &[]).await;
     }
 
+    /// Where sign-up is closed: a provider's person gets nowhere without a code, and
+    /// with one signs up under its rules.
+    #[tokio::test]
+    async fn a_closed_host_lets_an_identity_in_with_an_invite_alone() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let fake: Shared = Arc::default();
+        let app = Router::new().route("/d/token", post(d_token)).route("/d/profile", get(d_profile)).with_state(fake.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let providers = vec![Provider::at(Kind::Discord, &format!("{base}/d"))];
+        let Some(store) = shared_store().await else { return };
+        let cfg = Config { registration_open: false, ..pk_cfg() };
+        let a = on(store, cfg).await.with_oauth(crate::service::OAuth::new(http, providers));
+        let c = ctx("203.0.113.103");
+        fake.lock().unwrap().subject = unique("d");
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "").unwrap();
+        let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await.unwrap();
+        let SocialOutcome::NoAccount { cookie: signup } = out else { panic!("sign-up is closed") };
+
+        // Its sealed identity opens nothing by itself
+        let ts = pow::stamp(POW_KEY, util::now_secs() - 5);
+        let altcha = solve(&pow::issue(POW_KEY, 1000, 600));
+        let proof = pow::Proof { altcha: &altcha, ts: &ts, ..pow::Proof::default() };
+        assert!(matches!(a.oauth_signup(&c, &signup, &unique("o"), proof).await, Err(Error::SignupClosed)));
+        let name = unique("o");
+        for bad in ["", "not a code", "AAAAAAAAAAAAAAAAAAAAAA"] {
+            assert!(matches!(a.oauth_signup_invite(&c, &signup, bad, &name).await, Err(Error::Invalid(_))), "{bad:?}");
+        }
+        assert!(matches!(a.oauth_signup_invite(&c, "forged", "AAAAAAAAAAAAAAAAAAAAAA", &name).await, Err(Error::Invalid(_))));
+
+        // A code bound to another name is for that name alone
+        let other = unique("o");
+        let bound = a.invite_create_as_host(&c, Some(&other), 1).await.unwrap();
+        assert!(matches!(a.oauth_signup_invite(&c, &signup, &bound, &name).await, Err(Error::Invalid(_))));
+
+        // A refusal leaves the code: a taken name, then a free one
+        let code = a.invite_create_as_host(&c, None, 1).await.unwrap();
+        let taken = make_user(&a, &[]).await;
+        assert!(matches!(a.oauth_signup_invite(&c, &signup, &code, &taken.username).await, Err(Error::UsernameTaken)));
+        let s = a.oauth_signup_invite(&c, &signup, &code, &name).await.unwrap();
+        assert!(s.info.mfa_ok && s.info.method == "oauth");
+        let u = a.store.user_by_username(&name).await.unwrap().unwrap();
+        assert!(!u.has_password && u.display_name == "Dee D");
+        assert_eq!(a.oauth_linked(u.id).await.unwrap().len(), 1);
+
+        // Spent, and the identity has its account now
+        fake.lock().unwrap().subject = unique("d");
+        let (url, cookie) = a.oauth_begin(Kind::Discord, Intent::Login, None, "").unwrap();
+        let (out, _) = a.oauth_finish(&c, Kind::Discord, &cookie, &param(&url, "state"), "code", None).await.unwrap();
+        let SocialOutcome::NoAccount { cookie: next } = out else { panic!("another new identity") };
+        assert!(matches!(a.oauth_signup_invite(&c, &next, &code, &unique("o")).await, Err(Error::Invalid(_))), "spent");
+        assert!(
+            matches!(a.oauth_signup_invite(&c, &signup, &bound, &other).await, Err(Error::Invalid(_))),
+            "one identity, one account"
+        );
+        cleanup(&a, &[u.id, taken.id], &[]).await;
+    }
+
     #[tokio::test]
     async fn linking_needs_a_recent_sign_in_and_an_identity_has_one_account() {
         let Some((a, fake)) = setup().await else { return };

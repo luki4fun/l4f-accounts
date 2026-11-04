@@ -104,6 +104,10 @@ pub(super) async fn callback<H: WebHost>(
         Ok((SocialOutcome::Signup { cookie }, _)) => {
             see_other(&format!("{BASE}/oauth/signup"), &[clear, cookie_set(&a, SIGNUP_COOKIE, &cookie, 600)])
         }
+        // These pages have no way to take an invite code along
+        Ok((SocialOutcome::NoAccount { .. }, _)) => {
+            flash::to(&a.keys, back, false, "No account here uses that sign-in. Sign in another way, then link it on your security page.", &[clear])
+        }
         Ok((SocialOutcome::Linked, _)) => flash::to(&a.keys, SECURITY_PAGE, true, "Linked.", &[clear]),
         Ok((SocialOutcome::SteppedUp(s), next)) => see_other(util::safe_next(&next, BASE), &[clear, set_session(&cfg, &s.token)]),
         Err(e @ (Error::Invalid(_) | Error::Forbidden | Error::RateLimited | Error::BadLogin | Error::Closed)) => {
