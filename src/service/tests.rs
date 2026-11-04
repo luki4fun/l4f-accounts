@@ -993,6 +993,21 @@ async fn a_host_sets_a_password_and_checks_a_second_factor() {
 }
 
 #[tokio::test]
+async fn a_host_renames_under_the_username_rules() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.64");
+    let u = make_user(&a, &[]).await;
+    let other = make_user(&a, &[]).await;
+    let name = format!("  R{}  ", &u.id.hex()[..12]);
+    assert_eq!(a.rename_as_host(&c, u.id, &name).await.unwrap(), name.trim().to_lowercase());
+    assert!(matches!(a.rename_as_host(&c, u.id, &other.username).await, Err(Error::UsernameTaken)));
+    assert!(matches!(a.rename_as_host(&c, u.id, "a b").await, Err(Error::Invalid(_))));
+    assert!(matches!(a.rename_as_host(&c, u.id, "admin").await, Err(Error::Invalid(_))), "a reserved name is refused");
+    assert!(matches!(a.rename_as_host(&c, AccountId::new(), "nobody_here").await, Err(Error::NotFound)));
+    cleanup(&a, &[u.id, other.id], &[]).await;
+}
+
+#[tokio::test]
 async fn display_name_sessions_and_revoke() {
     let Some(a) = shared(cfg()).await else { return };
     let c = ctx("203.0.113.63");
@@ -1839,6 +1854,18 @@ mod social_flows {
         let claims = serde_json::json!({ "iss": "https://accounts.google.com", "aud": "client", "exp": util::now() + 600,
             "sub": f.subject, "nonce": f.nonce, "name": "Dee G", "auth_time": f.auth_time });
         Json(serde_json::json!({ "id_token": format!("e30.{}.sig", util::b64u(claims.to_string().as_bytes())) }))
+    }
+
+    #[tokio::test]
+    async fn the_redirect_can_live_apart_from_the_base_url() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let Some(store) = shared_store().await else { return };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let providers = vec![Provider::at(Kind::Discord, "http://127.0.0.1:1/d")];
+        let cfg = Config { base_url: "voipc://relay".into(), oauth_base_url: "https://voice.example".into(), ..pk_cfg() };
+        let a = on(store, cfg).await.with_oauth(crate::service::OAuth::new(http, providers));
+        let (url, _) = a.oauth_begin(Kind::Discord, crate::service::Intent::Login, None, "").unwrap();
+        assert!(url.contains(&util::urlencode("https://voice.example/account/oauth/discord/cb")), "{url}");
     }
 
     /// A stand-in provider on a local port, and accounts that talk to it over

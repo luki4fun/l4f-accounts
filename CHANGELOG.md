@@ -3,6 +3,18 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.12.0 (2026-11-04)
+
+For voipc 1.8's sign-in with a provider, on a host with no web pages. No migration.
+
+- The `oauth` feature no longer pulls in MySQL: any backend will do.
+- `Config.oauth_base_url`: where a provider sends the browser back, for a host
+  whose `base_url` is no web address (device keys verify against `base_url`, so
+  it cannot change). Empty, the default: `base_url`, as before.
+- `Accounts::rename_as_host(ctx, user, raw)`: a new username under the username
+  rules. `Store::rename_user` underneath, `false` when the name is taken. Only
+  the host knows what it bound to the old name.
+
 ## v0.11.0 (2026-11-03)
 
 For voipc 1.7's groups: roles a host checks by name, managed from its own app.

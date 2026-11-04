@@ -500,6 +500,13 @@ pub(crate) mod tests {
         assert_eq!(s.password_hash_of(u.id).await.unwrap().as_deref(), Some("h3"));
 
         assert!(s.set_display_name(u.id, "Dee Two").await.unwrap());
+        let taken = new_user(&unique("t"));
+        s.create_user(&taken, None).await.unwrap();
+        assert!(!s.rename_user(u.id, &taken.username).await.unwrap(), "a taken name is no rename");
+        let renamed = format!("r{}", &u.id.hex()[..12]);
+        assert!(s.rename_user(u.id, &renamed).await.unwrap());
+        assert_eq!(s.user_by_id(u.id).await.unwrap().unwrap().username, renamed);
+        assert!(!s.rename_user(AccountId::new(), "nobody_here").await.unwrap());
         assert!(s.set_sync_enabled(u.id, true).await.unwrap());
         assert!(s.set_status(u.id, UserStatus::Disabled).await.unwrap());
         let got = s.user_by_id(u.id).await.unwrap().unwrap();

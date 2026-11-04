@@ -19,7 +19,7 @@ sqlite = ["_db", "sqlx/sqlite"]
 # Internal: what every backend needs. Enable a backend, not this.
 _db = ["dep:sqlx", "dep:tokio"]
 axum = ["mysql", "dep:axum", "dep:askama"]
-oauth = ["mysql", "dep:reqwest"]
+oauth = ["_db", "dep:reqwest"]
 email = ["mysql", "dep:lettre"]
 # Only to verify a YOURLS-era bcrypt hash once and rehash it to Argon2id.
 legacy-bcrypt = ["dep:bcrypt"]

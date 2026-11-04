@@ -519,6 +519,14 @@ impl Backend {
         Ok(r.rows_affected() == 1)
     }
 
+    pub async fn rename_user(&self, id: AccountId, username: &str) -> sqlx::Result<bool> {
+        match sqlx::query(sql!("UPDATE acct_users SET username = ? WHERE id = ?")).bind(username).bind(&id.0[..]).execute(&self.0).await {
+            Ok(r) => Ok(r.rows_affected() == 1),
+            Err(e) if is_dup(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn set_sync_enabled(&self, id: AccountId, on: bool) -> sqlx::Result<bool> {
         let r = sqlx::query(sql!("UPDATE acct_users SET sync_enabled = ? WHERE id = ?"))
             .bind(on)

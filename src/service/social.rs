@@ -103,7 +103,9 @@ impl<H: Host> Accounts<H> {
     }
 
     fn redirect_uri(&self, kind: Kind) -> String {
-        format!("{}{ACCOUNT_PATH}/oauth/{}/cb", self.host.config().base_url, kind.slug())
+        let cfg = self.host.config();
+        let base = if cfg.oauth_base_url.is_empty() { &cfg.base_url } else { &cfg.oauth_base_url };
+        format!("{base}{ACCOUNT_PATH}/oauth/{}/cb", kind.slug())
     }
 
     /// Where to send the browser, and the sealed cookie value to set first.

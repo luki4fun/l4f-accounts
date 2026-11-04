@@ -126,6 +126,21 @@ impl<H: Host> Accounts<H> {
         Ok(name)
     }
 
+    /// A new username from the host's own code, under the username rules. The
+    /// host decides when that is safe: anything it bound to the old name stays
+    /// bound to it.
+    pub async fn rename_as_host(&self, ctx: &Ctx, user: AccountId, raw: &str) -> Result<String, Error> {
+        let name = self.host.config().username(raw)?;
+        if self.store.user_by_id(user).await?.is_none() {
+            return Err(Error::NotFound);
+        }
+        if !self.store.rename_user(user, &name).await? {
+            return Err(Error::UsernameTaken);
+        }
+        self.audit_after(ctx, Some(user), None, "rename", &name).await;
+        Ok(name)
+    }
+
     /// The account's live sessions, most recently used first. Pending-MFA ones
     /// included: someone who knows the password is worth seeing.
     pub async fn sessions(&self, user: AccountId, now: i64) -> sqlx::Result<Vec<SessionInfo>> {

@@ -129,6 +129,10 @@ pub struct Config {
     /// redirect add their path to it, so it ends without a slash.
     #[serde(skip)]
     pub base_url: String,
+    /// Where a provider sends the browser back, for a host whose `base_url`
+    /// is no web address. Empty: `base_url`.
+    #[serde(skip)]
+    pub oauth_base_url: String,
     #[serde(skip)]
     pub cookie_secure: bool,
     #[serde(skip)]
@@ -168,6 +172,7 @@ impl Default for Config {
             egress: None,
             storage_quota_bytes: 1024 * 1024,
             base_url: String::new(),
+            oauth_base_url: String::new(),
             cookie_secure: true,
             ip_mode: IpMode::default(),
         }

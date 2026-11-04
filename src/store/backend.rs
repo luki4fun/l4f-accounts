@@ -238,6 +238,8 @@ forward! {
     /// deletes the sessions of an account it disables.
     fn set_status(&self, id: AccountId, status: UserStatus) -> Result<bool, WriteError>;
     fn set_display_name(&self, id: AccountId, name: &str) -> sqlx::Result<bool>;
+    /// False when the name is taken or the account is gone.
+    fn rename_user(&self, id: AccountId, username: &str) -> sqlx::Result<bool>;
     fn set_sync_enabled(&self, id: AccountId, on: bool) -> sqlx::Result<bool>;
     /// Newest first, with the total for paging. `search` matches username,
     /// display name and verified email, case-insensitively (the columns
