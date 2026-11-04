@@ -11,9 +11,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::auth::WINDOW;
+use super::invite::{BAD_INVITE, INVITE_TRIES, code_hash};
 use super::{ACCOUNT_PATH, Accounts, Ctx, Error, Host, LoginStep, NewSession, has_second_factor};
 use crate::model::{Credential, NewUser, SessionInfo, User, UserStatus};
 use crate::oauth::{self, Flow, Identity, Kind, Provider};
+use crate::store::InviteSignup;
 use crate::{pow, scope, util};
 
 /// The configured providers and the client that may reach them.
@@ -41,6 +43,9 @@ pub enum SocialOutcome {
     /// An identity nobody has, and sign-up is open: `cookie` carries it to the
     /// choose-a-username page.
     Signup { cookie: String },
+    /// An identity nobody has, and sign-up is closed. `cookie` is good only with an
+    /// invite code (`oauth_signup_invite`); without one, say no account uses it.
+    NoAccount { cookie: String },
     Linked,
     SteppedUp(NewSession),
 }
@@ -196,11 +201,13 @@ impl<H: Host> Accounts<H> {
         let cfg = self.host.config();
         let ckind = kind.credential_kind();
         let Some(cred) = self.store.credential(&ckind, id.subject.as_bytes()).await? else {
-            if cfg.registration_open && self.pow_key.is_some() {
-                let c = SignupCookie { p: kind.slug().into(), sub: id.subject.clone(), handle: id.handle.clone(), e: util::now() + FLOW_SECS };
-                return Ok(SocialOutcome::Signup { cookie: self.seal_json("oauth-signup", &c) });
-            }
-            return Err(Error::Invalid("No account here uses that sign-in. Sign in another way, then link it on your security page."));
+            let c = SignupCookie { p: kind.slug().into(), sub: id.subject.clone(), handle: id.handle.clone(), e: util::now() + FLOW_SECS };
+            let cookie = self.seal_json("oauth-signup", &c);
+            return Ok(if cfg.registration_open && self.pow_key.is_some() {
+                SocialOutcome::Signup { cookie }
+            } else {
+                SocialOutcome::NoAccount { cookie }
+            });
         };
         let user = self.store.user_by_id(cred.user_id).await?.filter(|u| u.status == UserStatus::Active).ok_or(Error::BadLogin)?;
         // False once the identity was unlinked after the lookup above.
@@ -276,6 +283,55 @@ impl<H: Host> Accounts<H> {
         }
         drop(reg);
         self.record_after(ctx, Some(user.id), None, "register", &kind.credential_kind()).await;
+        Ok(self.create_session(user.id, "oauth", true, 0, ctx).await?)
+    }
+
+    /// `oauth_signup` with an invite code, for a host where sign-up is closed: the
+    /// code stands in for the sign-up gate as in `register_invite`, a code bound to a
+    /// username is for that name alone, and it is spent with the account in one
+    /// transaction, so a refusal leaves it for another try.
+    pub async fn oauth_signup_invite(&self, ctx: &Ctx, cookie: &str, code: &str, username: &str) -> Result<NewSession, Error> {
+        let r = self.oauth_signup_invite_inner(ctx, cookie, code, username).await;
+        if let Err(e) = &r {
+            tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = e.outcome(), "invite sign-up by a provider refused");
+        }
+        r
+    }
+
+    async fn oauth_signup_invite_inner(&self, ctx: &Ctx, cookie: &str, code: &str, username: &str) -> Result<NewSession, Error> {
+        let cfg = self.host.config();
+        self.door(ctx, "acct-inv", WINDOW, INVITE_TRIES)?;
+        let c: SignupCookie = self.open_json("oauth-signup", cookie).filter(|c: &SignupCookie| c.e > util::now()).ok_or(EXPIRED)?;
+        let kind = Kind::from_slug(&c.p).ok_or(EXPIRED)?;
+        let hash = code_hash(code.trim()).ok_or(BAD_INVITE)?;
+        let username = cfg.username(username)?;
+        let now = util::now();
+        if !self.store.invite_open(&hash, &username, now).await? {
+            return Err(BAD_INVITE);
+        }
+        if self.store.user_by_username(&username).await?.is_some() {
+            return Err(Error::UsernameTaken);
+        }
+        if self.store.credential(&kind.credential_kind(), c.sub.as_bytes()).await?.is_some() {
+            return Err(Error::Invalid("That account is linked to another account here already."));
+        }
+        let display_name = scope::clean_display_name(&c.handle).unwrap_or_else(|_| username.clone());
+        let new = NewUser { id: crate::model::AccountId::new(), username, display_name, email_pending: None, password_hash: None, created_at: now };
+        match self.store.create_user_with_invite(&new, "user", &hash, now).await? {
+            InviteSignup::Done => {}
+            InviteSignup::BadInvite => return Err(BAD_INVITE),
+            InviteSignup::UsernameTaken => return Err(Error::UsernameTaken),
+        }
+        let user = self.store.user_by_id(new.id).await?.ok_or(Error::NotFound)?;
+        let id = Identity { subject: c.sub, handle: c.handle, email: None, auth_time: None };
+        if !self.store.insert_credential(&Self::identity_row(kind, &user, &id)).await? {
+            // Lost a race for the identity: no account without a way in.
+            let mut tx = self.store.begin().await?;
+            crate::store::Store::delete_user(tx.conn(), user.id).await?;
+            tx.commit().await?;
+            return Err(Error::Invalid("That account is linked to another account here already."));
+        }
+        self.record_after(ctx, Some(user.id), None, "register", &format!("{} invite", kind.credential_kind())).await;
         Ok(self.create_session(user.id, "oauth", true, 0, ctx).await?)
     }
 

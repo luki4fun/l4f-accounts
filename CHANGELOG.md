@@ -3,6 +3,19 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.13.0 (2026-11-04)
+
+For voipc 1.9's invite links with a provider. No migration.
+
+- `SocialOutcome::NoAccount { cookie }`: an identity nobody has, where sign-up is
+  closed, was an error. It now hands the sealed identity back, good only with an
+  invite code. **BREAKING** for a host matching `SocialOutcome` without a wildcard:
+  add the arm, and say what the error said. The crate's own pages do.
+- `Accounts::oauth_signup_invite(ctx, cookie, code, username)`: sign-up by a provider
+  with an invite code, under `register_invite`'s rules (the code stands in for the
+  sign-up gate, a bound code is for that name, and it is spent with the account in one
+  transaction).
+
 ## v0.12.0 (2026-11-04)
 
 For voipc 1.8's sign-in with a provider, on a host with no web pages. No migration.

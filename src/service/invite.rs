@@ -15,7 +15,9 @@ use crate::{password, scope, util};
 /// Sign-ups with a code per address per window. Codes are 128 random bits, so
 /// this does not guard them; it keeps one address from minting accounts as
 /// fast as it holds codes. A wrong code never reaches the password hash.
-const INVITE_TRIES: usize = 20;
+pub(super) const INVITE_TRIES: usize = 20;
+/// Says nothing about which of these it was.
+pub(super) const BAD_INVITE: Error = Error::Invalid("That invite is not valid: wrong, used, expired, or meant for another name.");
 /// The longest an invite stays valid.
 pub const MAX_INVITE_DAYS: i64 = 30;
 
@@ -28,7 +30,7 @@ pub struct InviteForm<'a> {
 }
 
 /// SHA-256 of the code's 16 bytes, or `None` for anything never issued.
-fn code_hash(code: &str) -> Option<[u8; 32]> {
+pub(super) fn code_hash(code: &str) -> Option<[u8; 32]> {
     // 16 bytes are exactly 22 characters; also refuses a padded second spelling.
     if code.len() != 22 {
         return None;
@@ -110,7 +112,7 @@ impl<H: Host> Accounts<H> {
     async fn register_invite_inner(&self, ctx: &Ctx, form: InviteForm<'_>) -> Result<NewSession, Error> {
         let cfg = self.host.config();
         self.door(ctx, "acct-inv", WINDOW, INVITE_TRIES)?;
-        const BAD: Error = Error::Invalid("That invite is not valid: wrong, used, expired, or meant for another name.");
+        const BAD: Error = BAD_INVITE;
         let hash = code_hash(form.code.trim()).ok_or(BAD)?;
         let (username, display_name, email_pending) = signup_fields(&cfg, form.username, form.password, form.display_name, form.email)?;
         // A wrong code or a taken name costs no hash: Argon2 has two slots for
