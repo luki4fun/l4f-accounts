@@ -339,4 +339,26 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
+
+    /// A commit does not wait for the disk (`synchronous` 1 is NORMAL), which is as
+    /// safe as FULL for the file only in WAL mode: both hold on every connection.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    #[allow(irrefutable_let_patterns)]
+    async fn sqlite_commits_without_waiting_for_the_disk_in_wal() {
+        let path = std::env::temp_dir().join(format!("l4f_sy_{}.db", hex::encode(crate::util::random::<6>())));
+        let store = Store::connect(&format!("sqlite://{}", path.display())).await.unwrap();
+        for _ in 0..2 {
+            let mut held = lock(&store).await.unwrap();
+            let StoreConn::Lite(conn) = held.conn() else { unreachable!() };
+            let sync: i64 = sqlx::query_scalar("PRAGMA synchronous").fetch_one(&mut *conn).await.unwrap();
+            let journal: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(&mut *conn).await.unwrap();
+            assert_eq!((sync, journal.as_str()), (1, "wal"));
+            drop(held);
+        }
+        store.close().await;
+        for suffix in ["", "-wal", "-shm", ".lock"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

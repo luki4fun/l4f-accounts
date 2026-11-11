@@ -110,8 +110,11 @@ impl From<sqlx::SqlitePool> for Store {
 impl Store {
     /// Connects to `mysql://…`, `postgres://…` or `sqlite://…`, whichever of
     /// them this build has. A SQLite file is created when missing and runs in
-    /// WAL mode, so readers never wait for the writer. It has to be a file:
-    /// `migrate::run` refuses an in-memory or temporary database.
+    /// WAL mode, so readers never wait for the writer, with `synchronous` at
+    /// NORMAL: a commit waits for the disk only at a checkpoint, not every time.
+    /// A power cut can lose the last commits, never the file; a crash of the
+    /// process alone loses nothing. It has to be a file: `migrate::run`
+    /// refuses an in-memory or temporary database.
     pub async fn connect(url: &str) -> sqlx::Result<Store> {
         let scheme = url.split_once(':').map_or("", |(s, _)| s);
         match scheme {
@@ -126,9 +129,14 @@ impl Store {
                 // `secure_delete`: what is deleted (an account, its sessions,
                 // an app's rows) is overwritten where that costs no extra
                 // I/O, instead of staying readable in the file's free pages.
+                // `synchronous`: FULL, sqlx's default, waits for the disk at every
+                // commit, some milliseconds each on a server's disk, and a host
+                // writing one row at a time (an import) spends its time there. In
+                // WAL mode NORMAL is SQLite's own advice, and as safe for the file.
                 let opts = sqlx::sqlite::SqliteConnectOptions::from_str(url)?
                     .create_if_missing(true)
                     .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                    .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
                     .pragma("secure_delete", "FAST");
                 // The switch to WAL takes an exclusive lock and does not wait
                 // for it: of processes opening a new file at once, all but one
