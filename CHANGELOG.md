@@ -3,6 +3,16 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.13.1 (2026-11-11)
+
+No migration, no API change.
+
+- SQLite runs with `synchronous=NORMAL` beside its WAL mode, where it was sqlx's FULL. A
+  commit no longer waits for the disk: 200 single-row commits took 695 ms on an NVMe
+  disk, now 29 ms, and a host writing a row at a time (voipc's import from Discord) was
+  bound by that wait. A power cut can now lose the last commits; it cannot damage the
+  file, and a crash of the process alone loses nothing. SQLite's own advice for WAL.
+
 ## v0.13.0 (2026-11-04)
 
 For voipc 1.9's invite links with a provider. No migration.
