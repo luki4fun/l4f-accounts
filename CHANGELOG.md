@@ -3,6 +3,24 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.14.0 (2026-11-11)
+
+For voipc 1.12's password sign-in that never sends the password. No migration, no
+**BREAKING** change.
+
+- Host keys: a password the host checks itself. The client derives an Ed25519 key from
+  the password and signs the host's own message (voipc binds it to its TLS session); l4f
+  stores the public key in the password's column (`hostkey$ed25519$<hex>`) and applies
+  the password's rules to it: the sign-in caps of `login_password`, a second factor on
+  top, the race check against a change, a change ends the other sessions and remembered
+  browsers, `has_password` holds. A password sign-in against a host key always fails, at
+  the cost of any other. New: `hostkey_challenge`, `hostkey`, `login_hostkey`,
+  `confirm_hostkey`, `step_up_hostkey`, `hostkey_upgrade` (an Argon2 password to its key
+  from a recent sign-in, nothing else changes), `hostkey_change`, `hostkey_set_as_host`,
+  `register_hostkey`, `register_invite_hostkey`. Sessions say `method = "hostkey"`.
+- Inside: the sign-in caps of `login_password` are a function of their own
+  (`login_door`), and `set_password` writes through `write_password`.
+
 ## v0.13.1 (2026-11-11)
 
 No migration, no API change.
