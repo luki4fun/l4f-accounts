@@ -9,6 +9,7 @@
 mod account;
 mod admin;
 mod auth;
+mod hostkey;
 mod invite;
 #[cfg(feature = "email")]
 mod mail;

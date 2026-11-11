@@ -101,6 +101,22 @@ impl<H: Host> Accounts<H> {
         self.per_account("acct-pw", user.id, WINDOW, cfg.login_per_user_15min)?;
         let pw = new.to_owned();
         let hash = self.kdf(move || password::hash(&pw)).await?;
+        self.write_password(ctx, user, &hash, old, keep, how).await
+    }
+
+    /// Writes `hash` (Argon2, or a host key's text) only over `old`, then every remembered
+    /// browser and every session but `keep` go, and the owner is told. `NotFound` when the
+    /// hash changed meanwhile.
+    pub(super) async fn write_password(
+        &self,
+        ctx: &Ctx,
+        user: &User,
+        hash: &str,
+        old: Option<&str>,
+        keep: Option<&[u8; 32]>,
+        how: &str,
+    ) -> Result<(), Error> {
+        let hash = hash.to_owned();
         let written = match old {
             Some(o) => self.store.rehash_password(user.id, o, &hash).await?,
             None => self.store.set_password_hash(user.id, &hash).await?,

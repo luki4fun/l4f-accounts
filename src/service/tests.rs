@@ -2526,3 +2526,170 @@ async fn a_lost_audit_row_does_not_undo_a_committed_change() {
     drop(a);
     f.done().await;
 }
+
+// ---- host keys (`hostkey`)
+
+/// The host's check as a test has it: the signature is good when it says `ok` and the key
+/// is the one the device holds.
+fn checks(key: [u8; 32], ok: bool) -> impl FnOnce(&[u8; 32]) -> bool {
+    move |stored| ok && *stored == key
+}
+
+async fn register_keyed(a: &Accounts<Stub>, c: &Ctx, name: &str, key: &[u8; 32]) -> Result<NewSession, Error> {
+    let ts = pow::stamp(POW_KEY, util::now_secs() - 5);
+    let altcha = solve(&pow::issue(POW_KEY, 1000, 600));
+    let proof = pow::Proof { altcha: &altcha, ts: &ts, ..pow::Proof::default() };
+    a.register_hostkey(c, RegisterForm { username: name, password: "", email: None, display_name: None, proof }, key).await
+}
+
+#[tokio::test]
+async fn a_host_key_signs_in_as_the_password_would_and_a_password_never_does() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.140");
+    let key = [0x11; 32];
+    let name = unique("hk");
+    let s = register_keyed(&a, &c, &name, &key).await.unwrap();
+    assert_eq!(s.info.method, "hostkey");
+    assert!(a.fresh(&s.info, util::now()), "a new account's session is a recent sign-in");
+    let (user, _, _) = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap();
+    assert!(user.has_password, "the key is its password");
+    assert_eq!(a.hostkey(user.id).await.unwrap(), Some(key));
+
+    let login = |nonce: [u8; 16], ok: bool, with: [u8; 32]| {
+        let a = &a;
+        let c = &c;
+        let name = name.clone();
+        async move {
+            let token = a.hostkey_challenge(None, &nonce);
+            a.login_hostkey(c, &name, &token, &nonce, None, checks(with, ok)).await
+        }
+    };
+    let s = signed_in(login([1; 16], true, key).await);
+    assert!(a.fresh(&s.info, util::now()) && s.info.method == "hostkey");
+    assert!(matches!(login([2; 16], false, key).await, Err(Error::BadLogin)), "a bad signature");
+    assert!(matches!(login([3; 16], true, [0x22; 32]).await, Err(Error::BadLogin)), "another key");
+    // A token turned in on another connection (another nonce) is no token
+    let token = a.hostkey_challenge(None, &[4; 16]);
+    assert!(matches!(a.login_hostkey(&c, &name, &token, &[5; 16], None, checks(key, true)).await, Err(Error::Invalid(_))));
+    // And one spent is spent
+    let token = a.hostkey_challenge(None, &[6; 16]);
+    signed_in(a.login_hostkey(&c, &name, &token, &[6; 16], None, checks(key, true)).await);
+    assert!(matches!(a.login_hostkey(&c, &name, &token, &[6; 16], None, checks(key, true)).await, Err(Error::Invalid(_))));
+    // A name nobody has answers as a bad signature does
+    let token = a.hostkey_challenge(None, &[7; 16]);
+    assert!(matches!(a.login_hostkey(&c, &unique("nobody"), &token, &[7; 16], None, |_| true).await, Err(Error::BadLogin)));
+    // Whatever is typed as a password, at the full cost
+    assert!(matches!(a.login_password(&c, &name, PW, None).await, Err(Error::BadLogin)));
+    assert!(matches!(a.login_password(&c, &name, &super::hostkey::stored(&key), None).await, Err(Error::BadLogin)));
+    cleanup(&a, &[user.id], &[]).await;
+}
+
+#[tokio::test]
+async fn a_password_moves_to_a_host_key_once_and_nothing_else_changes() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.141");
+    let u = make_user(&a, &[]).await;
+    let other = signed_in(a.login_password(&c, &u.username, PW, None).await);
+    let s = signed_in(a.login_password(&c, &u.username, PW, None).await);
+    let key = [0x33; 32];
+    // Not from a session that is not a recent sign-in
+    let stale = a.create_session(u.id, "devkey", true, 0, &c).await.unwrap();
+    assert!(matches!(a.hostkey_upgrade(&c, &u, &stale.info, &key).await, Err(Error::Forbidden)));
+    a.hostkey_upgrade(&c, &u, &s.info, &key).await.unwrap();
+    assert_eq!(a.hostkey(u.id).await.unwrap(), Some(key));
+    assert!(a.session_from_token(&other.token, util::now()).await.unwrap().is_some(), "the other sessions stay");
+    assert!(matches!(a.login_password(&c, &u.username, PW, None).await, Err(Error::BadLogin)), "the old way is shut");
+    let token = a.hostkey_challenge(None, &[1; 16]);
+    signed_in(a.login_hostkey(&c, &u.username, &token, &[1; 16], None, checks(key, true)).await);
+    // Again with the same key: nothing to do. With another: that is a change, not this
+    a.hostkey_upgrade(&c, &u, &s.info, &key).await.unwrap();
+    assert!(matches!(a.hostkey_upgrade(&c, &u, &s.info, &[0x44; 32]).await, Err(Error::Invalid(_))));
+    // An account without a password has nothing to move
+    let bare = make_user(&a, &[]).await;
+    drop_password(&a, bare.id).await;
+    let fresh = a.create_session(bare.id, "oauth", true, util::now(), &c).await.unwrap();
+    assert!(matches!(a.hostkey_upgrade(&c, &bare, &fresh.info, &key).await, Err(Error::Invalid(_))));
+    assert_eq!(audit_events(&a, u.id).await.first().map(String::as_str), Some("login_ok"));
+    assert!(audit_events(&a, u.id).await.iter().any(|e| e == "password_upgrade"));
+    cleanup(&a, &[u.id, bare.id], &[]).await;
+}
+
+#[tokio::test]
+async fn a_host_key_steps_up_confirms_changes_and_resets_like_a_password() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.142");
+    let key = [0x55; 32];
+    let s = register_keyed(&a, &c, &unique("hk"), &key).await.unwrap();
+    let (u, _, _) = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap();
+    let other = a.create_session(u.id, "hostkey", true, util::now(), &c).await.unwrap();
+
+    // Step-up and confirm, over a challenge for this account
+    let stale = a.create_session(u.id, "devkey", true, 0, &c).await.unwrap();
+    let token = a.hostkey_challenge(Some(&u), &[1; 16]);
+    let up = a.step_up_hostkey(&c, &u, &stale.info, &token, &[1; 16], checks(key, true)).await.unwrap();
+    assert!(a.fresh(&up.info, util::now()));
+    let token = a.hostkey_challenge(Some(&u), &[2; 16]);
+    assert!(matches!(a.confirm_hostkey(&c, &u, &token, &[2; 16], checks(key, false)).await, Err(Error::Invalid(_))));
+    let token = a.hostkey_challenge(Some(&u), &[3; 16]);
+    a.confirm_hostkey(&c, &u, &token, &[3; 16], checks(key, true)).await.unwrap();
+    // A sign-in challenge is not a step-up's
+    let token = a.hostkey_challenge(None, &[4; 16]);
+    assert!(a.confirm_hostkey(&c, &u, &token, &[4; 16], checks(key, true)).await.is_err());
+
+    // A change: this session stays, every other one goes, the old key is no key
+    let new = [0x66; 32];
+    assert!(matches!(a.hostkey_change(&c, &u, &stale.info, &new).await, Err(Error::Forbidden)), "not without a recent sign-in");
+    a.hostkey_change(&c, &u, &up.info, &new).await.unwrap();
+    assert!(a.session_from_token(&up.token, util::now()).await.unwrap().is_some());
+    assert!(a.session_from_token(&other.token, util::now()).await.unwrap().is_none());
+    let token = a.hostkey_challenge(None, &[5; 16]);
+    assert!(a.login_hostkey(&c, &u.username, &token, &[5; 16], None, checks(key, true)).await.is_err());
+
+    // A reset the host proved: every session goes
+    let reset = [0x77; 32];
+    a.hostkey_set_as_host(&c, u.id, &reset).await.unwrap();
+    assert!(a.session_from_token(&up.token, util::now()).await.unwrap().is_none());
+    let token = a.hostkey_challenge(None, &[6; 16]);
+    signed_in(a.login_hostkey(&c, &u.username, &token, &[6; 16], None, checks(reset, true)).await);
+    let events = audit_events(&a, u.id).await;
+    assert!(events.iter().filter(|e| *e == "password_change").count() == 2, "{events:?}");
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+#[tokio::test]
+async fn a_host_key_with_a_second_factor_waits_for_it() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.143");
+    let key = [0x88; 32];
+    let s = register_keyed(&a, &c, &unique("hk"), &key).await.unwrap();
+    let (u, _, _) = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap();
+    let setup = a.totp_setup(&u);
+    let secret = totp_secret(&setup);
+    a.totp_enable(&c, &u, &full_session(&a, &c, &u).await, &setup.sealed, &format!("{:06}", crate::totp::code_at(&secret, step_now())))
+        .await
+        .unwrap();
+    let u = a.store.user_by_id(u.id).await.unwrap().unwrap();
+    let token = a.hostkey_challenge(None, &[1; 16]);
+    let pending = pending_of(a.login_hostkey(&c, &u.username, &token, &[1; 16], None, checks(key, true)).await);
+    assert!(!pending.info.mfa_ok);
+    // A step-up goes by the second factor, as with a password
+    let full = full_session(&a, &c, &u).await;
+    let token = a.hostkey_challenge(Some(&u), &[2; 16]);
+    assert!(matches!(a.step_up_hostkey(&c, &u, &full, &token, &[2; 16], checks(key, true)).await, Err(Error::Invalid(_))));
+    cleanup(&a, &[u.id], &[]).await;
+}
+
+#[tokio::test]
+async fn an_invite_signs_up_with_a_host_key() {
+    let Some(a) = shared(cfg()).await else { return };
+    let c = ctx("203.0.113.144");
+    let name = unique("hk");
+    let code = a.invite_create_as_host(&c, Some(&name), 1).await.unwrap();
+    let key = [0x99; 32];
+    let form = InviteForm { code: &code, username: &name, password: "", email: None, display_name: None };
+    let s = a.register_invite_hostkey(&c, form, &key).await.unwrap();
+    assert_eq!(s.info.method, "hostkey");
+    let (u, _, _) = a.session_from_token(&s.token, util::now()).await.unwrap().unwrap();
+    assert_eq!(a.hostkey(u.id).await.unwrap(), Some(key));
+    cleanup(&a, &[u.id], &[]).await;
+}

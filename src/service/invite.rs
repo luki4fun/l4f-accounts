@@ -6,11 +6,11 @@
 
 use sha2::{Digest, Sha256};
 
-use super::auth::{NewSession, WINDOW, signup_fields};
+use super::auth::{NewSecret, NewSession, WINDOW, signup_fields};
 use super::{Accounts, Actor, Ctx, DAY, Error, Host};
 use crate::model::{AccountId, Invite, NewUser};
 use crate::store::InviteSignup;
-use crate::{password, scope, util};
+use crate::{scope, util};
 
 /// Sign-ups with a code per address per window. Codes are 128 random bits, so
 /// this does not guard them; it keeps one address from minting accounts as
@@ -102,19 +102,30 @@ impl<H: Host> Accounts<H> {
     /// `user` role, and a full session. The code is spent with the account in
     /// one transaction, so a refusal leaves it for another try.
     pub async fn register_invite(&self, ctx: &Ctx, form: InviteForm<'_>) -> Result<NewSession, Error> {
-        let r = self.register_invite_inner(ctx, form).await;
+        let secret = NewSecret::Password(form.password);
+        let r = self.register_invite_inner(ctx, form, secret).await;
         if let Err(e) = &r {
             tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = e.outcome(), "invite sign-up refused");
         }
         r
     }
 
-    async fn register_invite_inner(&self, ctx: &Ctx, form: InviteForm<'_>) -> Result<NewSession, Error> {
+    /// `register_invite` with a host key for the password (`hostkey`): `form.password`
+    /// is not read.
+    pub async fn register_invite_hostkey(&self, ctx: &Ctx, form: InviteForm<'_>, key: &[u8; 32]) -> Result<NewSession, Error> {
+        let r = self.register_invite_inner(ctx, form, NewSecret::HostKey(key)).await;
+        if let Err(e) = &r {
+            tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = e.outcome(), "invite sign-up refused");
+        }
+        r
+    }
+
+    async fn register_invite_inner(&self, ctx: &Ctx, form: InviteForm<'_>, secret: NewSecret<'_>) -> Result<NewSession, Error> {
         let cfg = self.host.config();
         self.door(ctx, "acct-inv", WINDOW, INVITE_TRIES)?;
         const BAD: Error = BAD_INVITE;
         let hash = code_hash(form.code.trim()).ok_or(BAD)?;
-        let (username, display_name, email_pending) = signup_fields(&cfg, form.username, form.password, form.display_name, form.email)?;
+        let (username, display_name, email_pending) = signup_fields(&cfg, form.username, secret.password(), form.display_name, form.email)?;
         // A wrong code or a taken name costs no hash: Argon2 has two slots for
         // the whole process. The claim below still settles a race for either.
         if !self.store.invite_open(&hash, &username, util::now()).await? {
@@ -123,8 +134,7 @@ impl<H: Host> Accounts<H> {
         if self.store.user_by_username(&username).await?.is_some() {
             return Err(Error::UsernameTaken);
         }
-        let pw = form.password.to_owned();
-        let password_hash = self.kdf(move || password::hash(&pw)).await?;
+        let password_hash = self.secret_hash(secret).await?;
         let now = util::now();
         let id = AccountId::new();
         let user = NewUser { id, username, display_name, email_pending, password_hash: Some(password_hash), created_at: now };
@@ -136,6 +146,6 @@ impl<H: Host> Accounts<H> {
         self.audit_after(ctx, Some(id), None, "register", "invite").await;
         tracing::info!(target: "accounts", ip = %self.shaped_ip(ctx.ip), outcome = "register", user = %id.hex(),
             username = ?user.username, how = "invite");
-        Ok(self.create_session(id, "password", true, now, ctx).await?)
+        Ok(self.create_session(id, secret.method(), true, now, ctx).await?)
     }
 }

@@ -195,6 +195,20 @@ the client keeps and presents on every connection.
   there (say `voipc://client`). Verified key sign-ins of one account share
   `3 × login_per_user_15min` per 15 minutes: a client that signs in per
   connection may need a higher `login_per_user_15min`.
+- **Host key** (a password the host checks itself, so it never leaves the
+  client): the client derives an Ed25519 key from the password and signs the
+  host's own message over a challenge; the host verifies it, l4f keeps the key
+  in the password's place and applies the password's rules (the same sign-in
+  caps, a second factor on top, a change ends the other sessions, the account
+  has a password; a password sign-in against it always fails). Sign-up:
+  `register_hostkey(ctx, form, &key)` or `register_invite_hostkey` (`password`
+  is not read). Sign-in: `hostkey_challenge(None, nonce)`, then
+  `login_hostkey(ctx, name, token, nonce, None, |key| host_checks(key))`.
+  Again on a signed-in session: `hostkey_challenge(Some(user), nonce)`, then
+  `confirm_hostkey` or `step_up_hostkey`. `hostkey_upgrade` moves an Argon2
+  password to its key from a recent sign-in, keeping everything else;
+  `hostkey_change` and `hostkey_set_as_host` are `password_change` and
+  `password_set_as_host`. `hostkey(user)` is the stored key, if any.
 - **Step-up**: `step_up` (password), `step_up_totp`, `step_up_recovery`
   (spends a recovery code), `passkey_step_up`; check `fresh(&session, now)`
   before a sensitive action. `password_change` checks it itself.
