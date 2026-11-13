@@ -3,6 +3,16 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.14.1 (2026-11-13)
+
+No migration, no **BREAKING** change.
+
+- `oauth::client` keeps no connection idle (`pool_max_idle_per_host(0)`). A provider (or
+  a proxy in front of it) that closed a kept connection as it went back into use failed
+  the sign-in: a code's exchange is a POST nobody may send again. Each provider call now
+  opens its own connection, a TLS handshake more per call, a few calls per sign-in. Seen
+  once in voipc's lane against a stand-in that closes idle connections after 5 s.
+
 ## v0.14.0 (2026-11-11)
 
 For voipc 1.12's password sign-in that never sends the password. No migration, no

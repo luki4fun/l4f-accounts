@@ -132,18 +132,26 @@ pub enum OAuthError {
 
 /// The client every provider call goes through.
 pub fn client(egress: Option<SocketAddr>) -> reqwest::Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder()
+    settings(reqwest::Client::builder(), egress).https_only(true).build()
+}
+
+/// Everything of `client` but https-only. No connection is kept idle: a sign-in is a few
+/// calls minutes apart, and one a provider (or a proxy in front of it) closed as it went
+/// back into use failed the sign-in, since a code's exchange is a POST nobody may send
+/// twice. A fresh connection costs a TLS handshake per call.
+fn settings(b: reqwest::ClientBuilder, egress: Option<SocketAddr>) -> reqwest::ClientBuilder {
+    let mut b = b
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .https_only(true)
         .timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(0)
         .user_agent("l4f-accounts");
     if let Some(addr) = egress {
         for h in EGRESS_HOSTS {
             b = b.resolve(h, addr);
         }
     }
-    b.build()
+    b
 }
 
 /// The per-sign-in secrets, kept in the sealed flow cookie.
@@ -324,6 +332,58 @@ pub async fn exchange(http: &reqwest::Client, p: &Provider, code: &str, redirect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that answers one request a connection, and hangs up at a second on the same
+    /// one: a keep-alive that ran out as the client sent. Counts the connections.
+    fn one_answer_a_connection() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = accepted.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let mut got = Vec::new();
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}");
+                    // The next request on this connection: closed unanswered
+                    let _ = conn.read(&mut buf);
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_provider_call_never_goes_out_on_a_connection_kept_idle() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (port, accepted) = one_answer_a_connection();
+        let url = format!("http://127.0.0.1:{port}/token");
+        let http = settings(reqwest::Client::builder(), None).build().unwrap();
+        for _ in 0..3 {
+            let r = http.post(&url).form(&[("code", "c")]).send().await;
+            assert_eq!(r.map(|r| r.status().as_u16()).map_err(|e| e.to_string()), Ok(200));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 3, "a connection a call");
+
+        // The control: a client that keeps one idle sends the next call on it, and fails
+        let (port, _) = one_answer_a_connection();
+        let url = format!("http://127.0.0.1:{port}/token");
+        let pooled = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(pooled.post(&url).form(&[("code", "c")]).send().await.is_ok());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(pooled.post(&url).form(&[("code", "c")]).send().await.is_err(), "the race, made certain");
+    }
 
     fn host_of(url: &str) -> &str {
         url.split("://").nth(1).unwrap().split('/').next().unwrap()
