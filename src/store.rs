@@ -11,7 +11,7 @@
 use crate::model::AccountId;
 
 mod backend;
-pub use backend::{Store, StoreConn, StoreTx};
+pub use backend::{PoolConfig, Store, StoreConn, StoreTx};
 
 #[cfg(feature = "mysql")]
 pub mod my {
