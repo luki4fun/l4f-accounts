@@ -9,6 +9,34 @@ use sqlx::Transaction;
 use super::{Blob, CreateUserError, DeleteCredential, EmailConfirm, InviteSignup, Profile, PutBlob, PutLimited, WriteError};
 use crate::model::{AccountId, AuditEntry, Credential, Invite, NewUser, Role, SessionInfo, User, UserStatus};
 
+/// How the store's connection pool behaves (`Store::connect_with`). The default is sqlx's.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolConfig {
+    /// Connections open at most (sqlx: 10). A host signing in thousands at once queues
+    /// behind them; the database's own `max_connections` has to hold every host's.
+    pub max_connections: u32,
+    /// How long a query waits for a free connection before it fails (sqlx: 30 s).
+    pub acquire_timeout: std::time::Duration,
+    /// A ping on each connection as it leaves the pool (sqlx: on): one round trip more for
+    /// every query. Off, a connection the database dropped fails its next query instead.
+    pub test_before_acquire: bool,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig { max_connections: 10, acquire_timeout: std::time::Duration::from_secs(30), test_before_acquire: true }
+    }
+}
+
+impl PoolConfig {
+    fn options<DB: sqlx::Database>(&self) -> sqlx::pool::PoolOptions<DB> {
+        sqlx::pool::PoolOptions::new()
+            .max_connections(self.max_connections.max(1))
+            .acquire_timeout(self.acquire_timeout)
+            .test_before_acquire(self.test_before_acquire)
+    }
+}
+
 /// The account store. Clone is cheap (a pool handle).
 #[derive(Clone)]
 pub enum Store {
@@ -116,12 +144,17 @@ impl Store {
     /// process alone loses nothing. It has to be a file: `migrate::run`
     /// refuses an in-memory or temporary database.
     pub async fn connect(url: &str) -> sqlx::Result<Store> {
+        Store::connect_with(url, PoolConfig::default()).await
+    }
+
+    /// `connect`, with a pool of this size and manners.
+    pub async fn connect_with(url: &str, pool: PoolConfig) -> sqlx::Result<Store> {
         let scheme = url.split_once(':').map_or("", |(s, _)| s);
         match scheme {
             #[cfg(feature = "mysql")]
-            "mysql" | "mariadb" => Ok(sqlx::MySqlPool::connect(url).await?.into()),
+            "mysql" | "mariadb" => Ok(pool.options::<sqlx::MySql>().connect(url).await?.into()),
             #[cfg(feature = "postgres")]
-            "postgres" | "postgresql" => Ok(sqlx::PgPool::connect(url).await?.into()),
+            "postgres" | "postgresql" => Ok(pool.options::<sqlx::Postgres>().connect(url).await?.into()),
             #[cfg(feature = "sqlite")]
             "sqlite" => {
                 use std::str::FromStr;
@@ -146,7 +179,7 @@ impl Store {
                 };
                 let until = Instant::now() + Duration::from_secs(5);
                 loop {
-                    match sqlx::SqlitePool::connect_with(opts.clone()).await {
+                    match pool.options::<sqlx::Sqlite>().connect_with(opts.clone()).await {
                         Err(e) if busy(&e) && Instant::now() < until => tokio::time::sleep(Duration::from_millis(20)).await,
                         r => return Ok(r?.into()),
                     }

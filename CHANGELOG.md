@@ -3,6 +3,16 @@
 Migrations are append-only once a version is tagged: a host that ran them can
 only move forward. **BREAKING** marks changes a host has to act on.
 
+## v0.15.0 (2026-11-17)
+
+No migration, no **BREAKING** change.
+
+- `Store::connect_with(url, PoolConfig)`: the pool's size, how long a query waits for a
+  connection, and whether a connection is pinged as it leaves the pool. `Store::connect` is
+  `connect_with` with `PoolConfig::default()`, sqlx's own (10 connections, 30 s, ping on), so
+  nothing changes for a host that does not ask. Seen in voipc: 10 connections held a sign-in
+  storm on Postgres to what 10 WAL flushes at a time carry.
+
 ## v0.14.1 (2026-11-13)
 
 No migration, no **BREAKING** change.
